@@ -6,3 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ye-codec = { path = "../ye-codec" }
+ye-time = { path = "../ye-time" }
