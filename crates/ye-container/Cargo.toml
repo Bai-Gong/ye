@@ -1,0 +1,8 @@
+[package]
+name = "ye-container"
+description = "百工·冶：封装/解封装抽象——Stream 与 Packet 之间的 trait 与注册表"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

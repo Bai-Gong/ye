@@ -1,0 +1,8 @@
+[package]
+name = "ye-pixfmt"
+description = "百工·冶：像素格式、色彩空间与采样布局的定义"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

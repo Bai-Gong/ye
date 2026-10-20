@@ -1,0 +1,13 @@
+[package]
+name = "ye-cli"
+description = "百工·冶：`ye` 命令行——媒体探查与转码（对标 ffmpeg / ffprobe）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ye = { path = "../ye" }
+
+[[bin]]
+name = "ye"
+path = "src/main.rs"

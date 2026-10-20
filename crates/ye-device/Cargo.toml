@@ -1,0 +1,8 @@
+[package]
+name = "ye-device"
+description = "百工·冶：硬件加速后端——设备内存与硬件编解码会话的抽象"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "ye-time"
+description = "百工·冶：有理数时基、时间戳与帧率换算"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

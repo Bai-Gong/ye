@@ -1,0 +1,8 @@
+[package]
+name = "ye-filter"
+description = "百工·冶：媒体处理图——帧级变换的组装与调度"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

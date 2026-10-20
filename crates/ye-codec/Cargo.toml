@@ -1,0 +1,8 @@
+[package]
+name = "ye-codec"
+description = "百工·冶：编解码器抽象——Packet 与 Frame 之间的 trait 与注册表"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
