@@ -6,7 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ye = { path = "../ye" }
+ye = { path = "../ye", features = ["mp4"] }
+
+[lib]
+name = "ye_cli"
 
 [[bin]]
 name = "ye"

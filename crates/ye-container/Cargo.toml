@@ -6,3 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# 具体容器实现，一律 optional，按 feature 开启（见 docs/contracts.md）。
+ye-container-mp4 = { path = "../ye-container-mp4", optional = true }
+
+[features]
+# MP4 容器：解封装（progressive 与 fMP4）与封装（Mp4Writer）。
+# 由 ye 门面的同名 feature 传递开启。
+mp4 = ["dep:ye-container-mp4"]

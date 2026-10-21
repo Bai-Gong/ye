@@ -12,3 +12,8 @@ ye-codec = { path = "../ye-codec" }
 ye-container = { path = "../ye-container" }
 ye-filter = { path = "../ye-filter" }
 ye-device = { path = "../ye-device" }
+
+[features]
+default = ["mp4"]
+# 容器：MP4 解封装与封装（ye-container-mp4）。传递给 ye-container 的同名 feature。
+mp4 = ["ye-container/mp4"]
