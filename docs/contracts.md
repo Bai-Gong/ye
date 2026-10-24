@@ -149,10 +149,14 @@ ye-codec 34 / ye-container 24，合流时基线）经 `cargo test --workspace
    数据驱动的时戳重标度溢出按 Muxer 契约走 Time 变体）、其余 →
    `InvalidData` 带原文案）。
 4. **探测评分**：`DemuxerFactory::probe` 做 ftyp/styp box 嗅探——
-   size ≥ 8 + box 类型四字符命中 + major brand 在常见集（13 项，
+   size ≥ 8 + box 类型四字符命中 + major brand 在常见集（12 项，
    2026-10-24 评审移除 heic——HEIF 静态图片无 moov/trak，读取端另有
-   「至少一条 trak」校验兜底；对齐
-   FFmpeg mov probe 常用子集）→ `ProbeScore::MAXIMUM`；brand 可读但
+   「至少一条 trak」校验兜底；同日施工图①再移除 `qt  `——qt 族 MOV
+   降入拒绝表：major brand 为 `qt  ` 时直接 `NONE`（probe 即拒），
+   `open_demuxer`/`probe`/`detect` 明确 `UnknownFormat`，不假成功，
+   剪对 MOV 过渡期回退 ffprobe，M4 落地 MOV 支持后移除；对齐
+   FFmpeg mov probe 常用子集）→ `ProbeScore::MAXIMUM`；brand 在
+   拒绝表（现仅 `qt  `，只拦 major brand）→ `NONE`；brand 可读但
    不在集内 → `EXTENSION`；乱数据 → `NONE`。`register_mp4` 以格式名
    `"mp4"` 注册 demuxer/muxer 双工厂，auto-probe 由
    `ContainerRegistry::open_demuxer` 驱动；`ye-container` 本体零改动。

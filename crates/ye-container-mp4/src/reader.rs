@@ -1726,7 +1726,9 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
     // 落空；此前的防御性兜底 Ok(0) 会静默把帧间帧当关键帧返回，seek
     // 落点从该处起花屏。改为解析期拒绝。音频轨的 stss 不参与关键帧
     // 判定（恒关键帧），不做此约束。
-    if kind != TrackKind::Audio && let Some(stss) = &b.stss {
+    if kind != TrackKind::Audio
+        && let Some(stss) = &b.stss
+    {
         let stss_path = format!("{path}.mdia.minf.stbl.stss");
         if stss.is_empty() {
             return Err(malformed(&stss_path, "stss 表为空（须至少含样号 1）"));

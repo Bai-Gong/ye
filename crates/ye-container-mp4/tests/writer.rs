@@ -1120,7 +1120,8 @@ fn writer_is_poisoned_after_first_io_error() {
     );
     w.add_stream(audio_cfg(1000)).unwrap();
     for i in 0..4i64 {
-        w.write_packet(&pkt(0, i * 10, 10, true, &[0xA0, 0xA1])).unwrap();
+        w.write_packet(&pkt(0, i * 10, 10, true, &[0xA0, 0xA1]))
+            .unwrap();
     }
     // 首次失败：I/O 错误。
     match w.flush_fragment() {
@@ -1250,8 +1251,5 @@ fn rescale_overflow_is_time_error() {
     q.dts = Some(Timestamp::new(1000, tb1k));
     q.pts = Some(Timestamp::new(i64::MIN, tb1k));
     q.duration = Some(Timestamp::new(1, tb1k));
-    assert!(matches!(
-        w2.write_packet(&q),
-        Err(WriterError::Misuse(_))
-    ));
+    assert!(matches!(w2.write_packet(&q), Err(WriterError::Misuse(_))));
 }

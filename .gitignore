@@ -1,1 +1,3 @@
 /target
+# 一致性测试向量缓存（向量不入库，见 tests/conformance/README.md）
+tests/conformance/.cache/

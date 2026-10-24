@@ -15,6 +15,7 @@
 //!   fMP4 等布局选项走具体类型 [`Mp4Writer`]，不经 trait（裁决第 7 条）；
 //! - [`Mp4DemuxerFactory::probe`]：ftyp/styp box 头嗅探——size 合法 +
 //!   类型四字符命中 + major brand 在常见集内 → [`ProbeScore::MAXIMUM`]，
+//!   brand 在拒绝表（qt 族 MOV）→ NONE（明确拒绝，见 [`DENIED_BRANDS`]），
 //!   brand 可读但不在集内 → [`ProbeScore::EXTENSION`]，其余 → NONE；
 //! - [`register_mp4`]：向注册表注册 demuxer/muxer 工厂（auto-probe 由
 //!   [`ContainerRegistry::open_demuxer`] 驱动）。
@@ -75,20 +76,33 @@ fn map_write_err(e: WriterError) -> ContainerError {
 // —— 探测 ——
 
 /// ftyp/styp major brand 常见集（对齐 FFmpeg mov probe 的 brand 表的
-/// 常用子集；命中即视作魔数完全命中。注意 `m4a `/`m4v `/`qt  ` 含空格）。
+/// 常用子集；命中即视作魔数完全命中。注意 `m4a `/`m4v ` 含空格）。
 /// 不含 `heic` 等 HEIF 静态图片 brand（2026-10-24 评审：HEIC 是 ISOBMFF
 /// 家族但无 moov/trak，命中 MAXIMUM 会让照片被当 MP4 假阳性录取——
 /// 现在 heic 走未知 brand 路径（EXTENSION 半命中），再被读取端
 /// 「至少一条 trak」校验在 open 阶段拒绝）。
-const KNOWN_BRANDS: [[u8; 4]; 13] = [
+/// 也不含 `qt  `（QuickTime MOV，施工图①同日修订）：qt 族降为
+/// [`DENIED_BRANDS`] 明确拒绝，probe 即拒、不假成功。
+const KNOWN_BRANDS: [[u8; 4]; 12] = [
     *b"isom", *b"iso2", *b"mp41", *b"mp42", *b"mp71", *b"avc1", *b"avc3", *b"mp4a", *b"m4v ",
-    *b"dash", *b"msdh", *b"mse6", *b"qt  ",
+    *b"dash", *b"msdh", *b"mse6",
 ];
+
+/// 明确不录取的 major brand（施工图①：qt 族 MOV 在 probe 即拒）。
+/// QuickTime 专有 atom 语义与 codec（SVQ3 等）超出本 MP4 实现的
+/// 声明范围——与其半懂地假成功，不如明确失败，让调用方（剪）按
+/// 探测结果回退 ffprobe（过渡期行为；M4 落地 MOV 支持后移除）。
+/// 注意本表只拦 major brand；compatible brands 里的 `qt  ` 不拦
+/// （major 非 qt 的文件按其 major brand 归类）。
+const DENIED_BRANDS: [[u8; 4]; 1] = [*b"qt  "];
 
 /// ftyp/box 嗅探（[`DemuxerFactory::probe`] 的实现）。
 ///
 /// 规则：≥8 字节、首 box size ≥ 8 且类型为 `ftyp`/`styp` 才继续；
 /// major brand（box 载荷前 4 字节）在 [`KNOWN_BRANDS`] → MAXIMUM，
+/// 在 [`DENIED_BRANDS`]（qt 族 MOV）→ NONE（**明确拒绝**：本实现不
+/// 声明支持 QuickTime 专有语义，`open_demuxer`/`probe` 即刻
+/// `UnknownFormat`，不进 open 阶段假成功），
 /// 可打印但不在集内 → EXTENSION（**部分魔数命中**：box 头可信但
 /// brand 未知，如 heic 照片或罕见 brand 的真 MP4——探查管线无文件名
 /// 输入，该档语义见 [`ProbeScore::EXTENSION`]；录取后的硬保证由读取端
@@ -113,6 +127,9 @@ fn probe_mp4(head: &[u8]) -> ProbeScore {
     let brand: [u8; 4] = head[8..12].try_into().unwrap();
     if KNOWN_BRANDS.contains(&brand) {
         return ProbeScore::MAXIMUM;
+    }
+    if DENIED_BRANDS.contains(&brand) {
+        return ProbeScore::NONE;
     }
     let printable = brand.iter().all(|&b| (0x20..=0x7e).contains(&b));
     if printable {
@@ -581,7 +598,6 @@ mod tests {
         let f = Mp4DemuxerFactory;
         // 已知 brand → MAXIMUM
         assert_eq!(f.probe(&ftyp_bytes(b"isom")), ProbeScore::MAXIMUM);
-        assert_eq!(f.probe(&ftyp_bytes(b"qt  ")), ProbeScore::MAXIMUM);
         assert_eq!(f.probe(&ftyp_bytes(b"mp42")), ProbeScore::MAXIMUM);
         // 可读但未知 brand → EXTENSION
         assert_eq!(f.probe(&ftyp_bytes(b"zzzz")), ProbeScore::EXTENSION);
@@ -617,6 +633,46 @@ mod tests {
     fn probe_heic_brand_is_not_maximum() {
         let f = Mp4DemuxerFactory;
         assert_eq!(f.probe(&ftyp_bytes(b"heic")), ProbeScore::EXTENSION);
+    }
+
+    /// qt 族 MOV 在 probe 即拒（施工图①：`qt  ` 移出常见集并进拒绝表，
+    /// 打 NONE 而非 EXTENSION——EXTENSION ≥ MINIMUM 仍会被注册表录取，
+    /// 结构兼容的 MOV 会假成功）。回归：此前 `qt  ` 命中 MAXIMUM。
+    #[test]
+    fn qt_brand_is_denied_at_probe() {
+        let f = Mp4DemuxerFactory;
+        assert_eq!(f.probe(&ftyp_bytes(b"qt  ")), ProbeScore::NONE);
+    }
+
+    /// 注册表面：qt brand 样片经 `open_demuxer`/`probe`/`detect` 必须
+    /// 明确失败（`UnknownFormat`），不进 open 阶段——剪对 MOV 按此
+    /// 回退 ffprobe（过渡期行为）。样片带 moov 形态头：即便结构再像
+    /// MP4，brand 拒绝也先于一切结构解析。
+    #[test]
+    fn qt_brand_mov_fails_at_registry_not_fake_success() {
+        let reg = registry();
+        let mut data = ftyp_bytes(b"qt  ");
+        // ftyp_bytes 声明 24 字节只给 20：补齐 + moov 占位
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&[0, 0, 0, 16, b'm', b'o', b'o', b'v']);
+        data.extend_from_slice(&[0u8; 8]);
+        // auto-probe 打开：唯一工厂打 NONE < MINIMUM → UnknownFormat
+        match reg.open_demuxer(open_vec(data.clone())) {
+            Err(ContainerError::UnknownFormat) => {}
+            Err(other) => panic!("应为 UnknownFormat，实为 {other:?}"),
+            Ok(_) => panic!("qt 族 MOV 不得被 MP4 工厂录取（假成功）"),
+        }
+        // 一步式 probe 同样明确失败
+        assert!(matches!(
+            reg.probe(open_vec(data.clone())),
+            Err(ContainerError::UnknownFormat)
+        ));
+        // 只打分不打开的 detect 同口径
+        let mut cursor = std::io::Cursor::new(data);
+        assert!(matches!(
+            reg.detect(&mut cursor),
+            Err(ContainerError::UnknownFormat)
+        ));
     }
 
     /// 无 moov/trak 的文件（HEIC 照片形态：ftyp heic + free/mdat）经

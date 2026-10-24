@@ -813,9 +813,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
     /// 改变，调用方按 kind 分流不受影响）。
     fn poison_err(e: &WriterError) -> WriterError {
         match e {
-            WriterError::Io(io) => {
-                WriterError::Io(std::io::Error::new(io.kind(), io.to_string()))
-            }
+            WriterError::Io(io) => WriterError::Io(std::io::Error::new(io.kind(), io.to_string())),
             WriterError::Unsupported(w) => WriterError::Unsupported(w),
             WriterError::InvalidStreamIndex { index, count } => WriterError::InvalidStreamIndex {
                 index: *index,

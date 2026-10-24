@@ -1,0 +1,93 @@
+# ye 一致性测试向量清单 v1（清单入库、向量二进制不入库）。
+#
+# 2026-10-24 施工图①裁决落地：
+# - 就位集（[[vector]]，6 条）：外网被墙（curl test-videos.co.uk /
+#   samples.ffmpeg.org 均 code=000）无法下载 FATE 向量，按裁决以本机
+#   ffmpeg + 确定性 lavfi 源自造（176×144/640×360/1280×720 ×
+#   testsrc2/smptebars）。smptebars 为「真实素材转码」项的替代——无
+#   外网素材源，选确定性测试图替代并在本清单登记。
+# - 每条记完整生成命令（{OUT} 为缓存路径占位）、ffmpeg 版本与实测
+#   SHA256（sha 只准实测，禁止推测值）。
+# - 待网络清册（[[pending_vector]]）：FFmpeg FATE H.264 conformance 的
+#   Baseline 子集（ba*/B* 系列）。本机外网被墙无法下载计算实测
+#   SHA256，按裁决登记不进 ran/skipped 计数、不参与终验断言，摘要行
+#   另落 pending=K；网络恢复后实测 sha256 并升入 [[vector]]。
+# - 增删向量须登记理由，选择权不在施工方（施工图 risks 第 13 条）。
+
+manifest_version = 1
+
+# —— 就位集：testsrc2（含运动，跨三档分辨率）——
+
+[[vector]]
+name = "h264-testsrc2-176x144"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=176x144:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "2f21dee9a195bd1168888598c1139bf7297acd3ac601df241f3fad1fbadf55cb"
+
+[[vector]]
+name = "h264-testsrc2-640x360"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=640x360:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "933de4aa6ce074220cf39fe85093cbb166535375749edb5a5bbbfdf057889f14"
+
+[[vector]]
+name = "h264-testsrc2-1280x720"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "ed26c25298bd52e349d51437aa1d8da1dad4b4e64cb1a922ff8ffe5e4040d68c"
+
+# —— 就位集：smptebars（「真实素材」替代项：静态确定性测试图，同三档）——
+
+[[vector]]
+name = "h264-smptebars-176x144"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i smptebars=size=176x144:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "76e0da6323ea61b257b498ba68f04ab7e2356ff5b714abd25785740acc53ffac"
+
+[[vector]]
+name = "h264-smptebars-640x360"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i smptebars=size=640x360:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "8bd50c878884f27557976872a97603dc2e5ebfce4f4197ea0c0fa2e6d2f76b60"
+
+[[vector]]
+name = "h264-smptebars-1280x720"
+codec = "h264"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i smptebars=size=1280x720:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "fa3be23dd7a56a5595521062f3b94c101c7aa7acd8ad157eb03a53098c8f5620"
+
+# —— 待网络清册：FATE H.264 conformance 的 Baseline 子集（ba*/B* 系列）——
+# 选择规则：profile=Baseline 的 ba*/B* 系列原始码流（.264），下载后须
+# remux 进 mp4 容器再入就位集（我方管线对拍入口是 MP4 demux）。
+
+[[pending_vector]]
+name = "fate-h264-ba1-ft"
+source = "https://samples.ffmpeg.org/fate-suite/h264-conformance/"
+note = "BA1_FT_C（文件名待网络核对）；下载后 remux mp4、实测 sha256 升入 [[vector]]"
+
+[[pending_vector]]
+name = "fate-h264-ba2-sony"
+source = "https://samples.ffmpeg.org/fate-suite/h264-conformance/"
+note = "BA2_SONY_C（文件名待网络核对）"
+
+[[pending_vector]]
+name = "fate-h264-ba3-sva"
+source = "https://samples.ffmpeg.org/fate-suite/h264-conformance/"
+note = "BA3_SVA_C（文件名待网络核对）"
+
+[[pending_vector]]
+name = "fate-h264-basqp1-sony"
+source = "https://samples.ffmpeg.org/fate-suite/h264-conformance/"
+note = "BASQP1_Sony_C（文件名待网络核对）"

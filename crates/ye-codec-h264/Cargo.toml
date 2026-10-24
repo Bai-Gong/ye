@@ -1,0 +1,10 @@
+[package]
+name = "ye-codec-h264"
+description = "百工·冶：H.264 码流层——NAL 拆包（AVCC/Annex B）与 SPS/PPS 解析"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 零第三方依赖（全库约定）。码流层是纯字节/位运算，不依赖 ye-codec 的
+# Packet/Frame 契约类型——M2 解码器接线（④）时再按需引入。

@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "tests/conformance"]
 # 2026-10-24 合流（B 案）裁决：ye-container-mp4 曾因 m1 旧类型被 exclude；
 # 同日按 develop 契约类型（流内时基 Timestamp / ye-codec Packet /
 # ye-container Stream）移植完成，恢复为 workspace 成员。
+# 同日施工图①：tests/conformance（一致性框架 runner）入 workspace——
+# 其 lib 测试随 `cargo test --workspace` 离线跑，bin 由对拍流程显式调。
 
 [workspace.package]
 version = "0.1.0"

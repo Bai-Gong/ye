@@ -270,14 +270,26 @@ mod tests {
         });
         // 同类相连合法。
         g.connect(
-            PadRef { node: video, pad: 0 },
-            PadRef { node: video, pad: 0 },
+            PadRef {
+                node: video,
+                pad: 0,
+            },
+            PadRef {
+                node: video,
+                pad: 0,
+            },
         )
         .unwrap();
         // video 输出 → audio 输入：媒体类型失配 ⇒ InvalidArguments，不记边。
         let err = g.connect(
-            PadRef { node: video, pad: 0 },
-            PadRef { node: audio, pad: 0 },
+            PadRef {
+                node: video,
+                pad: 0,
+            },
+            PadRef {
+                node: audio,
+                pad: 0,
+            },
         );
         assert_eq!(
             err,
@@ -287,14 +299,26 @@ mod tests {
         );
         // audio 输出 → video 输入同拒。
         let err = g.connect(
-            PadRef { node: audio, pad: 0 },
-            PadRef { node: video, pad: 0 },
+            PadRef {
+                node: audio,
+                pad: 0,
+            },
+            PadRef {
+                node: video,
+                pad: 0,
+            },
         );
         assert!(matches!(err, Err(FilterError::InvalidArguments(_))));
         // audio→audio 合法（此时共 2 条边）。
         g.connect(
-            PadRef { node: audio, pad: 0 },
-            PadRef { node: audio, pad: 0 },
+            PadRef {
+                node: audio,
+                pad: 0,
+            },
+            PadRef {
+                node: audio,
+                pad: 0,
+            },
         )
         .unwrap();
         assert_eq!(g.edge_count(), 2);

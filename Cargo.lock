@@ -31,6 +31,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ye-codec-h264"
+version = "0.1.0"
+
+[[package]]
+name = "ye-conformance"
+version = "0.1.0"
+dependencies = [
+ "ye-codec",
+ "ye-codec-h264",
+ "ye-container",
+ "ye-container-mp4",
+]
+
+[[package]]
 name = "ye-container"
 version = "0.1.0"
 dependencies = [

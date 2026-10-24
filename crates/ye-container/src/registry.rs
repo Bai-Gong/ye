@@ -103,10 +103,7 @@ impl ContainerRegistry {
     /// 消费方的路由决策应复用本查询，而不是各自手抄一份魔数规则
     /// （两处规则只能人工保持同步）。最高分 <
     /// [`ProbeScore::MINIMUM`] → `Err(UnknownFormat)`。
-    pub fn detect(
-        &self,
-        input: &mut dyn ReadSeek,
-    ) -> Result<(String, ProbeScore), ContainerError> {
+    pub fn detect(&self, input: &mut dyn ReadSeek) -> Result<(String, ProbeScore), ContainerError> {
         let head = self.probe_window(input)?;
         let (index, score) = self.best_demuxer(&head)?;
         if score < ProbeScore::MINIMUM {
@@ -334,7 +331,10 @@ mod tests {
         assert_eq!(name, "magic-bytes");
         assert_eq!(score, ProbeScore::MAXIMUM);
         // 只打分、不打开：工厂的 open 从未被调用。
-        assert!(open_positions.lock().unwrap().is_empty(), "detect 不得 open");
+        assert!(
+            open_positions.lock().unwrap().is_empty(),
+            "detect 不得 open"
+        );
         // 输入已回卷（事件末尾 seek(0)）。
         let events = events.lock().unwrap().clone();
         assert_eq!(*events.last().unwrap(), IoEvent::Seek(0));
