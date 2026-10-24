@@ -12,3 +12,12 @@ ye-codec = { path = "../ye-codec" }
 ye-container = { path = "../ye-container" }
 ye-filter = { path = "../ye-filter" }
 ye-device = { path = "../ye-device" }
+
+[features]
+default = ["mp4"]
+# 容器：MP4 解封装与封装（ye-container-mp4）。
+# 2026-10-24 合流（B 案）：契约层（ye-container develop 版）暂无 mp4 feature，
+# 此处先做空桩保持 feature 名与 ye-cli（m1 版为底）的 `features = ["mp4"]`
+# 可解析；ye-container-mp4 按新 trait 重写、恢复 `ye-container/mp4` 转发后
+# 再改回 `mp4 = ["ye-container/mp4"]`。
+mp4 = []

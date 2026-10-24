@@ -1,8 +1,44 @@
-//! `ye` 命令行：媒体探查与转码，对标 ffmpeg / ffprobe（建设中）。
+//! `ye` 命令行：媒体探查与转码，对标 ffmpeg / ffprobe。
+//!
+//! 本文件只做 argv 分发与输出；逻辑在 `ye_cli` lib（可测试主体）。
 
-fn main() {
-    println!(
-        "ye {} — 百工·冶（FFmpeg 替代基础库）命令行，建设中",
-        ye::VERSION
-    );
+use std::ffi::OsString;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match ye_cli::parse_args(&args) {
+        Ok(ye_cli::Command::Help) => {
+            println!("{}", ye_cli::USAGE);
+            ExitCode::SUCCESS
+        }
+        Ok(ye_cli::Command::Version) => {
+            println!("ye {}", ye::VERSION);
+            ExitCode::SUCCESS
+        }
+        Ok(ye_cli::Command::Probe { path }) => match ye_cli::probe(&path) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("ye: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(ye_cli::Command::Remux { input, output }) => match ye_cli::remux(&input, &output) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("ye: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(usage) => {
+            eprintln!("ye: {usage}");
+            ExitCode::from(2)
+        }
+    }
 }
