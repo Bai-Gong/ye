@@ -15,6 +15,11 @@
 //! 5. mdhd/tkhd 先读版本字节再按 v0/v1 字段宽度解析。
 //! 6. read_packet 分配前校验样例 offset+size ≤ 文件长度，越界 ⇒ Malformed。
 //!
+//! 时戳语义（2026-10-24 移植裁决）：样例时戳一律以流时基
+//! （`1/mdhd:timescale`）的**原生轨道单位**打戳（`Timestamp::new(单位,
+//! 流时基)`），无全局 tick 换算、无舍入；`pts` 恒 `Some(dts+cts)`
+//! （ctts 缺省 ⇒ cts=0）。取代 m1 的全局 tick（7,056,000）方案。
+//!
 //! fMP4（fragment）硬契约：
 //! 7. mvex 按 track_id 关联 trak：mehd 可选（跳过）；trex 记录
 //!    default_sample_description_index/duration/size/flags。moof 递归
@@ -53,23 +58,49 @@
 //!     之后才是 handler_type，ffmpeg 实测产物）；mp4a entry 兼容 20 字节
 //!     基础布局与 28 字节扩展布局（声道/采样率前多 8 字节，ffmpeg 产物
 //!     与 Mp4Writer 输出均为后者），按采样率/声道合理区间判别。
+//!
+//! 媒体类别映射：hdlr 非 vide/soun 的轨内部按 [`TrackKind::Other`]
+//! 处理（entry 布局取 8 字节基座、关键帧走 stss 链），公开面映射
+//! `MediaType::Subtitle` + `CodecId::Unknown`（develop 的 `MediaType`
+//! 无 Other；裁决见 docs/contracts.md）。
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
+
+use ye_codec::{AudioParams, CodecParameters, MediaType, Packet, PacketFlags, VideoParams};
+use ye_container::{Metadata, Stream};
+use ye_time::{Rational, Timestamp};
 
 use crate::box_tree::{BoxInfo, BoxNode};
 use crate::error::{Mp4Error, malformed};
-use crate::types::{AudioInfo, FourCc, MediaKind, Packet, Stream, VideoInfo};
-use ye_time::{Rational, Timestamp};
+use crate::types::{FourCc, codec_id_of, default_channel_layout};
 
 type Res<T> = std::result::Result<T, Mp4Error>;
 
-/// 轨道时间值（timebase 单位）换算成全局 tick（`Timestamp::from_units`，
-/// 四舍五入 half-away-from-zero）。溢出报 Malformed。
-fn to_ticks(v: i64, tb: Rational, path: &str, what: &str) -> Res<Timestamp> {
-    Timestamp::from_units(v, tb)
-        .ok_or_else(|| malformed(path, format!("{what} 换算全局 tick 溢出")))
+/// 轨道媒体类别（内部三值；公开面映射 [`MediaType`]，Other→Subtitle）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackKind {
+    Video,
+    Audio,
+    Other,
+}
+
+impl TrackKind {
+    fn media_type(self) -> MediaType {
+        match self {
+            TrackKind::Video => MediaType::Video,
+            TrackKind::Audio => MediaType::Audio,
+            TrackKind::Other => MediaType::Subtitle,
+        }
+    }
+}
+
+/// 轨道时间值（timescale 单位，u64 源）→ i64 tick 数。
+/// 单位域即 tick 域，无换算无舍入；落不回 i64 ⇒ Malformed。
+fn u64_ticks(v: u64, path: &str, what: &str) -> Res<i64> {
+    i64::try_from(v).map_err(|_| malformed(path, format!("{what} 超出可表示范围")))
 }
 
 // —— 样例表数据 ——
@@ -155,6 +186,10 @@ struct TrafState {
 
 /// 一路 trak 的样例表，`read_packet` 随机访问的依据。
 struct TrackTables {
+    kind: TrackKind,
+    track_id: u32,
+    /// stsd 首 entry 类型（avc1/mp4a/…）。
+    codec: FourCc,
     timebase: Rational,
     /// 如 `"moov.trak[0]"`，错误定位用。
     path: String,
@@ -328,10 +363,10 @@ impl TrackTables {
     }
 
     /// stss 含此样例（1-based）⇒ 关键帧；无表 ⇒ 恒 true；音频 ⇒ 恒 true。
-    fn is_keyframe(&self, kind: MediaKind, sample: u64) -> bool {
-        match kind {
-            MediaKind::Audio => true,
-            MediaKind::Video | MediaKind::Other => match &self.stss {
+    fn is_keyframe(&self, sample: u64) -> bool {
+        match self.kind {
+            TrackKind::Audio => true,
+            TrackKind::Video | TrackKind::Other => match &self.stss {
                 Some(set) => set.contains(&(sample + 1)),
                 None => true,
             },
@@ -342,10 +377,10 @@ impl TrackTables {
 /// fragment 样例关键帧：有效 flags 的 sample_is_non_sync_sample 位
 /// （0x00010000）清零 ⇒ 关键帧；flags 全缺省 ⇒ true（与 stbl 无 stss 表
 /// 恒关键帧的语义对齐）；音频 ⇒ 恒 true。
-fn is_frag_keyframe(kind: MediaKind, flags: Option<u32>) -> bool {
+fn is_frag_keyframe(kind: TrackKind, flags: Option<u32>) -> bool {
     match kind {
-        MediaKind::Audio => true,
-        MediaKind::Video | MediaKind::Other => flags.is_none_or(|f| f & 0x0001_0000 == 0),
+        TrackKind::Audio => true,
+        TrackKind::Video | TrackKind::Other => flags.is_none_or(|f| f & 0x0001_0000 == 0),
     }
 }
 
@@ -360,6 +395,28 @@ pub struct Mp4Reader<R: Read + Seek> {
     boxes: Vec<BoxNode>,
     streams: Vec<Stream>,
     tracks: Vec<TrackTables>,
+}
+
+/// MP4 轨道特有信息（develop `Stream` 放不下的字段，只读查询）：
+/// tkhd 的 track_id 与 stsd 首 entry 的原始 fourcc。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// tkhd track_ID。
+    pub track_id: u32,
+    /// stsd 首 entry 类型（avc1/mp4a/…；`CodecId` 之外的原始四字符码）。
+    pub codec: FourCc,
+}
+
+/// 样例时戳（流时基；`Mp4Reader::sample_timing` 的返回）。
+/// pts 恒有值（ctts 缺省 ⇒ cts=0 ⇒ pts==dts）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleTiming {
+    /// 解码时戳。
+    pub dts: Timestamp,
+    /// 展示时戳（dts + ctts 偏移）。
+    pub pts: Timestamp,
+    /// 样例时长。
+    pub duration: Timestamp,
 }
 
 /// 手写 Debug（R 未必可 Debug；只显示流表摘要，测试里 `unwrap_err` 需要）。
@@ -448,6 +505,16 @@ impl<R: Read + Seek> Mp4Reader<R> {
         self.streams.get(index)
     }
 
+    /// MP4 轨道特有信息（track_id / 原始 fourcc）——develop `Stream`
+    /// 无处安放的字段，经此只读查询（流索引越界同 [`Mp4Error::InvalidStreamIndex`]）。
+    pub fn track_info(&self, stream_index: usize) -> Result<TrackInfo, Mp4Error> {
+        let t = self.track_tables(stream_index)?;
+        Ok(TrackInfo {
+            track_id: t.track_id,
+            codec: t.codec,
+        })
+    }
+
     pub fn sample_count(&self, stream_index: usize) -> Result<usize, Mp4Error> {
         match self.tracks.get(stream_index) {
             Some(t) => Ok(t.sample_count as usize),
@@ -458,22 +525,64 @@ impl<R: Read + Seek> Mp4Reader<R> {
         }
     }
 
-    /// 随机访问：按 sample_index 读一个样例。序号统一编址——小于 stbl
-    /// 样例数走样例表（拼 dts/pts/keyframe，seek 到 chunk_offset+前序样例
-    /// 偏移）；否则走 fragment 样例（tfdt/trun 已在解析期算好偏移与时戳）。
-    /// 按序解封装 = 调用方 sample_index 递增。
-    pub fn read_packet(
-        &mut self,
-        stream_index: usize,
-        sample_index: usize,
-    ) -> Result<Packet, Mp4Error> {
-        let Some(stream) = self.streams.get(stream_index) else {
-            return Err(Mp4Error::InvalidStreamIndex {
+    /// 轨道表引用（越界统一 InvalidStreamIndex）。
+    fn track_tables(&self, stream_index: usize) -> Result<&TrackTables, Mp4Error> {
+        self.tracks
+            .get(stream_index)
+            .ok_or(Mp4Error::InvalidStreamIndex {
                 index: stream_index,
                 count: self.streams.len(),
-            });
-        };
-        let t = &self.tracks[stream_index];
+            })
+    }
+
+    /// 第 sample 个样例（0-based）的时戳三元组（dts/pts/duration，
+    /// 流时基轨道单位；不读样例数据）。progressive 与 fragment 统一编址。
+    /// 错误语义与 [`Mp4Reader::read_packet`] 一致。
+    pub fn sample_timing(
+        &self,
+        stream_index: usize,
+        sample_index: usize,
+    ) -> Result<SampleTiming, Mp4Error> {
+        let t = self.track_tables(stream_index)?;
+        let si = self.check_sample_index(t, stream_index, sample_index)?;
+        let (dts, pts, duration) = self.sample_times(t, si)?;
+        Ok(SampleTiming { dts, pts, duration })
+    }
+
+    /// ≤ sample_index 的最近关键帧样例序号（含自身；自身即关键帧则返回
+    /// 自身）。音频轨/无 stss 表恒关键帧 ⇒ 恒返回 sample_index。
+    /// 为接线阶段 `Demuxer::seek`（前一关键帧语义）预置的只读查询，
+    /// 不改变任何读取状态。错误语义与 [`Mp4Reader::read_packet`] 一致。
+    pub fn keyframe_index_before(
+        &self,
+        stream_index: usize,
+        sample_index: usize,
+    ) -> Result<usize, Mp4Error> {
+        let t = self.track_tables(stream_index)?;
+        let si = self.check_sample_index(t, stream_index, sample_index)?;
+        for i in (0..=si).rev() {
+            let key = if i < t.stbl_count {
+                t.is_keyframe(i)
+            } else {
+                let f = &t.frags[(i - t.stbl_count) as usize];
+                is_frag_keyframe(t.kind, f.flags)
+            };
+            if key {
+                return Ok(i as usize);
+            }
+        }
+        // 到不了这里：0 号样例要么在 stss 表（1-based 样号 1 必要时含 0
+        // 之前无样例），要么无表恒关键帧。防御性返回 0。
+        Ok(0)
+    }
+
+    /// 样例序号越界检查（0-based，统一编址）。
+    fn check_sample_index(
+        &self,
+        t: &TrackTables,
+        stream_index: usize,
+        sample_index: usize,
+    ) -> Result<u64, Mp4Error> {
         if sample_index as u64 >= t.sample_count {
             return Err(Mp4Error::SampleIndexOutOfRange {
                 stream: stream_index,
@@ -481,51 +590,73 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 count: t.sample_count as usize,
             });
         }
-        let si = sample_index as u64;
-        let (dts, pts, duration, keyframe, offset, size, bound_path) = if si < t.stbl_count {
+        Ok(sample_index as u64)
+    }
+
+    /// 第 si 个样例的 (dts, pts, duration)（流时基）。progressive 走
+    /// stts/ctts 前缀计算，fragment 走解析期已算好的字段。
+    fn sample_times(&self, t: &TrackTables, si: u64) -> Res<(Timestamp, Timestamp, Timestamp)> {
+        if si < t.stbl_count {
             // —— progressive 分支：stbl 样例表 ——
             let ctts_path = format!("{}.mdia.minf.stbl.ctts", t.path);
             let stts_path = format!("{}.mdia.minf.stbl.stts", t.path);
-            let stsz_path = format!("{}.mdia.minf.stbl.stsz", t.path);
             let (dts_track, delta) = t.stts_at(si)?;
-            let dts_v = i64::try_from(dts_track)
-                .map_err(|_| malformed(&stts_path, "dts 超出可表示范围"))?;
-            let dts = to_ticks(dts_v, t.timebase, &stts_path, "dts")?;
-            let pts = match t.ctts_at(si)? {
-                Some(off) => {
-                    let v = dts_v
-                        .checked_add(off)
-                        .ok_or_else(|| malformed(&ctts_path, "pts 溢出"))?;
-                    Some(to_ticks(v, t.timebase, &ctts_path, "pts")?)
-                }
-                None => None,
+            let dts_v = u64_ticks(dts_track, &stts_path, "dts")?;
+            let dts = Timestamp::new(dts_v, t.timebase);
+            // ctts 偏移可有符号（v1 负偏移合法，pts 可早于 dts/为负）。
+            let pts_v = match t.ctts_at(si)? {
+                Some(off) => dts_v
+                    .checked_add(off)
+                    .ok_or_else(|| malformed(&ctts_path, "pts 溢出"))?,
+                None => dts_v,
             };
-            let delta_v = i64::try_from(delta)
-                .map_err(|_| malformed(&stts_path, "样例时长超出可表示范围"))?;
-            let duration = to_ticks(delta_v, t.timebase, &stts_path, "样例时长")?;
-            let keyframe = t.is_keyframe(stream.kind, si);
-            let (offset, size) = t.locate(si, self.file_len)?;
-            (dts, pts, duration, keyframe, offset, size, stsz_path)
+            let pts = Timestamp::new(pts_v, t.timebase);
+            let duration = Timestamp::new(u64_ticks(delta, &stts_path, "样例时长")?, t.timebase);
+            Ok((dts, pts, duration))
         } else {
             // —— fragment 分支：tfdt/trun 解析期已算好的字段 ——
             let f = &t.frags[(si - t.stbl_count) as usize];
             let path = t.frag_path.clone();
-            let dts_v = i64::try_from(f.dts).map_err(|_| malformed(&path, "dts 超出可表示范围"))?;
-            let dts = to_ticks(dts_v, t.timebase, &path, "dts")?;
-            let pts = match f.cts {
-                Some(c) => {
-                    let v = dts_v
-                        .checked_add(c)
-                        .ok_or_else(|| malformed(&path, "pts 溢出"))?;
-                    Some(to_ticks(v, t.timebase, &path, "pts")?)
-                }
-                None => None,
+            let dts_v = u64_ticks(f.dts, &path, "dts")?;
+            let dts = Timestamp::new(dts_v, t.timebase);
+            let pts_v = match f.cts {
+                Some(c) => dts_v
+                    .checked_add(c)
+                    .ok_or_else(|| malformed(&path, "pts 溢出"))?,
+                None => dts_v,
             };
-            let dur_v = i64::try_from(f.duration)
-                .map_err(|_| malformed(&path, "样例时长超出可表示范围"))?;
-            let duration = to_ticks(dur_v, t.timebase, &path, "样例时长")?;
-            let keyframe = is_frag_keyframe(stream.kind, f.flags);
-            (dts, pts, duration, keyframe, f.offset, f.size, path)
+            let pts = Timestamp::new(pts_v, t.timebase);
+            let duration = Timestamp::new(u64_ticks(f.duration, &path, "样例时长")?, t.timebase);
+            Ok((dts, pts, duration))
+        }
+    }
+
+    /// 随机访问：按 sample_index 读一个样例。序号统一编址——小于 stbl
+    /// 样例数走样例表（拼 dts/pts/keyframe，seek 到 chunk_offset+前序样例
+    /// 偏移）；否则走 fragment 样例（tfdt/trun 已在解析期算好偏移与时戳）。
+    /// 按序解封装 = 调用方 sample_index 递增。产出的包按流时基打戳
+    /// （demuxer 打戳契约），keyframe 进 `PacketFlags::KEYFRAME`。
+    pub fn read_packet(
+        &mut self,
+        stream_index: usize,
+        sample_index: usize,
+    ) -> Result<Packet, Mp4Error> {
+        let t = self.track_tables(stream_index)?;
+        let si = self.check_sample_index(t, stream_index, sample_index)?;
+        let (dts, pts, duration) = self.sample_times(t, si)?;
+        let keyframe = if si < t.stbl_count {
+            t.is_keyframe(si)
+        } else {
+            let f = &t.frags[(si - t.stbl_count) as usize];
+            is_frag_keyframe(t.kind, f.flags)
+        };
+        let (offset, size, bound_path) = if si < t.stbl_count {
+            let stsz_path = format!("{}.mdia.minf.stbl.stsz", t.path);
+            let (offset, size) = t.locate(si, self.file_len)?;
+            (offset, size, stsz_path)
+        } else {
+            let f = &t.frags[(si - t.stbl_count) as usize];
+            (f.offset, f.size, t.frag_path.clone())
         };
         // 分配前先按文件长度校验样例范围：stsz/trun 声明可达近 4 GiB，
         // 不校验就 vec![0u8; size] 会被损坏文件拖进巨型分配。
@@ -544,14 +675,17 @@ impl<R: Read + Seek> Mp4Reader<R> {
         let mut data = vec![0u8; size as usize];
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.read_exact(&mut data)?;
+        let mut flags = PacketFlags::empty();
+        if keyframe {
+            flags.insert(PacketFlags::KEYFRAME);
+        }
         Ok(Packet {
-            stream_index,
-            sample_index,
-            dts,
-            pts,
-            duration,
-            keyframe,
-            data,
+            data: Arc::from(data),
+            stream_index: stream_index as u32,
+            pts: Some(pts),
+            dts: Some(dts),
+            duration: Some(duration),
+            flags,
         })
     }
 
@@ -1369,7 +1503,7 @@ fn parse_trun(d: &[u8], path: &str, ctx: &mut ParseCtx) -> Res<()> {
     // 约束。补长度界（同 read_packet 分配前校验的原则：数据必须装进
     // 文件），防无逐样例字段的 trun 声明 u32::MAX 样例令逐样例入表
     // 触发巨型分配 abort：缺省 size 已知时 O(1) 校验本 trun 数据总跨度；
-    // size 全缺省为 0 无字节可依时按样例数 ≤ file_len 兜底。逐样例显式
+    // size 全缺省 0 无字节可依时按样例数 ≤ file_len 兜底。逐样例显式
     // size 时每个样例至少占 trun 内 4 字节，样例数已被 need 约束。
     if !f_size {
         let def_size = traf
@@ -1384,17 +1518,13 @@ fn parse_trun(d: &[u8], path: &str, ctx: &mut ParseCtx) -> Res<()> {
             if end > file_len {
                 return Err(malformed(
                     path,
-                    format!(
-                        "fragment 样例数据越出文件（需 {end} 字节，文件长 {file_len}）"
-                    ),
+                    format!("fragment 样例数据越出文件（需 {end} 字节，文件长 {file_len}）"),
                 ));
             }
         } else if n > file_len {
             return Err(malformed(
                 path,
-                format!(
-                    "fragment 样例数 {n} 超出文件长度 {file_len}（size 缺省 0 的兜底界）"
-                ),
+                format!("fragment 样例数 {n} 超出文件长度 {file_len}（size 缺省 0 的兜底界）"),
             ));
         }
     }
@@ -1481,17 +1611,22 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         .ok_or_else(|| malformed(&format!("{path}.mdia.minf.stbl.stco"), "缺失 stco/co64"))?;
 
     let kind = match &b.handler {
-        Some(h) if h.as_bytes() == *b"vide" => MediaKind::Video,
-        Some(h) if h.as_bytes() == *b"soun" => MediaKind::Audio,
-        _ => MediaKind::Other,
+        Some(h) if h.as_bytes() == *b"vide" => TrackKind::Video,
+        Some(h) if h.as_bytes() == *b"soun" => TrackKind::Audio,
+        _ => TrackKind::Other,
     };
     let (video, audio, extra_data) = extract_entry_fields(kind, &b.stsd_content, &path)?;
 
     let mdhd_path = format!("{path}.mdia.mdhd");
-    let timebase = Rational::new(1, timescale as i64)
-        .ok_or_else(|| malformed(&mdhd_path, "timescale 超出可表示范围"))?;
+    // timescale 为 u32；Rational 分母为 i32——超出 i32::MAX 的 timescale
+    // 无法构造 1/timescale ⇒ Malformed（荒谬量级，正常文件不触）。
+    if timescale > i32::MAX as u32 {
+        return Err(malformed(&mdhd_path, "timescale 超出可表示范围"));
+    }
+    let timebase = Rational::new(1, timescale as i32);
     // 有 fragment 样例 ⇒ Stream.duration = 末 fragment 尾 dts+dur
-    // （mdhd/mehd 为 0 时亦然）；否则沿用 mdhd 时长。
+    // （mdhd/mehd 为 0 时亦然）；否则沿用 mdhd 时长。流时基原生单位，
+    // 无换算无舍入。
     let frag = b.frag;
     let frag_count = frag.as_ref().map_or(0, |f| f.samples.len() as u64);
     let sample_count = stsz
@@ -1499,36 +1634,52 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         .checked_add(frag_count)
         .ok_or_else(|| malformed(&mdhd_path, "样例计数溢出"))?;
     let duration = match &frag {
-        Some(f) => {
-            let end = i64::try_from(f.end_dts)
-                .map_err(|_| malformed(&f.path, "fragment 尾 dts 超出可表示范围"))?;
-            to_ticks(end, timebase, &f.path, "fragment 尾 dts")?
-        }
-        None => to_ticks(
-            i64::try_from(b.mdhd_duration.unwrap_or(0))
-                .map_err(|_| malformed(&mdhd_path, "时长超出可表示范围"))?,
+        Some(f) => Timestamp::new(u64_ticks(f.end_dts, &f.path, "fragment 尾 dts")?, timebase),
+        None => Timestamp::new(
+            u64_ticks(b.mdhd_duration.unwrap_or(0), &mdhd_path, "时长")?,
             timebase,
-            &mdhd_path,
-            "时长",
-        )?,
+        ),
     };
     let (frags, frag_path) = match frag {
         Some(f) => (f.samples, f.path),
         None => (Vec::new(), String::new()),
     };
 
+    let media_type = kind.media_type();
     let stream = Stream {
-        index,
-        track_id: b.track_id.unwrap_or(0),
-        kind,
-        codec,
-        timebase,
-        duration,
-        video,
-        audio,
-        extra_data,
+        index: index as u32,
+        media_type,
+        codec: CodecParameters {
+            codec: codec_id_of(&codec),
+            media_type,
+            extradata: if extra_data.is_empty() {
+                None
+            } else {
+                Some(extra_data)
+            },
+            bit_rate: None,
+            video: video.map(|(width, height)| VideoParams {
+                width,
+                height,
+                pixel_format: None,
+                frame_rate: None,
+            }),
+            audio: audio.map(|(channel_count, sample_rate)| AudioParams {
+                sample_rate,
+                channel_layout: default_channel_layout(channel_count),
+                sample_format: None,
+            }),
+        },
+        time_base: timebase,
+        start_time: None,
+        duration: Some(duration),
+        nb_frames: Some(sample_count),
+        metadata: Metadata::new(),
     };
     let tables = TrackTables {
+        kind,
+        track_id: b.track_id.unwrap_or(0),
+        codec,
         timebase,
         path,
         stts,
@@ -1549,24 +1700,22 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
 
 /// 按 kind 从 stsd entry 内容取宽高/声道采样率与首个子 box 载荷。
 /// visual entry 固定字段 78 字节，audio 20 字节，其余按 8 字节
-/// SampleEntry 基座找子 box。
-fn extract_entry_fields(
-    kind: MediaKind,
-    content: &[u8],
-    trak_path: &str,
-) -> Res<(Option<VideoInfo>, Option<AudioInfo>, Vec<u8>)> {
+/// SampleEntry 基座找子 box。返回 (视频 (w,h)?, 音频 (声道,采样率)?, extra)。
+type EntryFields = (Option<(u32, u32)>, Option<(u32, u32)>, Vec<u8>);
+
+fn extract_entry_fields(kind: TrackKind, content: &[u8], trak_path: &str) -> Res<EntryFields> {
     let path = format!("{trak_path}.mdia.minf.stbl.stsd");
     let mut c = Cur::new(content);
     match kind {
-        MediaKind::Video => {
+        TrackKind::Video => {
             c.need(78, &path, "visual entry")?;
             c.skip(24, &path, "entry 固定字段")?;
             let width = c.u16(&path, "width")? as u32;
             let height = c.u16(&path, "height")? as u32;
             let extra = child_payload(content, 78, &path)?;
-            Ok((Some(VideoInfo { width, height }), None, extra))
+            Ok((Some((width, height)), None, extra))
         }
-        MediaKind::Audio => {
+        TrackKind::Audio => {
             c.need(20, &path, "audio entry")?;
             // 两种 AudioSampleEntry 布局都支持，以 samplerate 高 16 位
             // （16.16 定点）与声道数的合理区间判别：
@@ -1600,16 +1749,9 @@ fn extract_entry_fields(
                 return Err(malformed(&path, "audio entry 声道/采样率字段不可识别"));
             };
             let extra = child_payload(content, fixed_len, &path)?;
-            Ok((
-                None,
-                Some(AudioInfo {
-                    channel_count,
-                    sample_rate,
-                }),
-                extra,
-            ))
+            Ok((None, Some((channel_count, sample_rate)), extra))
         }
-        MediaKind::Other => {
+        TrackKind::Other => {
             let extra = child_payload(content, 8, &path)?;
             Ok((None, None, extra))
         }

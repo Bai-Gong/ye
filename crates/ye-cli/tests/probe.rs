@@ -324,9 +324,11 @@ fn temp_mp4(bytes: &[u8]) -> PathBuf {
 
 // —— 断言 —-
 
-/// M1 验收口径：`ye probe` 列出每路流的编解码、宽高/采样率、时基、时长。
-/// 视频时长 30 单位 @ 1/1000 → 211680 tick = 0.030s；
-/// 音频时长 48 单位 @ 1/48000 → 7056 tick = 0.001s。
+/// M2 接线后验收口径：`ye probe` 经注册表 auto-probe 识别格式，列出
+/// 每路流的编解码、宽高/采样率、时基、时长，另补帧率与码率。
+/// 视频时长 30 单位 @ 1/1000（流时基原生 tick）；
+/// 帧率 3÷0.030s = 100.000；码率 (4+5+6)×8÷0.030s = 4000bps。
+/// 音频时长 48 单位 @ 1/48000；码率 4×8÷0.001s = 32000bps。
 #[test]
 fn probe_lists_every_stream() {
     let path = temp_mp4(&two_track_mp4());
@@ -334,20 +336,20 @@ fn probe_lists_every_stream() {
     let out = probe(&path).expect("probe 双轨 MP4 应成功");
 
     assert!(
-        out.contains(": MP4, 2 路流"),
-        "报告头应声明容器与流数，实际:\n{out}"
+        out.contains(": mp4, 2 路流"),
+        "报告头应声明容器（注册表识别）与流数，实际:\n{out}"
     );
     assert!(
         out.contains(
-            "流 #0 [视频] codec=avc1 时基=1/1000 时长=0.030s (211680 tick) 样例数=3 尺寸=64x96"
+            "流 #0 [视频] codec=h264 时基=1/1000 时长=0.030s (30 tick) 样例数=3 帧率≈100.000（样例数÷时长近似，VFR 文件有偏差） 尺寸=64x96 码率=4000bps"
         ),
-        "视频流行应完整，实际:\n{out}"
+        "视频流行应完整（含帧率近似与 VFR 偏差注明、码率），实际:\n{out}"
     );
     assert!(
         out.contains(
-            "流 #1 [音频] codec=mp4a 时基=1/48000 时长=0.001s (7056 tick) 样例数=1 声道=2 采样率=48000Hz"
+            "流 #1 [音频] codec=aac 时基=1/48000 时长=0.001s (48 tick) 样例数=1 声道=2 采样率=48000Hz 码率=32000bps"
         ),
-        "音频流行应完整，实际:\n{out}"
+        "音频流行应完整（含码率），实际:\n{out}"
     );
 }
 
@@ -387,11 +389,11 @@ fn binary_probe_end_to_end() {
     let stdout = String::from_utf8(out.stdout).expect("stdout 应为 UTF-8");
     println!("---- ye probe 实际输出 ----\n{stdout}---------------------------");
     assert!(
-        stdout.contains("流 #0 [视频] codec=avc1") && stdout.contains("尺寸=64x96"),
+        stdout.contains("流 #0 [视频] codec=h264") && stdout.contains("尺寸=64x96"),
         "二进制 stdout 应含视频流信息，实际:\n{stdout}"
     );
     assert!(
-        stdout.contains("流 #1 [音频] codec=mp4a") && stdout.contains("采样率=48000Hz"),
+        stdout.contains("流 #1 [音频] codec=aac") && stdout.contains("采样率=48000Hz"),
         "二进制 stdout 应含音频流信息，实际:\n{stdout}"
     );
 }
@@ -418,7 +420,7 @@ fn binary_exit_codes() {
     assert!(String::from_utf8(help.stdout).unwrap().contains("ye probe"));
 
     let bad = std::process::Command::new(bin)
-        .arg("convert")
+        .arg("frobnicate")
         .output()
         .expect("启动 ye 二进制失败");
     assert_eq!(
@@ -427,6 +429,65 @@ fn binary_exit_codes() {
         "未知命令应以退出码 2 报用法错误"
     );
     assert!(String::from_utf8(bad.stderr).unwrap().contains("未知命令"));
+}
+
+// —— convert 占位桩（真转码 M3；参数形态即锻接入契约）——
+
+/// 真二进制调用 `ye convert`：固定返回不支持的特性（退出码 1），
+/// 且不产出输出文件。
+#[test]
+fn binary_convert_stub_returns_unsupported() {
+    let src = temp_mp4(&two_track_mp4());
+    let _guard = scopeguard(&src);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dst = std::env::temp_dir().join(format!(
+        "ye-cli-convert-stub-{}-{unique}.mp4",
+        std::process::id()
+    ));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ye"))
+        .arg("convert")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("启动 ye 二进制失败");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "convert 桩应以退出码 1 报不支持的特性"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("不支持的特性") && stderr.contains("M3"),
+        "stderr 应明确 Unsupported 桩语义，实际:\n{stderr}"
+    );
+    assert!(!dst.exists(), "占位桩不应产出输出文件: {}", dst.display());
+}
+
+/// lib 层直调：convert 收到进度回调与取消旗标后仍返回桩错误
+/// （回调不被触发），错误信息含两个路径。
+#[test]
+fn convert_stub_signature_and_error() {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    let cancel = AtomicBool::new(false);
+    let called = Cell::new(false);
+    let progress = |_, _| called.set(true);
+    let err = ye_cli::convert(
+        std::path::Path::new("in.mp4"),
+        std::path::Path::new("out.mp4"),
+        &progress,
+        &cancel,
+    )
+    .expect_err("占位桩应返回 Err");
+    assert!(!called.get(), "桩不触发进度回调");
+    assert!(
+        err.contains("in.mp4") && err.contains("out.mp4") && err.contains("不支持的特性"),
+        "错误应含路径与 Unsupported 语义，实际: {err}"
+    );
 }
 
 // —— 参数解析 ——
@@ -467,6 +528,26 @@ fn parse_args_rejects_bad_usage() {
     );
     assert!(
         parse_args(&[OsString::from("convert")]).is_err(),
+        "convert 缺参数应报用法错误"
+    );
+    assert!(
+        parse_args(&[OsString::from("frobnicate")]).is_err(),
         "未知命令应报用法错误"
+    );
+}
+
+#[test]
+fn parse_args_accepts_convert() {
+    let case = parse_args(&[
+        OsString::from("convert"),
+        OsString::from("in.mp4"),
+        OsString::from("out.mp4"),
+    ]);
+    assert_eq!(
+        case,
+        Ok(Command::Convert {
+            input: PathBuf::from("in.mp4"),
+            output: PathBuf::from("out.mp4")
+        })
     );
 }

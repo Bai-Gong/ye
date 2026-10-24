@@ -1,14 +1,17 @@
 //! Mp4Writer 单元测试：写 `Cursor<Vec<u8>>`，用 [`Mp4Reader`] 读回断言
 //! + 定点字节断言。自包含（不依赖 helpers/）。
 //!
-//! 帧时戳全部给全局 tick（tick 基数 7,056,000）：1/1000 时基下
-//! 1 单位 = 70_560 tick，1/48000 下 1 单位 = 147 tick。
+//! 移植后语义：包时戳自带时基（自描述 `Timestamp`）。本文件主路径用
+//! 轨道时基原生单位（1/1000 下 1 单位即 1 tick；1/48000 同理）——重标度
+//! 恒等、逐包精确；另设跨时基重标度专组（NearInf 舍入路径）。
 
 use std::io::Cursor;
+use std::sync::Arc;
 use ye_container_mp4::{
-    AudioInfo, BoxNode, FourCc, Layout, MediaKind, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet,
-    Rational, Timestamp, TrackConfig, VideoInfo, WriterError,
+    AudioParams, CodecId, Layout, MediaType, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet,
+    PacketFlags, Rational, Timestamp, TrackConfig, VideoParams, WriterError,
 };
+use ye_pixfmt::ChannelLayout;
 
 /// avcC 载荷（AVCDecoderConfigurationRecord 本体；内容任意但定长便于断言）。
 const AVCC: [u8; 14] = [
@@ -25,47 +28,73 @@ const ESDS: [u8; 29] = [
     0x06, 0x01, 0x02, // SLConfigDescriptor
 ];
 
-fn t(v: i64) -> Timestamp {
-    Timestamp::from_ticks(v)
+/// 指定时基下的时间戳。
+fn ts(units: i64, tb_den: i32) -> Timestamp {
+    Timestamp::new(units, Rational::new(1, tb_den))
 }
 
-fn video_cfg(tb_den: i64) -> TrackConfig {
+/// 视频轨时基（1/1000）便捷构造。
+fn t(units: i64) -> Timestamp {
+    ts(units, 1000)
+}
+
+fn video_cfg(tb_den: i32) -> TrackConfig {
     TrackConfig {
-        kind: MediaKind::Video,
-        codec: FourCc::new(*b"avc1"),
-        timebase: Rational::new(1, tb_den).unwrap(),
-        video: Some(VideoInfo {
+        media_type: MediaType::Video,
+        codec: CodecId::H264,
+        timebase: Rational::new(1, tb_den),
+        video: Some(VideoParams {
             width: 64,
             height: 96,
+            pixel_format: None,
+            frame_rate: None,
         }),
         audio: None,
         extra_data: AVCC.to_vec(),
     }
 }
 
-fn audio_cfg(tb_den: i64) -> TrackConfig {
+fn audio_cfg(tb_den: i32) -> TrackConfig {
     TrackConfig {
-        kind: MediaKind::Audio,
-        codec: FourCc::new(*b"mp4a"),
-        timebase: Rational::new(1, tb_den).unwrap(),
+        media_type: MediaType::Audio,
+        codec: CodecId::Aac,
+        timebase: Rational::new(1, tb_den),
         video: None,
-        audio: Some(AudioInfo {
-            channel_count: 2,
+        audio: Some(AudioParams {
             sample_rate: 48_000,
+            channel_layout: Some(ChannelLayout::STEREO),
+            sample_format: None,
         }),
         extra_data: ESDS.to_vec(),
     }
 }
 
-fn pkt(si: usize, idx: usize, dts: i64, dur: i64, key: bool, data: &[u8]) -> Packet {
+/// 轨道时基原生单位的包（主路径：重标度恒等）。
+fn pkt(si: usize, dts_units: i64, dur_units: i64, key: bool, data: &[u8]) -> Packet {
+    pkt_tb(si, dts_units, dur_units, key, data, 1000)
+}
+
+/// 指定包时基的包（跨时基重标度组用）。
+fn pkt_tb(
+    si: usize,
+    dts_units: i64,
+    dur_units: i64,
+    key: bool,
+    data: &[u8],
+    tb_den: i32,
+) -> Packet {
+    let tb = Rational::new(1, tb_den);
+    let mut flags = PacketFlags::empty();
+    if key {
+        flags.insert(PacketFlags::KEYFRAME);
+    }
     Packet {
-        stream_index: si,
-        sample_index: idx,
-        dts: t(dts),
+        data: Arc::from(data.to_vec()),
+        stream_index: si as u32,
         pts: None,
-        duration: t(dur),
-        keyframe: key,
-        data: data.to_vec(),
+        dts: Some(Timestamp::new(dts_units, tb)),
+        duration: Some(Timestamp::new(dur_units, tb)),
+        flags,
     }
 }
 
@@ -100,12 +129,15 @@ fn i32b(b: &[u8], at: usize) -> i32 {
     u32b(b, at) as i32
 }
 
-fn find<'a>(nodes: &'a [BoxNode], kind: &str) -> Option<&'a BoxNode> {
+fn find<'a>(
+    nodes: &'a [ye_container_mp4::BoxNode],
+    kind: &str,
+) -> Option<&'a ye_container_mp4::BoxNode> {
     nodes.iter().find(|n| n.info.kind.as_str() == kind)
 }
 
 /// 第 trak_i 路轨的 stbl 节点。
-fn stbl_of(r: &Mp4Reader<Cursor<Vec<u8>>>, trak_i: usize) -> &BoxNode {
+fn stbl_of(r: &Mp4Reader<Cursor<Vec<u8>>>, trak_i: usize) -> &ye_container_mp4::BoxNode {
     let moov = find(r.box_tree(), "moov").unwrap();
     let trak = moov
         .children
@@ -119,7 +151,7 @@ fn stbl_of(r: &Mp4Reader<Cursor<Vec<u8>>>, trak_i: usize) -> &BoxNode {
 }
 
 /// box 载荷（8 字节普通头；本封装器产出的表 box 均非 largesize）。
-fn payload<'a>(data: &'a [u8], node: &BoxNode) -> &'a [u8] {
+fn payload<'a>(data: &'a [u8], node: &ye_container_mp4::BoxNode) -> &'a [u8] {
     let s = node.info.offset as usize;
     &data[s + 8..s + node.info.size as usize]
 }
@@ -177,6 +209,10 @@ fn co64_entries(p: &[u8]) -> Vec<u64> {
     (0..n).map(|i| u64b(p, 8 + i * 8)).collect()
 }
 
+fn is_key(p: &Packet) -> bool {
+    p.flags.contains(PacketFlags::KEYFRAME)
+}
+
 // —— ① 单视频轨黄金：布局 + stco 回填 + stts run-length 合并 ——
 
 #[test]
@@ -185,22 +221,15 @@ fn golden_layout_ftyp_free_mdat_moov() {
         free_size: 16,
         ..Default::default()
     };
-    // 3 样例：durations 10/10/20 单位（tb=1/1000 ⇒ 70_560/70_560/141_120 tick），
-    // 数据 4+5+6=15 字节，全关键帧。
+    // 3 样例：durations 10/10/20 单位（tb=1/1000），数据 4+5+6=15 字节，
+    // 全关键帧。
     let data = mux(
         opts,
         vec![video_cfg(1000)],
         vec![
-            pkt(0, 0, 0, 70_560, true, &[0xA0, 0xA1, 0xA2, 0xA3]),
-            pkt(0, 1, 70_560, 70_560, true, &[0xA4, 0xA5, 0xA6, 0xA7, 0xA8]),
-            pkt(
-                0,
-                2,
-                141_120,
-                141_120,
-                true,
-                &[0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE],
-            ),
+            pkt(0, 0, 10, true, &[0xA0, 0xA1, 0xA2, 0xA3]),
+            pkt(0, 10, 10, true, &[0xA4, 0xA5, 0xA6, 0xA7, 0xA8]),
+            pkt(0, 20, 20, true, &[0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE]),
         ],
     )
     .unwrap();
@@ -239,14 +268,14 @@ fn golden_layout_ftyp_free_mdat_moov() {
     let stsz = find(&stbl.children, "stsz").unwrap();
     assert_eq!(stsz_table(payload(&data, stsz)), (0, 3, vec![4, 5, 6]));
 
-    // 读回：dts/duration/数据逐包一致。
+    // 读回：dts/duration/数据逐包一致（流时基原生单位）。
     assert_eq!(r.sample_count(0).unwrap(), 3);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!((p0.dts, p0.duration), (t(0), t(70_560)));
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!((p0.dts, p0.duration), (Some(t(0)), Some(t(10))));
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!((p2.dts, p2.duration), (t(141_120), t(141_120)));
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!((p2.dts, p2.duration), (Some(t(20)), Some(t(20))));
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 }
 
 /// free_size=0（默认）⇒ 不写 free，顶层即 ftyp → mdat → moov。
@@ -257,7 +286,7 @@ fn zero_free_size_omits_free_box() {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![pkt(0, 0, 0, 70_560, true, &[1, 2, 3])],
+        vec![pkt(0, 0, 10, true, &[1, 2, 3])],
     )
     .unwrap();
     let r = Mp4Reader::from_vec(data).unwrap();
@@ -274,67 +303,68 @@ fn avc1_extra_data_roundtrip() {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![pkt(0, 0, 0, 70_560, true, &[0xAA; 8])],
+        vec![pkt(0, 0, 10, true, &[0xAA; 8])],
     )
     .unwrap();
     let mut r = Mp4Reader::from_vec(data).unwrap();
     let s = r.stream(0).unwrap();
-    assert_eq!(s.kind, MediaKind::Video);
-    assert_eq!(s.codec.as_str(), "avc1");
-    assert_eq!(s.timebase, Rational::new(1, 1000).unwrap());
+    assert_eq!(s.media_type, MediaType::Video);
+    assert_eq!(s.codec.codec, CodecId::H264);
+    assert_eq!(r.track_info(0).unwrap().codec.as_str(), "avc1");
+    assert_eq!(s.time_base, Rational::new(1, 1000));
     assert_eq!(
-        s.video,
-        Some(VideoInfo {
+        s.codec.video,
+        Some(VideoParams {
             width: 64,
-            height: 96
+            height: 96,
+            pixel_format: None,
+            frame_rate: None,
         })
     );
     // 原样回写：逐字节相等。
-    assert_eq!(s.extra_data, AVCC.to_vec());
-    assert_eq!(r.read_packet(0, 0).unwrap().data, vec![0xAA; 8]);
+    assert_eq!(s.codec.extradata, Some(AVCC.to_vec()));
+    assert_eq!(&*r.read_packet(0, 0).unwrap().data, &vec![0xAA; 8]);
 }
 
 // —— ③ mp4a/esds 原样回写 ——
-//
-// 注：writer 按 ISO 14496-12 写 28 字节 AudioSampleEntry（声道在 +16、
-// 采样率在 +24）；读取端 extract_entry_fields 现按 20 字节旧布局解析
-// （声道在 +8、采样率在 +16），故本测试的声道/采样率/extra_data 断言在
-// 读取端修复前为预期失败（与 oracle_mux 同根因，修法见 contracts.md
-// Mp4Writer 节与交付 notes）。
+
 #[test]
 fn mp4a_esds_roundtrip() {
-    // tb=1/48000 ⇒ 1 单位 = 147 tick。
+    // tb=1/48000，包时戳即音频原生单位。
     let data = mux(
         Mp4WriterOptions {
             ..Default::default()
         },
         vec![audio_cfg(48_000)],
         vec![
-            pkt(0, 0, 0, 147, true, &[0xC0, 0xC1]),
-            pkt(0, 1, 147, 147, true, &[0xC2, 0xC3]),
+            pkt_tb(0, 0, 1, true, &[0xC0, 0xC1], 48_000),
+            pkt_tb(0, 1, 1, true, &[0xC2, 0xC3], 48_000),
         ],
     )
     .unwrap();
     let mut r = Mp4Reader::from_vec(data).unwrap();
     let s = r.stream(0).unwrap();
-    assert_eq!(s.kind, MediaKind::Audio);
-    assert_eq!(s.codec.as_str(), "mp4a");
-    assert_eq!(s.timebase, Rational::new(1, 48_000).unwrap());
+    assert_eq!(s.media_type, MediaType::Audio);
+    assert_eq!(s.codec.codec, CodecId::Aac);
+    assert_eq!(r.track_info(0).unwrap().codec.as_str(), "mp4a");
+    assert_eq!(s.time_base, Rational::new(1, 48_000));
     assert_eq!(
-        s.audio,
-        Some(AudioInfo {
-            channel_count: 2,
-            sample_rate: 48_000
+        s.codec.audio,
+        Some(AudioParams {
+            sample_rate: 48_000,
+            channel_layout: Some(ChannelLayout::STEREO),
+            sample_format: None,
         })
     );
     // esds 载荷（含 4 字节版本/标志）原样回写。
-    assert_eq!(s.extra_data, ESDS.to_vec());
+    assert_eq!(s.codec.extradata, Some(ESDS.to_vec()));
     // 音频轨无 stss（恒关键帧）。
     let stbl = stbl_of(&r, 0);
     assert!(find(&stbl.children, "stss").is_none());
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!((p1.dts, p1.duration), (t(147), t(147)));
-    assert!(p1.keyframe);
+    let at = |u: i64| Timestamp::new(u, Rational::new(1, 48_000));
+    assert_eq!((p1.dts, p1.duration), (Some(at(1)), Some(at(1))));
+    assert!(is_key(&p1));
 }
 
 // —— ④ 音视频交错：同流连续样例合一 chunk，stsc 段最小 ——
@@ -342,17 +372,16 @@ fn mp4a_esds_roundtrip() {
 #[test]
 fn interleaved_av_chunks_minimal_stsc() {
     // 写序：v0 v1 | a0 a1 | v2 | a2 —— 同流相邻包在文件内连续 ⇒ 各合成
-    // 一个 chunk；v2/a2 单样例 chunk。
+    // 一个 chunk；v2/a2 单样例 chunk。两轨同为 1/1000。
     let v = video_cfg(1000);
     let a = audio_cfg(1000);
-    let u = 70_560i64; // 1 单位 @1/1000
     let packets = vec![
-        pkt(0, 0, 0, u, true, &[0xA0, 0xA1]),
-        pkt(0, 1, u, u, false, &[0xA2, 0xA3]),
-        pkt(1, 0, 0, u, true, &[0xC0]),
-        pkt(1, 1, u, u, true, &[0xC1]),
-        pkt(0, 2, 2 * u, u, false, &[0xA4, 0xA5]),
-        pkt(1, 2, 2 * u, u, true, &[0xC2]),
+        pkt(0, 0, 10, true, &[0xA0, 0xA1]),
+        pkt(0, 10, 10, false, &[0xA2, 0xA3]),
+        pkt(1, 0, 10, true, &[0xC0]),
+        pkt(1, 10, 10, true, &[0xC1]),
+        pkt(0, 20, 10, false, &[0xA4, 0xA5]),
+        pkt(1, 20, 10, true, &[0xC2]),
     ];
     let data = mux(
         Mp4WriterOptions {
@@ -380,7 +409,7 @@ fn interleaved_av_chunks_minimal_stsc() {
 
     // 交错读回：数据逐包一致。
     let expect = [
-        (0usize, vec![0xA0, 0xA1]),
+        (0u32, vec![0xA0, 0xA1]),
         (0, vec![0xA2, 0xA3]),
         (1, vec![0xC0]),
         (1, vec![0xC1]),
@@ -392,10 +421,10 @@ fn interleaved_av_chunks_minimal_stsc() {
     for si in 0..2 {
         for ii in 0..r.sample_count(si).unwrap() {
             let p = r.read_packet(si, ii).unwrap();
-            got.push((p.stream_index, p.data));
+            got.push((p.stream_index, p.data.to_vec()));
         }
     }
-    let mut want = expect.to_vec();
+    let mut want = expect;
     got.sort_by_key(|(si, _)| *si);
     want.sort_by_key(|(si, _)| *si);
     assert_eq!(got, want);
@@ -405,15 +434,14 @@ fn interleaved_av_chunks_minimal_stsc() {
 
 #[test]
 fn ctts_v1_written_only_when_pts_shifts() {
-    let u = 70_560i64;
     let mut packets = vec![
-        pkt(0, 0, 0, u, true, &[0xA0]),
-        pkt(0, 1, u, u, false, &[0xA1]),
-        pkt(0, 2, 2 * u, u, false, &[0xA2]),
+        pkt(0, 0, 10, true, &[0xA0]),
+        pkt(0, 10, 10, false, &[0xA1]),
+        pkt(0, 20, 10, false, &[0xA2]),
     ];
-    // 偏移（单位域）：+1 / 0 / −1（负 pts−dts 合法）。
-    packets[0].pts = Some(t(u));
-    packets[2].pts = Some(t(2 * u - u));
+    // 偏移（轨道单位）：+10 / 0 / −10（负 pts−dts 合法）。
+    packets[0].pts = Some(t(10));
+    packets[2].pts = Some(t(10));
     let data = mux(
         Mp4WriterOptions {
             ..Default::default()
@@ -428,39 +456,37 @@ fn ctts_v1_written_only_when_pts_shifts() {
     let ctts = find(&stbl.children, "ctts").unwrap();
     let (version, entries) = ctts_entries(payload(&data, ctts));
     assert_eq!(version, 1, "ctts 须 v1（有符号偏移）");
-    // 偏移为轨道时基单位：u=70_560 tick = 10 单位。
     assert_eq!(entries, vec![(1, 10), (1, 0), (1, -10)]);
     // 读回 pts：dts + 偏移。
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.pts, Some(t(u)));
+    assert_eq!(p0.pts, Some(t(10)));
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.pts, Some(t(u))); // ctts 存在 ⇒ pts 显式 == dts
+    assert_eq!(p1.pts, Some(t(10))); // ctts 存在 ⇒ pts 显式 == dts
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.pts, Some(t(u))); // dts 2u + (−1u)
+    assert_eq!(p2.pts, Some(t(10))); // dts 20 + (−10)
 
-    // 对照组：pts 全等 dts（None）⇒ box 树无 ctts，读回 pts 全 None。
+    // 对照组：pts 缺省（None）⇒ box 树无 ctts，读回 pts==dts。
     let plain = mux(
         Mp4WriterOptions {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![pkt(0, 0, 0, u, true, &[0]), pkt(0, 1, u, u, false, &[1])],
+        vec![pkt(0, 0, 10, true, &[0]), pkt(0, 10, 10, false, &[1])],
     )
     .unwrap();
     let mut r2 = Mp4Reader::from_vec(plain).unwrap();
     assert!(find(&stbl_of(&r2, 0).children, "ctts").is_none());
-    assert_eq!(r2.read_packet(0, 0).unwrap().pts, None);
+    assert_eq!(r2.read_packet(0, 0).unwrap().pts, Some(t(0)));
 }
 
 // —— ⑥ stss：部分关键帧才写；全关键帧/音频轨不写 ——
 
 #[test]
 fn stss_partial_keyframes_only() {
-    let u = 70_560i64;
     let packets = vec![
-        pkt(0, 0, 0, u, true, &[0xA0]),
-        pkt(0, 1, u, u, false, &[0xA1]),
-        pkt(0, 2, 2 * u, u, true, &[0xA2]),
+        pkt(0, 0, 10, true, &[0xA0]),
+        pkt(0, 10, 10, false, &[0xA1]),
+        pkt(0, 20, 10, true, &[0xA2]),
     ];
     let data = mux(
         Mp4WriterOptions {
@@ -475,8 +501,8 @@ fn stss_partial_keyframes_only() {
     let stss = find(&stbl.children, "stss").unwrap();
     // 1-based 样号，仅关键帧样例。
     assert_eq!(stss_entries(payload(&data, stss)), vec![1, 3]);
-    assert!(!r.read_packet(0, 1).unwrap().keyframe);
-    assert!(r.read_packet(0, 2).unwrap().keyframe);
+    assert!(!is_key(&r.read_packet(0, 1).unwrap()));
+    assert!(is_key(&r.read_packet(0, 2).unwrap()));
 
     // 全关键帧视频轨 ⇒ 无 stss（缺省语义即全关键帧）。
     let all_key = mux(
@@ -484,12 +510,12 @@ fn stss_partial_keyframes_only() {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![pkt(0, 0, 0, u, true, &[0]), pkt(0, 1, u, u, true, &[1])],
+        vec![pkt(0, 0, 10, true, &[0]), pkt(0, 10, 10, true, &[1])],
     )
     .unwrap();
     let mut r2 = Mp4Reader::from_vec(all_key).unwrap();
     assert!(find(&stbl_of(&r2, 0).children, "stss").is_none());
-    assert!(r2.read_packet(0, 0).unwrap().keyframe);
+    assert!(is_key(&r2.read_packet(0, 0).unwrap()));
 
     // 音频轨即使 keyframe=false 也不写 stss，读回恒关键帧。
     let audio = mux(
@@ -498,14 +524,14 @@ fn stss_partial_keyframes_only() {
         },
         vec![audio_cfg(1000)],
         vec![
-            pkt(0, 0, 0, u, false, &[0xC0]),
-            pkt(0, 1, u, u, false, &[0xC1]),
+            pkt(0, 0, 10, false, &[0xC0]),
+            pkt(0, 10, 10, false, &[0xC1]),
         ],
     )
     .unwrap();
     let mut r3 = Mp4Reader::from_vec(audio).unwrap();
     assert!(find(&stbl_of(&r3, 0).children, "stss").is_none());
-    assert!(r3.read_packet(0, 0).unwrap().keyframe, "音频恒关键帧");
+    assert!(is_key(&r3.read_packet(0, 0).unwrap()), "音频恒关键帧");
 }
 
 // —— ⑦ force_co64 出 co64 ——
@@ -519,8 +545,8 @@ fn force_co64_writes_co64() {
         },
         vec![video_cfg(1000)],
         vec![
-            pkt(0, 0, 0, 70_560, true, &[0xA0, 0xA1]),
-            pkt(0, 1, 70_560, 70_560, false, &[0xA2, 0xA3]),
+            pkt(0, 0, 10, true, &[0xA0, 0xA1]),
+            pkt(0, 10, 10, false, &[0xA2, 0xA3]),
         ],
     )
     .unwrap();
@@ -536,7 +562,7 @@ fn force_co64_writes_co64() {
         vec![mdat.info.offset + 16]
     );
     // co64 不影响数据读取。
-    assert_eq!(r.read_packet(0, 1).unwrap().data, vec![0xA2, 0xA3]);
+    assert_eq!(&*r.read_packet(0, 1).unwrap().data, &[0xA2, 0xA3]);
 }
 
 // —— ⑧ Misuse / Unsupported / InvalidStreamIndex 全清单 ——
@@ -555,7 +581,7 @@ fn misuse(err: WriterError, what: &str) {
 fn misuse_timebase_num_not_one() {
     let mut cfg = video_cfg(1000);
     // Rational 构造即约分：30/1001 的 num=30 ≠ 1。
-    cfg.timebase = Rational::new(30, 1001).unwrap();
+    cfg.timebase = Rational::new(30, 1001);
     let mut w = Mp4Writer::new(
         Cursor::new(Vec::new()),
         Mp4WriterOptions {
@@ -566,30 +592,30 @@ fn misuse_timebase_num_not_one() {
 }
 
 #[test]
-fn unsupported_other_kind_and_codec() {
+fn unsupported_other_media_type_and_codec() {
     let mut w = Mp4Writer::new(
         Cursor::new(Vec::new()),
         Mp4WriterOptions {
             ..Default::default()
         },
     );
-    // kind=Other → Unsupported。
+    // media_type=Subtitle（非 vide/soun）→ Unsupported。
     let mut cfg = video_cfg(1000);
-    cfg.kind = MediaKind::Other;
+    cfg.media_type = MediaType::Subtitle;
     match w.add_stream(cfg).unwrap_err() {
         WriterError::Unsupported(what) => assert_eq!(what, "仅支持视频/音频轨（vide/soun）"),
         other => panic!("应为 Unsupported，实为 {other:?}"),
     }
-    // Video + 非 avc1 → Unsupported。
+    // Video + 非 H264（写不出 avc1）→ Unsupported。
     let mut cfg = video_cfg(1000);
-    cfg.codec = FourCc::new(*b"hev1");
+    cfg.codec = CodecId::Hevc;
     match w.add_stream(cfg).unwrap_err() {
         WriterError::Unsupported(what) => assert_eq!(what, "仅支持 avc1（视频）与 mp4a（音频）"),
         other => panic!("应为 Unsupported，实为 {other:?}"),
     }
-    // Audio + 非 mp4a → Unsupported。
+    // Audio + 非 Aac → Unsupported。
     let mut cfg = audio_cfg(48_000);
-    cfg.codec = FourCc::new(*b"ac-3");
+    cfg.codec = CodecId::Flac;
     match w.add_stream(cfg).unwrap_err() {
         WriterError::Unsupported(what) => assert_eq!(what, "仅支持 avc1（视频）与 mp4a（音频）"),
         other => panic!("应为 Unsupported，实为 {other:?}"),
@@ -597,7 +623,7 @@ fn unsupported_other_kind_and_codec() {
 }
 
 #[test]
-fn misuse_kind_info_mismatch() {
+fn misuse_media_type_info_mismatch() {
     let mut w = Mp4Writer::new(
         Cursor::new(Vec::new()),
         Mp4WriterOptions {
@@ -610,9 +636,10 @@ fn misuse_kind_info_mismatch() {
     misuse(w.add_stream(cfg).unwrap_err(), "video 信息");
     // Video 多带 audio 信息。
     let mut cfg = video_cfg(1000);
-    cfg.audio = Some(AudioInfo {
-        channel_count: 2,
+    cfg.audio = Some(AudioParams {
         sample_rate: 48_000,
+        channel_layout: Some(ChannelLayout::STEREO),
+        sample_format: None,
     });
     misuse(w.add_stream(cfg).unwrap_err(), "audio 信息");
     // Audio 缺 audio 信息。
@@ -621,11 +648,21 @@ fn misuse_kind_info_mismatch() {
     misuse(w.add_stream(cfg).unwrap_err(), "audio 信息");
     // Audio 多带 video 信息。
     let mut cfg = audio_cfg(48_000);
-    cfg.video = Some(VideoInfo {
+    cfg.video = Some(VideoParams {
         width: 64,
         height: 96,
+        pixel_format: None,
+        frame_rate: None,
     });
     misuse(w.add_stream(cfg).unwrap_err(), "video 信息");
+    // Audio 无声道布局（channel_count 无从取）。
+    let mut cfg = audio_cfg(48_000);
+    cfg.audio = Some(AudioParams {
+        sample_rate: 48_000,
+        channel_layout: None,
+        sample_format: None,
+    });
+    misuse(w.add_stream(cfg).unwrap_err(), "声道数");
 }
 
 #[test]
@@ -637,13 +674,30 @@ fn misuse_add_stream_after_first_packet() {
         },
     );
     w.add_stream(video_cfg(1000)).unwrap();
-    w.write_packet(&pkt(0, 0, 0, 70_560, true, &[0])).unwrap();
+    w.write_packet(&pkt(0, 0, 10, true, &[0])).unwrap();
     misuse(w.add_stream(video_cfg(1000)).unwrap_err(), "首包已写");
 }
 
 #[test]
+fn misuse_missing_dts_or_duration() {
+    // 移植新增契约：Packet 缺 dts/duration ⇒ Misuse（M1 不推断时戳）。
+    let mut w = Mp4Writer::new(
+        Cursor::new(Vec::new()),
+        Mp4WriterOptions {
+            ..Default::default()
+        },
+    );
+    w.add_stream(video_cfg(1000)).unwrap();
+    let mut p = pkt(0, 0, 10, true, &[0]);
+    p.dts = None;
+    misuse(w.write_packet(&p).unwrap_err(), "缺 dts");
+    let mut p = pkt(0, 0, 10, true, &[0]);
+    p.duration = None;
+    misuse(w.write_packet(&p).unwrap_err(), "缺 duration");
+}
+
+#[test]
 fn misuse_dts_regression_gap_and_overlap() {
-    let u = 70_560i64;
     // 回退：dts[2] < dts[1]（首包 dts 恒 0，回退只能出现在第 2 包起）。
     let mut w = Mp4Writer::new(
         Cursor::new(Vec::new()),
@@ -652,11 +706,10 @@ fn misuse_dts_regression_gap_and_overlap() {
         },
     );
     w.add_stream(video_cfg(1000)).unwrap();
-    w.write_packet(&pkt(0, 0, 0, u, true, &[0])).unwrap();
-    w.write_packet(&pkt(0, 1, u, u, true, &[1])).unwrap();
+    w.write_packet(&pkt(0, 0, 10, true, &[0])).unwrap();
+    w.write_packet(&pkt(0, 10, 10, true, &[1])).unwrap();
     misuse(
-        w.write_packet(&pkt(0, 2, u / 2, u, true, &[2]))
-            .unwrap_err(),
+        w.write_packet(&pkt(0, 5, 10, true, &[2])).unwrap_err(),
         "单调不减",
     );
     // 间隙：dts[1] > dts[0]+dur[0]。
@@ -667,10 +720,9 @@ fn misuse_dts_regression_gap_and_overlap() {
         },
     );
     w.add_stream(video_cfg(1000)).unwrap();
-    w.write_packet(&pkt(0, 0, 0, u, true, &[0])).unwrap();
+    w.write_packet(&pkt(0, 0, 10, true, &[0])).unwrap();
     misuse(
-        w.write_packet(&pkt(0, 1, 2 * u, u, true, &[1]))
-            .unwrap_err(),
+        w.write_packet(&pkt(0, 20, 10, true, &[1])).unwrap_err(),
         "间隙/重叠",
     );
     // 重叠：dts[0] < dts[1] < dts[0]+dur[0]（同一报错路径）。
@@ -681,10 +733,9 @@ fn misuse_dts_regression_gap_and_overlap() {
         },
     );
     w.add_stream(video_cfg(1000)).unwrap();
-    w.write_packet(&pkt(0, 0, 0, u, true, &[0])).unwrap();
+    w.write_packet(&pkt(0, 0, 10, true, &[0])).unwrap();
     misuse(
-        w.write_packet(&pkt(0, 1, u / 2, u, true, &[1]))
-            .unwrap_err(),
+        w.write_packet(&pkt(0, 5, 10, true, &[1])).unwrap_err(),
         "间隙/重叠",
     );
 }
@@ -699,9 +750,7 @@ fn misuse_negative_dts_and_duration() {
     );
     w.add_stream(video_cfg(1000)).unwrap();
     // 固定文案（契约）：负 dts。
-    let err = w
-        .write_packet(&pkt(0, 0, -147, 70_560, true, &[0]))
-        .unwrap_err();
+    let err = w.write_packet(&pkt(0, -1, 10, true, &[0])).unwrap_err();
     match err {
         WriterError::Misuse(msg) => assert_eq!(
             msg,
@@ -711,7 +760,7 @@ fn misuse_negative_dts_and_duration() {
     }
     // 负 duration。
     misuse(
-        w.write_packet(&pkt(0, 0, 0, -1, true, &[0])).unwrap_err(),
+        w.write_packet(&pkt(0, 0, -1, true, &[0])).unwrap_err(),
         "负",
     );
 }
@@ -719,6 +768,7 @@ fn misuse_negative_dts_and_duration() {
 #[test]
 fn misuse_first_dts_nonzero() {
     // stts 隐式从 0 起算，非零首偏移无 elst 不可表达（契约补充规则）。
+    // 轨道时基域判定：10 单位 ≠ 0。
     let mut w = Mp4Writer::new(
         Cursor::new(Vec::new()),
         Mp4WriterOptions {
@@ -727,7 +777,12 @@ fn misuse_first_dts_nonzero() {
     );
     w.add_stream(video_cfg(1000)).unwrap();
     misuse(
-        w.write_packet(&pkt(0, 0, 70_560, 70_560, true, &[0]))
+        w.write_packet(&pkt(0, 10, 10, true, &[0])).unwrap_err(),
+        "首包 dts 须为 0",
+    );
+    // 跨时基：包时基 1/90000 的 900 单位（=10ms）重标度后非 0 ⇒ 同样拒绝。
+    misuse(
+        w.write_packet(&pkt_tb(0, 900, 900, true, &[0], 90_000))
             .unwrap_err(),
         "首包 dts 须为 0",
     );
@@ -742,10 +797,7 @@ fn misuse_invalid_stream_index() {
         },
     );
     w.add_stream(video_cfg(1000)).unwrap();
-    match w
-        .write_packet(&pkt(5, 0, 0, 70_560, true, &[0]))
-        .unwrap_err()
-    {
+    match w.write_packet(&pkt(5, 0, 10, true, &[0])).unwrap_err() {
         WriterError::InvalidStreamIndex { index, count } => assert_eq!((index, count), (5, 1)),
         other => panic!("应为 InvalidStreamIndex，实为 {other:?}"),
     }
@@ -785,75 +837,102 @@ fn zero_packet_tracks_finalize() {
     }
 }
 
-// —— ⑩ 时基换算：1/90000（非整除，舍入路径）与 1/1000（整除，精确往返）——
+// —— ⑩ 跨时基重标度（合流裁决 #4：封装器向目标流时基重标度，NearInf）——
 
-/// 1/90000：7,056,000/90,000 = 78.4 tick/单位，非整除。
-/// 单位可表示的 tick（784 的倍数）逐包精确往返；非表示值（785）在
-/// 单位域舍入（to_units(785)=10 单位），读回 tick 落到 784——单位域
-/// 严格一致、tick 域按舍入规则取整（见 contracts.md 时戳换算约定）。
+/// 包时基 ≠ 轨道时基：1/90000 的包写进 1/1000 轨。
+/// - 精确可表示值（90000 的倍数 ⇔ 1000 的倍数）：逐包恒等；
+/// - 非表示值按 NearInf 舍入：89999 @1/90000 = 0.99998…s → 1000 单位；
+///   44999 @1/90000 → 500 单位（44999/90 = 499.98… ⇒ 500）。
 #[test]
-fn timebase_90000_rounding_path() {
-    let data = mux(
-        Mp4WriterOptions {
-            ..Default::default()
-        },
-        vec![video_cfg(90_000)],
-        vec![
-            pkt(0, 0, 0, 784, true, &[0xA0]),
-            pkt(0, 1, 784, 784, false, &[0xA1]),
-            pkt(0, 2, 1568, 785, false, &[0xA2]), // 尾包 785 tick → 10 单位
-        ],
-    )
-    .unwrap();
-    let mut r = Mp4Reader::from_vec(data).unwrap();
-    let tb = Rational::new(1, 90_000).unwrap();
-    assert_eq!(r.stream(0).unwrap().timebase, tb);
-    // 784 tick = 10 单位（精确），dts 逐包 tick 精确。
-    let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, t(0));
-    let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.dts, t(784));
-    // 尾包：入表 delta = to_units(785) = 10 单位 ⇒ 读回 duration 784 tick，
-    // 单位域与调用侧一致（10）。
-    let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.dts, t(1568));
-    assert_eq!(p2.duration, t(784), "785 tick 舍入到 10 单位 = 784 tick");
-    assert_eq!(p2.duration.to_units(tb), Some(10), "单位域严格一致");
-    assert_eq!(t(785).to_units(tb), Some(10));
-}
-
-/// 1/1000：7,056,000/1000 = 7,056 tick/单位，整除 ⇒ 单位↔tick 双向精确，
-/// 任意单位可表示的 tick 值逐包严格往返（tick 域断言）。
-#[test]
-fn timebase_1000_exact_tick_roundtrip() {
-    let durs = [70_560i64, 35_280, 105_840]; // 10/5/15 单位
-    let mut packets = Vec::new();
-    let mut dts = 0i64;
-    for (i, &d) in durs.iter().enumerate() {
-        packets.push(pkt(0, i, dts, d, i == 0, &[0xA0 + i as u8]));
-        dts += d;
-    }
-    // 加一档 pts 偏移（+3 单位）验证 ctts 域同样精确。
-    packets[1].pts = Some(t(70_560 + 3 * 7_056));
+fn cross_timebase_rescale_near_inf() {
     let data = mux(
         Mp4WriterOptions {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        packets,
+        vec![
+            pkt_tb(0, 0, 90_000, true, &[0xA0], 90_000), // dur → 1000 单位
+            pkt_tb(0, 90_000, 89_999, false, &[0xA1], 90_000), // dur → NearInf 1000 单位
+        ],
     )
     .unwrap();
     let mut r = Mp4Reader::from_vec(data).unwrap();
-    let mut dts = 0i64;
-    for (i, &d) in durs.iter().enumerate() {
-        let p = r.read_packet(0, i).unwrap();
-        assert_eq!(p.dts, t(dts), "tick 域严格往返（样例 {i}）");
-        assert_eq!(p.duration, t(d), "tick 域严格往返（样例 {i}）");
-        if i == 1 {
-            assert_eq!(p.pts, Some(t(70_560 + 3 * 7_056)));
-        }
-        dts += d;
-    }
+    let tb = Rational::new(1, 1000);
+    assert_eq!(r.stream(0).unwrap().time_base, tb);
+    let p0 = r.read_packet(0, 0).unwrap();
+    assert_eq!(p0.dts, Some(t(0)));
+    assert_eq!(
+        p0.duration,
+        Some(t(1000)),
+        "90_000/90_000 s = 1s = 1000 单位"
+    );
+    let p1 = r.read_packet(0, 1).unwrap();
+    assert_eq!(
+        p1.dts,
+        Some(t(1000)),
+        "衔接校验在单位域：重标度后 90_000→1000"
+    );
+    assert_eq!(
+        p1.duration,
+        Some(t(1000)),
+        "89_999 @1/90000 → NearInf(999.98…) = 1000 单位"
+    );
+    // 重标度语义断言（ye-time 同款 NearInf）：
+    assert_eq!(
+        Timestamp::new(89_999, Rational::new(1, 90_000))
+            .rescale(tb)
+            .unwrap()
+            .ticks(),
+        1000
+    );
+    assert_eq!(
+        Timestamp::new(44_999, Rational::new(1, 90_000))
+            .rescale(tb)
+            .unwrap()
+            .ticks(),
+        500
+    );
+    // pts 跨时基同样重标度：cts = rescale(pts) − rescale(dts)。
+    let mut p = pkt_tb(0, 90_000, 90_000, true, &[0xA2], 90_000);
+    p.pts = Some(Timestamp::new(180_000, Rational::new(1, 90_000)));
+    let data2 = mux(
+        Mp4WriterOptions {
+            ..Default::default()
+        },
+        vec![video_cfg(1000)],
+        vec![pkt_tb(0, 0, 90_000, true, &[0xA0], 90_000), p],
+    )
+    .unwrap();
+    let mut r2 = Mp4Reader::from_vec(data2).unwrap();
+    let p1 = r2.read_packet(0, 1).unwrap();
+    assert_eq!(p1.dts, Some(t(1000)));
+    assert_eq!(p1.pts, Some(t(2000)), "pts 180_000@1/90000 → 2000 单位");
+}
+
+/// 间隙判定在重标度后的单位域进行：包时基的微小差距重标度后被抹平
+/// （90000 与 89999 同落 1000 单位 ⇒ 按重标度域衔接通过）。
+#[test]
+fn cross_timebase_gap_check_in_unit_domain() {
+    let mut w = Mp4Writer::new(
+        Cursor::new(Vec::new()),
+        Mp4WriterOptions {
+            ..Default::default()
+        },
+    );
+    w.add_stream(video_cfg(1000)).unwrap();
+    w.write_packet(&pkt_tb(0, 0, 89_999, true, &[0], 90_000))
+        .unwrap();
+    // 89_999 → 1000 单位（NearInf 入）；下一包 dts 90_000 → 1000 单位，
+    // 与「上一包尾 = 0 + 1000」衔接成立 ⇒ 不报间隙。
+    w.write_packet(&pkt_tb(0, 90_000, 90_000, false, &[1], 90_000))
+        .unwrap();
+    // 真间隙（包时基域也缺一段）：dts 跳到 270_000（=3000 单位）而
+    // 期望 2000 ⇒ Misuse。
+    misuse(
+        w.write_packet(&pkt_tb(0, 270_000, 90_000, false, &[2], 90_000))
+            .unwrap_err(),
+        "间隙/重叠",
+    );
 }
 
 /// duration==0 合法：写 delta 0，dts 停留（同 dts 连包）。
@@ -864,19 +943,15 @@ fn zero_duration_packet_is_legal() {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![
-            pkt(0, 0, 0, 0, true, &[0xA0]),
-            pkt(0, 1, 0, 70_560, false, &[0xA1]),
-        ],
+        vec![pkt(0, 0, 0, true, &[0xA0]), pkt(0, 0, 10, false, &[0xA1])],
     )
     .unwrap();
     let mut r = Mp4Reader::from_vec(data.clone()).unwrap();
     let stbl = stbl_of(&r, 0);
     let stts = find(&stbl.children, "stts").unwrap();
-    // 70_560 tick @1/1000 = 10 单位。
     assert_eq!(stts_entries(payload(&data, stts)), vec![(1, 0), (1, 10)]);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!((p0.dts, p0.duration), (t(0), t(0)));
+    assert_eq!((p0.dts, p0.duration), (Some(t(0)), Some(t(0))));
 }
 
 // —— ⑪ 评审回归 ——
@@ -892,10 +967,7 @@ fn all_empty_packets_writeread_roundtrip() {
             ..Default::default()
         },
         vec![video_cfg(1000)],
-        vec![
-            pkt(0, 0, 0, 70_560, true, &[]),
-            pkt(0, 1, 70_560, 70_560, false, &[]),
-        ],
+        vec![pkt(0, 0, 10, true, &[]), pkt(0, 10, 10, false, &[])],
     )
     .unwrap();
     let mut r = Mp4Reader::from_vec(data.clone()).unwrap();
@@ -906,11 +978,11 @@ fn all_empty_packets_writeread_roundtrip() {
     assert_eq!(stsz_table(payload(&data, stsz)), (0, 2, vec![0, 0]));
     // 逐样例可读回：空数据 + 时戳往返。
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.data, Vec::<u8>::new());
-    assert_eq!(p0.duration, t(70_560));
+    assert!(p0.data.is_empty());
+    assert_eq!(p0.duration, Some(t(10)));
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.data, Vec::<u8>::new());
-    assert_eq!(p1.dts, t(70_560));
+    assert!(p1.data.is_empty());
+    assert_eq!(p1.dts, Some(t(10)));
 }
 
 /// free_size 接近 u64::MAX：new 不得 panic（debug 下 8+free_size 加法
@@ -927,7 +999,7 @@ fn free_size_overflow_rejected_as_misuse() {
     let mut w = Mp4Writer::new(Cursor::new(Vec::new()), opts.clone());
     w.add_stream(video_cfg(1000)).unwrap();
     // 修复点二：首个写出点（write_packet → ensure_prologue）Misuse 拒写。
-    match w.write_packet(&pkt(0, 0, 0, 70_560, true, &[0xA0])) {
+    match w.write_packet(&pkt(0, 0, 10, true, &[0xA0])) {
         Err(WriterError::Misuse(what)) => assert!(what.contains("free_size"), "what={what}"),
         other => panic!("应为 Misuse，实为 {other:?}"),
     }

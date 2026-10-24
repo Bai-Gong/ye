@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# 2026-10-24 合流（B 案）裁决：ye-container-mp4 为 m1-mp4 侧实现，
-# 仍基于 m1 旧类型（自打戳 Packet / u64 Rational 等），与 develop 契约层
-# 不兼容，待按新 trait 重写后再移出 exclude、恢复编译。
-exclude = ["crates/ye-container-mp4"]
+# 2026-10-24 合流（B 案）裁决：ye-container-mp4 曾因 m1 旧类型被 exclude；
+# 同日按 develop 契约类型（流内时基 Timestamp / ye-codec Packet /
+# ye-container Stream）移植完成，恢复为 workspace 成员。
 
 [workspace.package]
 version = "0.1.0"

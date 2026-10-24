@@ -49,7 +49,11 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 - **M1（已完成，收口中）**：`ye-time` / `ye-pixfmt` 基础类型；
   `ye-container-mp4` 解封装 + 封装（progressive 与 fMP4），ffmpeg/ffprobe
-  oracle 对拍通过；`ye probe` / `ye remux` 可用。收口准入：**剪的素材
+  oracle 对拍通过；`ye probe` / `ye remux` 可用。2026-10-24 合流收口：
+  m1-mp4 并入 develop（B 案，契约层为主体）、移植挂 develop 契约类型、
+  `Demuxer`/`Muxer` trait 接线 + 注册表 auto-probe、门面 `remux` 助手、
+  `convert` 占位（锻 M3 接入契约定形）、ye-codec/ye-filter 接口桩就位
+  ——M2+ 缺口总账见 [waitlist.md](waitlist.md)。收口准入：**剪的素材
   导入 probe 换 ye**——jian 侧 `probe_media` 加双引擎开关，ffprobe 留作
   oracle 与回退。
 - **M2 解码——服务剪的抽帧与波形**：H.264 软件解码（先 Baseline，后
@@ -100,6 +104,11 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
+- 2026-10-24：M1 冶侧收口——m1-mp4 合流（B 案）+ 移植挂 develop
+  契约类型 + `Demuxer`/`Muxer` trait 接线 + 门面 `remux` 助手 +
+  `convert` 占位（锻 M3 接入契约定形）+ ye-codec/ye-filter 接口桩；
+  新增 [waitlist.md](waitlist.md)（M2+ 等待清单：缺口 × 阻塞层 ×
+  准入里程碑）。收口准入（剪 probe 双引擎）仍开放。
 - 2026-10-22：按剪/锻消费计划重排——M2 准入从"剪时间线可回放"改为
   "剪抽帧/波形"（剪的预览走浏览器，不经 ye，原准入是伪需求）；原
   M3 滤镜最小集与 M4 编码合并为新 M3 转码直通（convert 端到端本来就

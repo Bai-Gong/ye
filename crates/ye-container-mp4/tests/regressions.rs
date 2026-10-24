@@ -2,6 +2,9 @@
 //! extra_data 未按子 box 声明 size 截断 / 巨型样例分配未按文件长度
 //! 校验 / box 树递归无深度上限 / 声明值与文件长度失衡（trun 无逐样例
 //! 字段的巨量样例、locate 定长求和随序号线性增长）。
+//!
+//! 移植后 extra_data 位于 `Stream.codec.extradata`，四个加固回归的
+//! 断言本体原样保留。
 
 mod helpers;
 
@@ -25,8 +28,8 @@ fn extra_data_stops_at_first_child_declared_size() {
     let r = Mp4Reader::from_vec(file_with(&[video_trak(&stbl, 1000, 30)])).unwrap();
     let s = r.stream(0).unwrap();
     assert_eq!(
-        s.extra_data,
-        AVCC.to_vec(),
+        s.codec.extradata,
+        Some(AVCC.to_vec()),
         "extra_data 应止于 avcC 声明 size"
     );
 }
@@ -52,7 +55,11 @@ fn extra_data_child_size_zero_and_overflow() {
     ];
     let r = Mp4Reader::from_vec(file_with(&[video_trak(&stbl, 1000, 30)])).unwrap();
     let s = r.stream(0).unwrap();
-    assert_eq!(s.extra_data, expect, "size==0 子 box 应取到 entry 末");
+    assert_eq!(
+        s.codec.extradata,
+        Some(expect),
+        "size==0 子 box 应取到 entry 末"
+    );
 
     // 声明 size 远超 entry 实际长度 ⇒ Malformed。
     let mut big = Vec::new();

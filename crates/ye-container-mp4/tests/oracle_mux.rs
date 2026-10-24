@@ -5,18 +5,17 @@
 //! 打印一行跳过信息直接返回（不 fail）。临时文件全部落在
 //! `CARGO_TARGET_TMPDIR`。
 //!
-//! 时戳对拍口径：原文件与重封装文件都用自有 Mp4Reader 读（均为 stts/
-//! ctts 原始值，不含 ffmpeg demuxer 的 edit-list 平移），统一在流时基
-//! 单位域严格相等——timescale ≤ 7,056,000 时 tick→单位→tick 两次
-//! half-away 舍入互相抵消（数学保证，见 ye-time
-//! units_round_trip_common_timescales 测试）。tick 域严格相等仅当
-//! timescale 整除 7,056,000（如 44100/48000；视频 10240 之类非整除
-//! 时基只在单位域断言），另作一组断言。
+//! 时戳对拍口径（移植后）：原文件与重封装文件都用自有 Mp4Reader 读
+//! （均为 stts/ctts 原始值，不含 ffmpeg demuxer 的 edit-list 平移），
+//! 时戳即流时基原生单位——remux 按流时基直通（TrackConfig::from_stream
+//! 保时基 ⇒ 重标度恒等），两侧 Timestamp 逐字段**严格相等**（m1 时代
+//! 的「单位域相等/tick 域需整除」分组不再需要：新时戳模型下单位即
+//! tick，任何 timescale 都精确）。
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use ye_container_mp4::{Layout, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet, TrackConfig};
-use ye_time::TICKS_PER_SECOND;
 
 /// ffmpeg/ffprobe 是否可用。
 fn tools_ok() -> bool {
@@ -93,8 +92,14 @@ fn remux(src: &Path, dst: &Path, force_co64: bool) {
         per_stream.push(v);
     }
     // 合并写：按 (dts, stream_index) 全局排序；同轨子序列仍保持轨内序。
+    // Timestamp 无 Ord（契约），走 compare 精确交叉相乘。
     let mut all: Vec<&Packet> = per_stream.iter().flatten().collect();
-    all.sort_by_key(|p| (p.dts, p.stream_index));
+    all.sort_by(|a, b| {
+        a.dts
+            .unwrap()
+            .compare(b.dts.unwrap())
+            .then_with(|| a.stream_index.cmp(&b.stream_index))
+    });
     for p in all {
         w.write_packet(p).unwrap();
     }
@@ -196,7 +201,7 @@ fn remux_roundtrip_and_probes() {
     gen_source(&src);
     remux(&src, &out, false);
 
-    // —— ② roundtrip：自有 reader 两侧逐包对拍 ——
+    // —— ② roundtrip：自有 reader 两侧逐包对拍（严格相等）——
     let mut so = Mp4Reader::open(&src).unwrap();
     let mut rt = Mp4Reader::open(&out).unwrap();
     assert_eq!(rt.streams().len(), so.streams().len());
@@ -204,51 +209,28 @@ fn remux_roundtrip_and_probes() {
         let s_src = so.stream(si).unwrap();
         let s_rt = rt.stream(si).unwrap();
         // 流元数据一致（extra_data 原样回写）。
-        assert_eq!(s_src.codec.as_str(), s_rt.codec.as_str(), "流 {si} codec");
-        assert_eq!(s_src.timebase, s_rt.timebase, "流 {si} 时基");
-        assert_eq!(s_src.extra_data, s_rt.extra_data, "流 {si} extra_data");
-        assert_eq!(s_src.video, s_rt.video, "流 {si} 视频参数");
-        assert_eq!(s_src.audio, s_rt.audio, "流 {si} 音频参数");
+        assert_eq!(s_src.codec.codec, s_rt.codec.codec, "流 {si} codec");
+        assert_eq!(s_src.time_base, s_rt.time_base, "流 {si} 时基");
+        assert_eq!(
+            s_src.codec.extradata, s_rt.codec.extradata,
+            "流 {si} extra_data"
+        );
+        assert_eq!(s_src.codec.video, s_rt.codec.video, "流 {si} 视频参数");
+        assert_eq!(s_src.codec.audio, s_rt.codec.audio, "流 {si} 音频参数");
         assert_eq!(
             so.sample_count(si).unwrap(),
             rt.sample_count(si).unwrap(),
             "流 {si} 样例数"
         );
-        let tb = s_src.timebase;
-        // tick 域严格相等仅当 timescale 整除 7,056,000。
-        let tick_strict = tb.den != 0 && TICKS_PER_SECOND % tb.den == 0;
         for ii in 0..rt.sample_count(si).unwrap() {
             let po = so.read_packet(si, ii).unwrap();
             let pr = rt.read_packet(si, ii).unwrap();
             assert_eq!(po.data, pr.data, "流 {si} 样例 {ii} 数据");
-            // 单位域严格相等（timescale ≤ 7,056,000 的数学保证，见文件头注）。
-            assert_eq!(
-                po.dts.to_units(tb),
-                pr.dts.to_units(tb),
-                "流 {si} 样例 {ii} dts（单位域）"
-            );
-            // pts 缺省语义 = dts（None 与 Some(dts) 等价处理）。
-            let po_pts = po.pts.unwrap_or(po.dts);
-            let pr_pts = pr.pts.unwrap_or(pr.dts);
-            assert_eq!(
-                po_pts.to_units(tb),
-                pr_pts.to_units(tb),
-                "流 {si} 样例 {ii} pts（单位域）"
-            );
-            assert_eq!(
-                po.duration.to_units(tb),
-                pr.duration.to_units(tb),
-                "流 {si} 样例 {ii} duration（单位域）"
-            );
-            assert_eq!(po.keyframe, pr.keyframe, "流 {si} 样例 {ii} keyframe");
-            if tick_strict {
-                assert_eq!(po.dts, pr.dts, "流 {si} 样例 {ii} dts（tick 域，整除时基）");
-                assert_eq!(po_pts, pr_pts, "流 {si} 样例 {ii} pts（tick 域）");
-                assert_eq!(
-                    po.duration, pr.duration,
-                    "流 {si} 样例 {ii} duration（tick 域）"
-                );
-            }
+            // 流时基原生单位直通：Timestamp 逐字段严格相等（任何 timescale）。
+            assert_eq!(po.dts, pr.dts, "流 {si} 样例 {ii} dts");
+            assert_eq!(po.pts, pr.pts, "流 {si} 样例 {ii} pts");
+            assert_eq!(po.duration, pr.duration, "流 {si} 样例 {ii} duration");
+            assert_eq!(po.flags, pr.flags, "流 {si} 样例 {ii} flags");
         }
     }
 
@@ -276,7 +258,12 @@ fn remux_roundtrip_and_probes() {
     for si in 0..rt.streams().len() {
         let flags = ffprobe_keyframe_flags(&pk_json, si);
         let ours: Vec<bool> = (0..rt.sample_count(si).unwrap())
-            .map(|ii| rt.read_packet(si, ii).unwrap().keyframe)
+            .map(|ii| {
+                rt.read_packet(si, ii)
+                    .unwrap()
+                    .flags
+                    .contains(ye_container_mp4::PacketFlags::KEYFRAME)
+            })
             .collect();
         assert_eq!(
             flags, ours,
@@ -331,34 +318,49 @@ fn force_co64_output_still_ffprobe_readable() {
     assert_eq!(r.streams().len(), 2);
 }
 
-/// 挑一个非整除时基（视频轨，如 1/10240）证明只有单位域保证：
-/// 7,056,000 % 10240 ≠ 0，tick 域不作断言——由 remux_roundtrip 的
-/// tick_strict 分支天然覆盖（44100 整除走 tick 断言、10240 只走单位域）。
+/// 非整除 timescale 的轨（视频轨常为 1/10240、1/12800）：新时戳模型下
+/// roundtrip 仍逐包严格相等——取代 m1 的「整除才 tick 域严格相等」分组
+/// （流时基内单位即 tick，整除条件不再存在）。断言源确有非整除
+/// timescale 的轨，保证该路径真被走到。
 #[test]
-fn source_video_timescale_is_non_dividing() {
+fn non_dividing_timescale_roundtrip_is_strict() {
     if !tools_ok() {
-        eprintln!("跳过：PATH 无 ffmpeg/ffprobe（oracle_mux 时基分类）");
+        eprintln!("跳过：PATH 无 ffmpeg/ffprobe（oracle_mux 非整除时基）");
         return;
     }
     let dir = tmp("oracle_mux_ts");
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("src.mp4");
+    let out = dir.join("out_ts.mp4");
     gen_source(&src);
-    let r = Mp4Reader::open(&src).unwrap();
-    for s in r.streams() {
-        let divides = TICKS_PER_SECOND % s.timebase.den == 0;
-        // 记录分类即可：44100 整除（tick 域组），视频 timescale（ffmpeg
-        // 常给 10240/12800）非整除（单位域组）。断言至少一轨非整除，
-        // 保证两组断言路径都被真正执行。
-        eprintln!(
-            "流 {} timescale={} 整除={}",
-            s.index, s.timebase.den, divides
-        );
-    }
+    let mut so = Mp4Reader::open(&src).unwrap();
+    // m1 整除基准（7,056,000 % den == 0）已随全局 tick 域移除；此处仅
+    // 验证存在非「常见速率」的 timescale 且逐包严格相等。
+    let has_odd = so.streams().iter().any(|s| {
+        !matches!(
+            s.time_base.den(),
+            1000 | 44_100 | 48_000 | 24_000 | 25_000 | 30_000
+        )
+    });
     assert!(
-        r.streams()
-            .iter()
-            .any(|s| TICKS_PER_SECOND % s.timebase.den != 0),
-        "源文件应含非整除时基轨（视频），否则分组断言形同虚设"
+        has_odd,
+        "源文件应含非常见 timescale 轨（ffmpeg 视频轨常给 10240/12800）"
     );
+    remux(&src, &out, false);
+    let mut rt = Mp4Reader::open(&out).unwrap();
+    for si in 0..so.streams().len() {
+        let n = so.sample_count(si).unwrap();
+        assert_eq!(n, rt.sample_count(si).unwrap(), "流 {si} 样例数");
+        for ii in 0..n {
+            let po = so.read_packet(si, ii).unwrap();
+            let pr = rt.read_packet(si, ii).unwrap();
+            assert_eq!(
+                po.dts, pr.dts,
+                "流 {si} 样例 {ii} dts（任意 timescale 严格）"
+            );
+            assert_eq!(po.pts, pr.pts, "流 {si} 样例 {ii} pts");
+            assert_eq!(po.duration, pr.duration, "流 {si} 样例 {ii} duration");
+        }
+    }
+    let _ = Ordering::Equal; // compare 语义在 remux 排序处覆盖
 }

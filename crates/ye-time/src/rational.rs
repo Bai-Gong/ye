@@ -340,17 +340,10 @@ impl Rational {
         if h > i32::MAX as i128 {
             return Err(TimeError::Overflow);
         }
-        let num = if negative {
-            -(h as i32)
-        } else {
-            h as i32
-        };
+        let num = if negative { -(h as i32) } else { h as i32 };
         // 收敛子与半收敛子均天然既约（相邻行列式 h·k' − h'·k = ±1），直接构造；
         // negative 时 h ≥ 1（value < 0 且非零），取负不溢出
-        Ok(Rational {
-            num,
-            den: k as i32,
-        })
+        Ok(Rational { num, den: k as i32 })
     }
 }
 

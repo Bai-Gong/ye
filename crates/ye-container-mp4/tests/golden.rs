@@ -1,9 +1,18 @@
 //! 用例 1（黄金路径）与用例 5（box_tree 结构）。
+//!
+//! 移植后语义：时戳一律流时基（1/mdhd:timescale）原生单位，
+//! `Timestamp::new(单位, 1/timescale)`——黄金轨 timescale=1000，
+//! 时长 30 单位、样例时长 10 单位、ctts 首段 −5 单位，全部精确无舍入。
 
 mod helpers;
 
 use helpers::*;
-use ye_container_mp4::{BoxNode, FourCc, MediaKind, Mp4Reader, Rational, Timestamp, VideoInfo};
+use ye_container_mp4::{CodecId, FourCc, MediaType, Mp4Reader, PacketFlags, Rational, Timestamp};
+
+/// 视频轨时基（1/1000）下的时间戳。
+fn t(units: i64) -> Timestamp {
+    Timestamp::new(units, Rational::new(1, 1000))
+}
 
 fn golden() -> Vec<u8> {
     let (c1, c2) = golden_offsets(&golden_file(&[0, 0], false));
@@ -17,25 +26,27 @@ fn golden_path_stream_metadata() {
     assert_eq!(r.streams().len(), 1);
     let s = r.stream(0).unwrap();
     assert_eq!(s.index, 0);
-    assert_eq!(s.track_id, 7);
-    assert_eq!(s.kind, MediaKind::Video);
-    assert_eq!(s.codec, FourCc::new(*b"avc1"));
-    assert_eq!(s.codec.as_str(), "avc1");
-    assert_eq!(format!("{}", s.codec), "avc1");
+    // MP4 特有字段走 track_info（develop Stream 无处安放）。
+    let ti = r.track_info(0).unwrap();
+    assert_eq!(ti.track_id, 7);
+    assert_eq!(ti.codec, FourCc::new(*b"avc1"));
+    assert_eq!(ti.codec.as_str(), "avc1");
+    assert_eq!(format!("{}", ti.codec), "avc1");
+    assert_eq!(s.media_type, MediaType::Video);
+    // codec → CodecId 映射：avc1 ⇒ H264。
+    assert_eq!(s.codec.codec, CodecId::H264);
+    assert_eq!(s.codec.media_type, MediaType::Video);
     // 时基 = 1/timescale = 1/1000。
-    assert_eq!(s.timebase, Rational::new(1, 1000).unwrap());
-    // 时长：mdhd 30 @ 1/1000 s = 30 ms = 211680 tick。
-    assert_eq!(s.duration, Timestamp::from_ticks(211_680));
-    assert_eq!(
-        s.video,
-        Some(VideoInfo {
-            width: 64,
-            height: 96
-        })
-    );
-    assert_eq!(s.audio, None);
+    assert_eq!(s.time_base, Rational::new(1, 1000));
+    // 时长：mdhd 30 单位 @ 1/1000，流时基原生精确。
+    assert_eq!(s.duration, Some(t(30)));
+    assert_eq!(s.duration.unwrap().time_base(), Rational::new(1, 1000));
+    // 样例数进 nb_frames（样例表精确计数）。
+    assert_eq!(s.nb_frames, Some(3));
+    assert_eq!(s.start_time, None);
+    assert_eq!(s.codec.audio, None);
     // extra_data = avcC 载荷（AVCDecoderConfigurationRecord 本体）。
-    assert_eq!(s.extra_data, AVCC.to_vec());
+    assert_eq!(s.codec.extradata, Some(AVCC.to_vec()));
 
     assert_eq!(r.sample_count(0).unwrap(), 3);
     assert!(r.stream(1).is_none());
@@ -45,42 +56,71 @@ fn golden_path_stream_metadata() {
 fn golden_path_read_packets_in_order() {
     let mut r = Mp4Reader::from_vec(golden()).unwrap();
 
-    // 样例 0：dts=0；ctts v1 首段偏移 -5 ms ⇒ pts=-35280 tick；stss 仅样例 1。
+    // 样例 0：dts=0；ctts v1 首段偏移 −5 ⇒ pts=−5；stss 仅样例 1。
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!((p0.stream_index, p0.sample_index), (0, 0));
-    assert_eq!(p0.dts, Timestamp::ZERO);
-    assert_eq!(p0.pts, Some(Timestamp::from_ticks(-35_280)));
-    assert_eq!(p0.duration, Timestamp::from_ticks(70_560)); // stts delta 10 ms
-    assert!(p0.keyframe);
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(p0.stream_index, 0);
+    assert_eq!(p0.dts, Some(t(0)));
+    assert_eq!(p0.pts, Some(t(-5)));
+    assert_eq!(p0.duration, Some(t(10))); // stts delta 10 单位
+    assert!(p0.flags.contains(PacketFlags::KEYFRAME));
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
 
-    // 样例 1：dts=10 ms；ctts 第二段偏移 0 ⇒ pts=dts；非关键帧。
+    // 样例 1：dts=10；ctts 第二段偏移 0 ⇒ pts=dts；非关键帧。
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.dts, Timestamp::from_ticks(70_560));
-    assert_eq!(p1.pts, Some(Timestamp::from_ticks(70_560)));
-    assert_eq!(p1.duration, Timestamp::from_ticks(70_560));
-    assert!(!p1.keyframe);
-    assert_eq!(p1.data, (0xA4..=0xA8).collect::<Vec<u8>>());
+    assert_eq!(p1.dts, Some(t(10)));
+    assert_eq!(p1.pts, Some(t(10)));
+    assert_eq!(p1.duration, Some(t(10)));
+    assert!(!p1.flags.contains(PacketFlags::KEYFRAME));
+    assert_eq!(&*p1.data, &(0xA4..=0xA8).collect::<Vec<u8>>());
 
     // 样例 2：chunk2 起点 = chunk1 + 4 + 5。
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.dts, Timestamp::from_ticks(141_120));
-    assert_eq!(p2.pts, Some(Timestamp::from_ticks(141_120)));
-    assert_eq!(p2.duration, Timestamp::from_ticks(70_560));
-    assert!(!p2.keyframe);
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(p2.dts, Some(t(20)));
+    assert_eq!(p2.pts, Some(t(20)));
+    assert_eq!(p2.duration, Some(t(10)));
+    assert!(!p2.flags.contains(PacketFlags::KEYFRAME));
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 
     // 乱序随机访问也可（重读样例 0）。
     let again = r.read_packet(0, 0).unwrap();
-    assert_eq!(again.data, p0.data);
-    assert_eq!(again.pts, Some(Timestamp::from_ticks(-35_280)));
+    assert_eq!(&*again.data, &*p0.data);
+    assert_eq!(again.pts, Some(t(-5)));
 }
 
-fn child_kinds(node: &BoxNode) -> Vec<String> {
+/// 移植新增只读查询：sample_timing / keyframe_index_before
+/// （接线阶段 Demuxer::seek 的依据；与 read_packet 同源计算）。
+#[test]
+fn golden_path_timing_and_keyframe_queries() {
+    let r = Mp4Reader::from_vec(golden()).unwrap();
+    for (i, (dts, pts)) in [(0usize, (0i64, -5i64)), (1, (10, 10)), (2, (20, 20))] {
+        let tm = r.sample_timing(0, i).unwrap();
+        assert_eq!(tm.dts, t(dts), "样例 {i} dts");
+        assert_eq!(tm.pts, t(pts), "样例 {i} pts");
+        assert_eq!(tm.duration, t(10), "样例 {i} duration");
+    }
+    // stss 仅样例 1（1-based）⇒ 任何序号向前查都落到 0。
+    for i in 0..3 {
+        assert_eq!(r.keyframe_index_before(0, i).unwrap(), 0, "样例 {i}");
+    }
+    // 错误语义与 read_packet 一致。
+    assert!(matches!(
+        r.sample_timing(0, 3),
+        Err(ye_container_mp4::Mp4Error::SampleIndexOutOfRange { count: 3, .. })
+    ));
+    assert!(matches!(
+        r.keyframe_index_before(1, 0),
+        Err(ye_container_mp4::Mp4Error::InvalidStreamIndex { index: 1, count: 1 })
+    ));
+}
+
+fn child_kinds(node: &ye_container_mp4::BoxNode) -> Vec<String> {
     node.children.iter().map(|c| c.info.kind.as_str()).collect()
 }
 
-fn find_child<'a>(node: &'a BoxNode, kind: &str) -> Option<&'a BoxNode> {
+fn find_child<'a>(
+    node: &'a ye_container_mp4::BoxNode,
+    kind: &str,
+) -> Option<&'a ye_container_mp4::BoxNode> {
     node.children.iter().find(|c| c.info.kind.as_str() == kind)
 }
 

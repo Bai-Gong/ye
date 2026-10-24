@@ -1,9 +1,15 @@
-//! `ye` 命令行的可测试主体：参数解析、`probe` 报告与 `remux` 直通。
+//! `ye` 命令行的可测试主体：参数解析、`probe` 报告、`remux` 直通与
+//! `convert` 占位桩。
 //!
-//! 对标 ffprobe 的最小子集（M1 验收演示：能列出素材信息）与
-//! `ffmpeg -c copy` 的最小子集（M1 收尾：MP4 重封装直通）。
+//! 对标 ffprobe 的最小子集（探查素材信息）、`ffmpeg -c copy` 的最小
+//! 子集（重封装直通）；`convert`（真转码）在 M3 落地，本阶段只占
+//! 参数形态（锻 D2 接入约定：进度回调 + AtomicBool 取消）。
 //! 参数解析手写，不引第三方库——命令面还很小，等 M3 `convert`
 //! 带来成体系的选项后再评估 clap。
+//!
+//! probe/remux 全部走 [`ContainerRegistry`]（显式构造、注册 MP4 工厂，
+//! 输入 auto-probe ftyp/box 嗅探），不再直连具体容器类型——M2 接线后
+//! 的命令面与未来新容器（MOV/MKV…）天然解耦。
 //!
 //! 二进制入口在 `src/main.rs`，只做 argv 分发与输出；
 //! 逻辑放本 lib 供 `tests/` 集成测试直接调用。
@@ -11,26 +17,31 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
-use std::io::{Read, Seek};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
-use ye::container::mp4::{
-    Layout, MediaKind, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet, TrackConfig,
-};
-use ye::time::{TICKS_PER_SECOND, Timestamp};
+use ye::container::mp4::register_mp4;
+use ye::container::{ContainerRegistry, MediaHeader};
 
 /// 用法说明（`--help` 与用法错误共用，输出方负责加换行）。
 pub const USAGE: &str = "\
 ye — 百工·冶命令行（媒体探查 / 转码）
 
 用法:
-  ye probe <FILE>        探查媒体文件：列出每路流的编解码、宽高/采样率、时基、时长
-  ye remux <IN> <OUT>    MP4 重封装直通（解封装→封装，不转码）
+  ye probe <FILE>        探查媒体文件：每路流的编解码、宽高/采样率、时基、时长、帧率、码率
+  ye remux <IN> <OUT>    重封装直通（解封装→封装，不转码；输入格式自动探测，输出 MP4）
+  ye convert <IN> <OUT>  转码（占位桩：真转码 M3 落地，当前调用即返回不支持的特性）
   ye --help              显示本帮助
   ye --version           显示版本
 
 当前支持: MP4 解封装与封装（progressive 与 fMP4 读写），probe/remux 可用。
-转码（convert）在 M3 落地。";
+convert 为占位桩——参数形态即锻（duan）的进程内接入契约。";
+
+/// convert 占位桩的固定错误文案（`Unsupported` 语义，真转码 M3 落地）。
+pub const CONVERT_STUB_ERROR: &str = "不支持的特性：convert 真转码在 M3 落地，当前为占位桩\
+（参数形态已定：进度回调 (processed_us, total_us) 微秒 + AtomicBool 取消）";
 
 /// 解析后的子命令。
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +50,8 @@ pub enum Command {
     Probe { path: PathBuf },
     /// `ye remux <IN> <OUT>`。
     Remux { input: PathBuf, output: PathBuf },
+    /// `ye convert <IN> <OUT>`。
+    Convert { input: PathBuf, output: PathBuf },
     /// `ye --help` / `ye -h`。
     Help,
     /// `ye --version` / `ye -V`。
@@ -55,7 +68,10 @@ pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
     };
     match first.to_str() {
         Some("probe") => parse_probe(&args[1..]),
-        Some("remux") => parse_remux(&args[1..]),
+        Some("remux") => parse_two_paths("remux", &args[1..])
+            .map(|(input, output)| Command::Remux { input, output }),
+        Some("convert") => parse_two_paths("convert", &args[1..])
+            .map(|(input, output)| Command::Convert { input, output }),
         Some("--help") | Some("-h") => Ok(Command::Help),
         Some("--version") | Some("-V") => Ok(Command::Version),
         other => Err(format!(
@@ -77,186 +93,213 @@ fn parse_probe(rest: &[OsString]) -> Result<Command, String> {
     }
 }
 
-fn parse_remux(rest: &[OsString]) -> Result<Command, String> {
+/// `<IN> <OUT>` 双路径子命令的共用解析。
+fn parse_two_paths(name: &str, rest: &[OsString]) -> Result<(PathBuf, PathBuf), String> {
     match rest {
-        [input, output] => Ok(Command::Remux {
-            input: PathBuf::from(input),
-            output: PathBuf::from(output),
-        }),
-        [] => Err(format!("`remux` 需要输入与输出两个文件参数。\n\n{USAGE}")),
+        [input, output] => Ok((PathBuf::from(input), PathBuf::from(output))),
+        [] => Err(format!("`{name}` 需要输入与输出两个文件参数。\n\n{USAGE}")),
         [_only] => Err(format!(
-            "`remux` 需要输入与输出两个文件参数（缺输出）。\n\n{USAGE}"
+            "`{name}` 需要输入与输出两个文件参数（缺输出）。\n\n{USAGE}"
         )),
-        _ => Err(format!("`remux` 只接受输入与输出两个文件参数。\n\n{USAGE}")),
+        _ => Err(format!(
+            "`{name}` 只接受输入与输出两个文件参数。\n\n{USAGE}"
+        )),
     }
 }
 
+/// 命令行自用的容器注册表：MP4 demuxer/muxer 已注册（显式构造、
+/// 显式传递——注册表无全局单例，见 ye-container 契约）。
+pub fn registry() -> ContainerRegistry {
+    let mut reg = ContainerRegistry::new();
+    register_mp4(&mut reg);
+    reg
+}
+
+// —— probe ——
+
 /// 探查 `path` 指向的媒体文件，返回完整报告文本（含末尾换行）。
+///
+/// 输入经注册表 auto-probe（ftyp/box 嗅探）识别格式。报告在头信息
+/// （流表）之外补两列：
+/// - **帧率**（仅视频）：`样例数 ÷ 时长` 近似——恒帧率（CFR）文件
+///   准确，可变帧率（VFR）文件有偏差（逐帧时长不均时平均帧率不等于
+///   瞬时帧率），报告里注明；
+/// - **码率**：`样例字节总和 ÷ 时长`——为拿到样例字节总和，探查会
+///   把解封装排空一遍（读全文件一次；M2 取精确值优先于快）。
 ///
 /// Err 载荷为已含路径前缀的用户向错误信息。
 pub fn probe(path: &Path) -> Result<String, String> {
-    let reader = Mp4Reader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(report(&reader, path))
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (format, mut demuxer) = registry()
+        .open_demuxer(Box::new(BufReader::new(file)))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let header = demuxer
+        .read_header()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // 码率的样例字节总和：排空解封装逐包累加（每路 + 总量）。
+    let mut stream_bytes = vec![0u64; header.streams.len()];
+    while let Some(pkt) = demuxer
+        .read_packet()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+    {
+        let si = usize::try_from(pkt.stream_index).unwrap_or(usize::MAX);
+        if si < stream_bytes.len() {
+            stream_bytes[si] += pkt.data.len() as u64;
+        }
+    }
+    Ok(report(&header, &format, &stream_bytes, path))
 }
 
-/// 由已打开的读取器生成报告（generic 便于测试传入 from_vec 的读取器）。
-fn report<R: Read + Seek>(reader: &Mp4Reader<R>, path: &Path) -> String {
-    let streams = reader.streams();
-    let mut out = format!("{}: MP4, {} 路流\n", path.display(), streams.len());
-    for s in streams {
-        // open 成功后样例表已通过校验，sample_count 实际不会失败；
-        // 仍走防御分支，报告里如实显示而不是崩溃。
-        let count = reader
-            .sample_count(s.index)
+/// 由头信息与每路样例字节数生成报告。
+fn report(header: &MediaHeader, format: &str, stream_bytes: &[u64], path: &Path) -> String {
+    let mut out = format!(
+        "{}: {}, {} 路流\n",
+        path.display(),
+        format,
+        header.streams.len()
+    );
+    for s in &header.streams {
+        let secs = s.duration.map(|d| d.to_seconds());
+        let count = s
+            .nb_frames
             .map(|n| n.to_string())
-            .unwrap_or_else(|e| format!("读取失败: {e}"));
-        // 浮点仅用于显示（ye-time 契约允许），时长精确值以上面 tick 数为准。
-        let secs = s.duration.as_ticks() as f64 / TICKS_PER_SECOND as f64;
+            .unwrap_or_else(|| "未知".to_string());
         out.push_str(&format!(
-            "流 #{} [{}] codec={} 时基={} 时长={:.3}s ({} tick) 样例数={}",
+            "流 #{} [{}] codec={} 时基={}/{} 时长={} 样例数={}",
             s.index,
-            kind_label(s.kind),
-            s.codec,
-            s.timebase,
-            secs,
-            s.duration.as_ticks(),
+            kind_label(s.media_type),
+            codec_label(s.codec.codec),
+            s.time_base.num(),
+            s.time_base.den(),
+            duration_label(s.duration),
             count,
         ));
-        match (s.kind, s.video, s.audio) {
-            (MediaKind::Video, Some(v), _) => {
-                out.push_str(&format!(" 尺寸={}x{}\n", v.width, v.height));
-            }
-            (MediaKind::Audio, _, Some(a)) => {
-                out.push_str(&format!(
-                    " 声道={} 采样率={}Hz\n",
-                    a.channel_count, a.sample_rate
-                ));
-            }
-            _ => out.push('\n'),
+        // 帧率（仅视频）：样例数÷时长近似，VFR 有偏差。
+        if s.media_type == ye::container::mp4::MediaType::Video
+            && let Some(fps) = approx_fps(s.nb_frames, secs)
+        {
+            out.push_str(&format!(
+                " 帧率≈{fps:.3}（样例数÷时长近似，VFR 文件有偏差）"
+            ));
         }
+        // 媒体参数。
+        match (&s.codec.video, &s.codec.audio) {
+            (Some(v), _) => out.push_str(&format!(" 尺寸={}x{}", v.width, v.height)),
+            (None, Some(a)) => {
+                let ch = a
+                    .channel_layout
+                    .map(|l| l.channels().to_string())
+                    .unwrap_or_else(|| "未知".to_string());
+                out.push_str(&format!(" 声道={ch} 采样率={}Hz", a.sample_rate));
+            }
+            (None, None) => {}
+        }
+        // 码率：样例字节总和×8 ÷ 时长。
+        if let Some(bps) = approx_bit_rate(stream_bytes.get(s.index as usize).copied(), secs) {
+            out.push_str(&format!(" 码率={bps}bps"));
+        }
+        out.push('\n');
     }
     out
 }
 
-fn kind_label(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Video => "视频",
-        MediaKind::Audio => "音频",
-        MediaKind::Other => "其他",
+/// 时长字段：`x.xxxs (n tick)`；缺失 → `未知`。tick 即流时基的
+/// 原生单位数（精确值以它为准，秒数只是显示值）。
+fn duration_label(d: Option<ye::time::Timestamp>) -> String {
+    match d {
+        Some(d) => format!("{:.3}s ({} tick)", d.to_seconds(), d.ticks()),
+        None => "未知".to_string(),
     }
+}
+
+/// 帧率近似：样例数 ÷ 秒；时长缺失/为 0 → None。
+/// 仅显示用（f64），见 ye-time 契约。
+fn approx_fps(nb_frames: Option<u64>, secs: Option<f64>) -> Option<f64> {
+    let n = nb_frames?;
+    let s = secs?;
+    (s > 0.0).then_some(n as f64 / s)
+}
+
+/// 码率：样例字节总和 × 8 ÷ 秒；字节数/时长缺失或时长为 0 → None。
+fn approx_bit_rate(bytes: Option<u64>, secs: Option<f64>) -> Option<u64> {
+    let b = bytes?;
+    let s = secs?;
+    (s > 0.0).then_some((b as f64 * 8.0 / s).round() as u64)
+}
+
+fn kind_label(kind: ye::container::mp4::MediaType) -> &'static str {
+    match kind {
+        ye::container::mp4::MediaType::Video => "视频",
+        ye::container::mp4::MediaType::Audio => "音频",
+        ye::container::mp4::MediaType::Subtitle => "字幕",
+    }
+}
+
+/// codec 标签：`CodecId` 的 Debug 形式转小写（对齐 ffprobe 命名，
+/// 如 `h264`/`aac`；Unknown → `unknown`）。
+fn codec_label(codec: ye::container::mp4::CodecId) -> String {
+    format!("{codec:?}").to_lowercase()
 }
 
 // —— remux ——
 
-/// `ye remux <IN> <OUT>`：MP4 解封装 → 封装直通（不转码）。
+/// `ye remux <IN> <OUT>`：重封装直通（不转码，对标 `ffmpeg -c copy`）。
 ///
-/// - 输出为 progressive 布局（`ftyp → mdat → moov`）；包数据、关键帧、
-///   时长与 pts−dts 偏移原样透传（H.264 保持 AVCC，不转 Annex B）。
-/// - 流按 reader 流序一一对应写入（`TrackConfig::from_stream`）。
-/// - 交错：各轨按样例序游标推进，全局按 `(dts tick, 流号)` 归并写入
-///   （轨内序天然保持，同轨连续样例由 writer 自动合一 chunk）。
-/// - 时戳：progressive 的 stts 从 0 起算（无 elst），故每轨时间线整体
-///   平移到首包 dts = 0（平移量 = 该轨首包 dts；常见文件本就是 0，
-///   平移为 no-op）。轨内相对时序不变；跨轨起始差不保真。
+/// 归并循环上提到门面助手 [`ye::container::remux`]（见其文档）：
+/// 输入 auto-probe 打开 → 每轨平移到首包 dts=0 → 逐包直通 MP4
+/// （progressive）。包数据、关键帧、时长与 pts−dts 偏移原样透传
+/// （H.264 保持 AVCC，不转 Annex B）。
 ///
 /// Err 载荷为已含路径前缀的用户向错误信息。
 pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
-    let mut reader = Mp4Reader::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
-    if reader.streams().is_empty() {
-        return Err(format!("{}: 输入无流，无可直通内容", input.display()));
-    }
-    let mut writer = Mp4Writer::create(
-        output,
-        Mp4WriterOptions {
-            layout: Layout::Progressive,
-            ..Default::default()
-        },
+    let in_file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let out_file = File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let stats = ye::container::remux(
+        &registry(),
+        Box::new(BufReader::new(in_file)),
+        "mp4",
+        Box::new(BufWriter::new(out_file)),
     )
-    .map_err(|e| format!("{}: {e}", output.display()))?;
-    for s in reader.streams() {
-        writer
-            .add_stream(TrackConfig::from_stream(s))
-            .map_err(|e| format!("{}: 流 {}: {e}", input.display(), s.index))?;
-    }
-
-    // 每轨游标 + 头包缓冲的 k 路归并（内存里每轨至多挂一个包）。
-    let stream_count = reader.streams().len();
-    let err_open =
-        |si: usize, e: ye::container::mp4::Mp4Error| format!("{}: 流 {si}: {e}", input.display());
-    let mut cursors = vec![0usize; stream_count];
-    let mut heads: Vec<Option<Packet>> = Vec::with_capacity(stream_count);
-    for si in 0..stream_count {
-        let count = reader.sample_count(si).map_err(|e| err_open(si, e))?;
-        heads.push(if count > 0 {
-            Some(reader.read_packet(si, 0).map_err(|e| err_open(si, e))?)
-        } else {
-            None
-        });
-    }
-
-    // 各轨首包 dts（tick），作为该轨的整体平移量；None = 未定（未遇首包）。
-    let mut shifts: Vec<Option<i64>> = vec![None; stream_count];
-    let mut written = 0usize;
-    loop {
-        // 挑当前头包中 dts 最小者（并列取流号小者，输出确定）。
-        let mut pick: Option<usize> = None;
-        for si in 0..stream_count {
-            let Some(pkt) = &heads[si] else { continue };
-            pick = match pick {
-                None => Some(si),
-                Some(cur) => {
-                    let cur_dts = heads[cur].as_ref().expect("已选流应有头包").dts.as_ticks();
-                    if (pkt.dts.as_ticks(), si) < (cur_dts, cur) {
-                        Some(si)
-                    } else {
-                        Some(cur)
-                    }
-                }
-            };
-        }
-        let Some(si) = pick else { break };
-        let pkt = heads[si].take().expect("选中流的头包应存在");
-
-        // 首包定平移量；后续包按同值平移（轨内相对时序不变）。
-        let shift_ticks = *shifts[si].get_or_insert(pkt.dts.as_ticks());
-        let shift = Timestamp::from_ticks(shift_ticks);
-        let dts = pkt
-            .dts
-            .checked_sub(shift)
-            .ok_or_else(|| format!("{}: 流 {si}: dts 平移溢出", input.display()))?;
-        let pts = match pkt.pts {
-            None => None,
-            Some(p) => Some(
-                p.checked_sub(shift)
-                    .ok_or_else(|| format!("{}: 流 {si}: pts 平移溢出", input.display()))?,
-            ),
-        };
-        writer
-            .write_packet(&Packet { dts, pts, ..pkt })
-            .map_err(|e| format!("{}: 流 {si}: {e}", input.display()))?;
-        written += 1;
-
-        // 推进该轨游标，读入下一头包。
-        cursors[si] += 1;
-        let count = reader.sample_count(si).map_err(|e| err_open(si, e))?;
-        heads[si] = if cursors[si] < count {
-            Some(
-                reader
-                    .read_packet(si, cursors[si])
-                    .map_err(|e| err_open(si, e))?,
-            )
-        } else {
-            None
-        };
-    }
-    writer
-        .finalize()
-        .map_err(|e| format!("{}: {e}", output.display()))?;
+    .map_err(|e| format!("{} → {}: {e}", input.display(), output.display()))?;
     Ok(format!(
         "{} → {}: MP4, {} 路流, {} 样例直通（不转码）\n",
         input.display(),
         output.display(),
-        stream_count,
-        written
+        stats.streams,
+        stats.packets
+    ))
+}
+
+// —— convert（M3 占位桩）——
+
+/// 转码进度回调的参数形态（锻 D2 接入约定）：
+/// `(processed_us, total_us)` —— 已处理/总时长，微秒（参数名以文档
+/// 说明为准，`Fn(i64, i64)` 位置参数：第一个已处理、第二个总时长）。
+///
+/// 与锻现有 `transcode-progress` 事件负载 `{jobId, timeUs, totalUs}`
+/// 同源（timeUs/totalUs 直传）；jobId 路由与 ≥100ms 节流归锻侧
+/// （Tauri 事件层），ye 只提供进程内的每任务回调。
+pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);
+
+/// `ye convert <IN> <OUT>`：转码占位桩（真转码 M3 落地）。
+///
+/// 参数形态即锻的进程内接入契约，现在定形：
+/// - `progress`：进度回调 [`ConvertProgress`]（已处理/总时长，微秒；
+///   M3 的转码循环逐包/逐帧上报）；
+/// - `cancel`：取消旗标 `&AtomicBool`——锻侧置位即请求取消，M3 的
+///   转码循环逐包检查、及时退出并清理半成品（进程内等价于旧方案的
+///   kill 子进程）。
+///
+/// 本桩调用即返回 [`CONVERT_STUB_ERROR`]（不触碰输入输出文件）。
+pub fn convert(
+    input: &Path,
+    output: &Path,
+    _progress: ConvertProgress<'_>,
+    _cancel: &AtomicBool,
+) -> Result<String, String> {
+    Err(format!(
+        "{} → {}: {CONVERT_STUB_ERROR}",
+        input.display(),
+        output.display()
     ))
 }

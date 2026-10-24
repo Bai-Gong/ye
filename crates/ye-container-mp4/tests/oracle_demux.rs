@@ -4,14 +4,16 @@
 //! 对拍内容：
 //! ① ffprobe -show_streams 的 codec/尺寸/声道采样率/time_base 与 ye streams()；
 //! ② ffprobe -show_packets 逐包 dts/pts/duration/size 与 ye read_packet——
-//!    时戳统一换到流时基单位域比较：dts/pts 允许整轨常数偏移（ffmpeg 按
-//!    elist 平移时间轴、ye 读原始表，实测 prog.mp4 视频偏 2 帧、音频偏
-//!    1024 样本），但偏移必须恒定且 pts-dts 差逐包严格相等；duration 严格
-//!    相等（timescale ≤ 7,056,000 时 tick↔unit 往返无损，半 tick 舍入误差
-//!    < 0.5 单位；本机实测 timescale 12288/44100 量级均满足）；
+//!    时戳即流时基原生单位（ticks 直读，无换算无舍入）：dts/pts 允许整轨
+//!    常数偏移（ffmpeg 按 elist 平移时间轴、ye 读原始表，实测 prog.mp4
+//!    视频偏 2 帧、音频偏 1024 样本），但偏移必须恒定且 pts-dts 差逐包
+//!    严格相等；duration 严格相等；
 //! ③ keyframe 对拍 ffprobe flags 字段的 K；
-//! ④ data 字节数=size、读全包不越界（逐包 read_packet 本身即验证）；
-//! ⑤ ye probe 冒烟（构建并运行本工作区 ye-cli 的真二进制）。
+//! ④ data 字节数=size、读全包不越界（逐包 read_packet 本身即验证）。
+//!
+//! 注：m1 版⑤「ye probe 冒烟」（构建并运行 ye-cli 真二进制）随合流移出
+//! 本组——ye-cli 为 m1 版、develop 上暂不编译（超出本 crate 移植范围），
+//! 待其按新契约重写后回归（见 docs/contracts.md 移植裁决节）。
 //!
 //! 素材由 ffmpeg lavfi 生成到 CARGO_TARGET_TMPDIR（命令固定，保证 ≥2 个
 //! moof——实测 duration=1 -g 10 只产单 moof）：
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use ye_container_mp4::{MediaKind, Mp4Reader, Rational};
+use ye_container_mp4::{CodecId, MediaType, Mp4Reader, Rational};
 
 // —— 工具查找与素材生成 ——
 
@@ -148,7 +150,7 @@ struct FfStream {
     height: Option<u32>,
     channels: Option<u32>,
     sample_rate: Option<u32>,
-    time_base: (i64, i64),
+    time_base: (i32, i32),
 }
 
 struct FfPacket {
@@ -225,11 +227,11 @@ fn ff_packets(file: &Path) -> Vec<Vec<FfPacket>> {
     streams
 }
 
-/// ffprobe codec_name → MP4 fourcc（本测试生成的素材只含 h264/aac）。
-fn fourcc_of(codec: &str) -> &'static str {
+/// ffprobe codec_name → [`CodecId`]（本测试生成的素材只含 h264/aac）。
+fn codec_id_of(codec: &str) -> CodecId {
     match codec {
-        "h264" => "avc1",
-        "aac" => "mp4a",
+        "h264" => CodecId::H264,
+        "aac" => CodecId::Aac,
         other => panic!("未映射的 codec_name={other}（请在测试里补映射）"),
     }
 }
@@ -237,17 +239,17 @@ fn fourcc_of(codec: &str) -> &'static str {
 // —— 对拍断言 ——
 
 /// ① 流元数据对拍。
-fn compare_streams(name: &str, file: &Path) -> Vec<(Rational, MediaKind)> {
+fn compare_streams(name: &str, file: &Path) -> Vec<Rational> {
     let r = Mp4Reader::open(file).unwrap();
     let ff = ff_streams(file);
     assert_eq!(r.streams().len(), ff.len(), "{name}：流数");
     ff.iter().zip(r.streams()).for_each(|(f, s)| {
-        assert_eq!(f.index, s.index, "{name}：流序号");
-        assert_eq!(s.codec.as_str(), fourcc_of(&f.codec_name), "{name}：codec");
+        assert_eq!(f.index, s.index as usize, "{name}：流序号");
+        assert_eq!(s.codec.codec, codec_id_of(&f.codec_name), "{name}：codec");
         match f.codec_type.as_str() {
             "video" => {
-                assert_eq!(s.kind, MediaKind::Video, "{name}：kind");
-                let v = s.video.as_ref().unwrap();
+                assert_eq!(s.media_type, MediaType::Video, "{name}：kind");
+                let v = s.codec.video.as_ref().unwrap();
                 assert_eq!(
                     (v.width, v.height),
                     (f.width.unwrap(), f.height.unwrap()),
@@ -255,47 +257,46 @@ fn compare_streams(name: &str, file: &Path) -> Vec<(Rational, MediaKind)> {
                 );
             }
             "audio" => {
-                assert_eq!(s.kind, MediaKind::Audio, "{name}：kind");
-                let a = s.audio.as_ref().unwrap();
-                assert_eq!(a.channel_count, f.channels.unwrap(), "{name}：声道");
+                assert_eq!(s.media_type, MediaType::Audio, "{name}：kind");
+                let a = s.codec.audio.as_ref().unwrap();
+                assert_eq!(
+                    a.channel_layout.map(|l| l.channels()).unwrap_or(0),
+                    f.channels.unwrap(),
+                    "{name}：声道"
+                );
                 assert_eq!(a.sample_rate, f.sample_rate.unwrap(), "{name}：采样率");
             }
             other => panic!("{name}：未预期的 codec_type={other}"),
         }
         // time_base "1/12288" 形式与 ye 的 1/mdhd:timescale 应严格相等。
         assert_eq!(
-            (s.timebase.num, s.timebase.den),
+            (s.time_base.num(), s.time_base.den()),
             f.time_base,
             "{name}：流 {} 时基",
             s.index
         );
     });
-    r.streams().iter().map(|s| (s.timebase, s.kind)).collect()
+    r.streams().iter().map(|s| s.time_base).collect()
 }
 
 /// ②③④ 逐包对拍。`zero_dts_offset`：该文件是否要求 dts 常数偏移为 0
 /// （fMP4 无 elist、实测偏移为 0；渐进式文件 ffmpeg 写 elist 平移时间轴——
 /// 视频 B 帧延迟偏 2 帧、AAC priming 偏 1024 样本——只断言偏移恒定）。
-fn compare_packets(
-    name: &str,
-    file: &Path,
-    streams: &[(Rational, MediaKind)],
-    zero_dts_offset: bool,
-) {
+fn compare_packets(name: &str, file: &Path, tbs: &[Rational], zero_dts_offset: bool) {
     let mut r = Mp4Reader::open(file).unwrap();
     let ff = ff_packets(file);
-    assert_eq!(ff.len(), streams.len(), "{name}：有包流数");
+    assert_eq!(ff.len(), tbs.len(), "{name}：有包流数");
     for (si, ff_pk) in ff.iter().enumerate() {
-        let (tb, kind) = &streams[si];
+        let tb = tbs[si];
         let count = r.sample_count(si).unwrap();
         assert_eq!(count, ff_pk.len(), "{name}：流 {si} 包数");
         let mut dts_off: Option<i64> = None;
         let mut pts_off: Option<i64> = None;
         for (i, f) in ff_pk.iter().enumerate() {
             let p = r.read_packet(si, i).unwrap();
-            // ④ data 字节数 = ffprobe size（读全包不越界由 read_packet 保证）。
-            assert_eq!(p.data.len() as i64, f.size, "{name}：流 {si} 包 {i} 大小");
-            let ydts = p.dts.to_units(*tb).unwrap();
+            // 时戳已按流时基打戳：ticks 即轨道单位，直读对拍。
+            let ydts = p.dts.unwrap().ticks();
+            assert_eq!(p.dts.unwrap().time_base(), tb, "{name}：流 {si} 打戳时基");
             if let Some(fd) = f.dts {
                 let off = ydts - fd;
                 if let Some(prev) = dts_off.replace(off) {
@@ -305,7 +306,7 @@ fn compare_packets(
                     );
                 }
             }
-            let ypts = p.pts.map(|v| v.to_units(*tb).unwrap()).unwrap_or(ydts);
+            let ypts = p.pts.unwrap().ticks();
             if let (Some(fp), Some(fd)) = (f.pts, f.dts) {
                 let off = ypts - fp;
                 if let Some(prev) = pts_off.replace(off) {
@@ -315,13 +316,17 @@ fn compare_packets(
                 assert_eq!(ypts - ydts, fp - fd, "{name}：流 {si} 包 {i} pts-dts");
             }
             if let Some(fdur) = f.duration {
-                // timescale ≤ 7,056,000 ⇒ tick↔unit 往返无损，严格相等。
-                let ydur = p.duration.to_units(*tb).unwrap();
-                assert_eq!(ydur, fdur, "{name}：流 {si} 包 {i} 时长");
+                assert_eq!(
+                    p.duration.unwrap().ticks(),
+                    fdur,
+                    "{name}：流 {si} 包 {i} 时长"
+                );
             }
-            assert_eq!(p.keyframe, f.keyframe, "{name}：流 {si} 包 {i} 关键帧");
+            // ④ data 字节数 = ffprobe size（读全包不越界由 read_packet 保证）。
+            assert_eq!(p.data.len() as i64, f.size, "{name}：流 {si} 包 {i} 大小");
+            let key = p.flags.contains(ye_container_mp4::PacketFlags::KEYFRAME);
+            assert_eq!(key, f.keyframe, "{name}：流 {si} 包 {i} 关键帧");
         }
-        let _ = kind;
         if let Some(off) = dts_off {
             assert!(
                 !zero_dts_offset || off == 0,
@@ -332,8 +337,8 @@ fn compare_packets(
 }
 
 fn demux_and_compare(name: &str, file: &Path, zero_dts_offset: bool) {
-    let streams = compare_streams(name, file);
-    compare_packets(name, file, &streams, zero_dts_offset);
+    let tbs = compare_streams(name, file);
+    compare_packets(name, file, &tbs, zero_dts_offset);
 }
 
 // —— 测试入口 ——
@@ -355,49 +360,4 @@ fn oracle_fmp4_explicit_base() {
 fn oracle_progressive_with_audio() {
     let Some(fx) = fixture() else { return };
     demux_and_compare("progressive_av", &fx.progressive, false);
-}
-
-/// ⑤ ye probe 冒烟：构建并运行本工作区 ye-cli 的真二进制探查 fMP4。
-#[test]
-fn oracle_ye_probe_smoke_on_fmp4() {
-    let Some(fx) = fixture() else { return };
-    // cargo test 只构建本 crate；用编译期 CARGO 指向的 cargo 构建 ye-cli
-    // （增量构建，已构建过则秒回），再从 profile 目录取真二进制。
-    let cargo = env!("CARGO");
-    // 本机实测 CARGO_TARGET_TMPDIR = <target>/tmp（不带 profile 目录），
-    // 与上面不带 --release 的 cargo build 对应 debug 目录。
-    let profile_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .parent()
-        .unwrap()
-        .join("debug");
-    let status = Command::new(cargo)
-        .args(["build", "-p", "ye-cli", "--quiet"])
-        .status()
-        .expect("启动 cargo build -p ye-cli 失败");
-    assert!(status.success(), "ye-cli 构建失败");
-    let bin = if cfg!(windows) {
-        profile_dir.join("ye.exe")
-    } else {
-        profile_dir.join("ye")
-    };
-    let out = Command::new(&bin)
-        .arg("probe")
-        .arg(&fx.fmp4_default)
-        .output()
-        .expect("启动 ye 失败");
-    assert!(out.status.success(), "ye probe 应以 0 退出");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    println!("---- ye probe 实际输出 ----\n{stdout}---------------------------");
-    assert!(
-        stdout.contains(": MP4, 1 路流"),
-        "报告头应含流数，实际:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("流 #0 [视频] codec=avc1") && stdout.contains("样例数=24"),
-        "视频流行应完整（24 个 fragment 样例），实际:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("尺寸=320x240"),
-        "应含 testsrc2 默认尺寸，实际:\n{stdout}"
-    );
 }

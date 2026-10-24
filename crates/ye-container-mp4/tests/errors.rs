@@ -1,9 +1,11 @@
 //! 用例 4：错误路径。
+//!
+//! 移植后语义：时戳为流时基原生单位（tfdf/trun 的轨道单位直读）。
 
 mod helpers;
 
 use helpers::*;
-use ye_container_mp4::{Mp4Error, Mp4Reader, Timestamp};
+use ye_container_mp4::{Mp4Error, Mp4Reader, Rational, Timestamp};
 
 fn golden() -> Vec<u8> {
     let (c1, c2) = golden_offsets(&golden_file(&[0, 0], false));
@@ -72,15 +74,16 @@ fn moof_fragment_appends_to_track_samples() {
     push(&mut f, &moof);
     push(&mut f, &r#box("mdat", &MDAT));
 
+    let tb = Rational::new(1, 1000);
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.sample_count(0).unwrap(), 2);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, Timestamp::from_ticks(30 * 7056)); // tfdt 30 @ 1/1000
-    assert_eq!(p0.duration, Timestamp::from_ticks(10 * 7056));
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(p0.dts, Some(Timestamp::new(30, tb))); // tfdt 30 @ 1/1000
+    assert_eq!(p0.duration, Some(Timestamp::new(10, tb)));
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.dts, Timestamp::from_ticks(40 * 7056));
-    assert_eq!(p1.data, (0xA4..=0xA8).collect::<Vec<u8>>());
+    assert_eq!(p1.dts, Some(Timestamp::new(40, tb)));
+    assert_eq!(&*p1.data, &(0xA4..=0xA8).collect::<Vec<u8>>());
 }
 
 #[test]
@@ -110,10 +113,10 @@ fn mvex_without_moof_reads_progressive() {
     assert_eq!(r.streams().len(), 1);
     assert_eq!(r.sample_count(0).unwrap(), 3);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, Timestamp::ZERO);
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(p0.dts, Some(Timestamp::new(0, Rational::new(1, 1000))));
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 }
 
 #[test]

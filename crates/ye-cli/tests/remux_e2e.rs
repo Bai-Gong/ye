@@ -1,13 +1,13 @@
-//! `ye remux` 端到端集成测试（M1 收尾）：PATH 上的 ffmpeg 造小双轨源
-//! （视频 + 音频各一路）→ 真二进制 `ye remux` 直通 → 三重验收：
+//! `ye remux` 端到端集成测试（M1 收尾，M2 接线后随新 API 更新）：
+//! PATH 上的 ffmpeg 造小双轨源（视频 + 音频各一路）→ 真二进制
+//! `ye remux` 直通（注册表 auto-probe + 门面 remux 助手）→ 三重验收：
 //!
 //! 1. 输出能被 ffprobe 正常读取（`-v error` 退出码 0）；
 //! 2. 流参数与输入一致（ffprobe codec/尺寸/声道/采样率/时基逐字段）；
 //! 3. ye 再解封装输出与首次解封装输入逐包对拍——数据字节严格一致，
-//!    dts/pts/duration 在流时基单位域严格相等（timescale ≤ 7,056,000
-//!    时 tick→单位→tick 两次 half-away 舍入互相抵消，数学保证，见
-//!    ye-time units_round_trip_common_timescales；整除时基另作 tick 域
-//!    断言），关键帧逐包一致。
+//!    dts/pts/duration 在流时基原生单位严格相等（读取端无换算无舍入；
+//!    remux 同容器直通、模板时基 = 源流时基 ⇒ muxer 重标度恒等），
+//!    关键帧 flags 逐包一致。
 //!
 //! PATH 上找不到 ffmpeg/ffprobe（或不可执行）时打印跳过信息直接返回
 //! （不 fail）。临时文件全部落在 `CARGO_TARGET_TMPDIR`（target/ 下，
@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ye::container::mp4::Mp4Reader;
-use ye::time::TICKS_PER_SECOND;
 use ye_cli::{Command as CliCommand, parse_args};
 
 // —— 工具探测与临时目录 ——
@@ -177,8 +176,8 @@ fn remux_end_to_end() {
     }
 
     // —— ③ ye 两次解封装逐包对拍（输入 vs 重封装输出）——
-    // 数据字节严格一致；时戳在单位域严格相等（存储域即真值），
-    // 整除时基（7,056,000 % timescale == 0）另作 tick 域断言。
+    // 数据字节严格一致；时戳在流时基原生单位严格相等（存储域即真值，
+    // remux 模板时基 = 源流时基 ⇒ 写入重标度恒等）；关键帧 flags 一致。
     let mut so = Mp4Reader::open(&src).unwrap();
     let mut rt = Mp4Reader::open(&dst).unwrap();
     assert_eq!(rt.streams().len(), so.streams().len());
@@ -187,49 +186,30 @@ fn remux_end_to_end() {
         let s_src = so.stream(si).unwrap();
         let s_rt = rt.stream(si).unwrap();
         // 流元数据一致（时基/extra_data/视频音频参数原样回写）。
-        assert_eq!(s_src.codec.as_str(), s_rt.codec.as_str(), "流 {si} codec");
-        assert_eq!(s_src.timebase, s_rt.timebase, "流 {si} 时基");
-        assert_eq!(s_src.extra_data, s_rt.extra_data, "流 {si} extra_data");
-        assert_eq!(s_src.video, s_rt.video, "流 {si} 视频参数");
-        assert_eq!(s_src.audio, s_rt.audio, "流 {si} 音频参数");
+        assert_eq!(s_src.codec.codec, s_rt.codec.codec, "流 {si} codec");
+        assert_eq!(s_src.time_base, s_rt.time_base, "流 {si} 时基");
+        assert_eq!(
+            s_src.codec.extradata, s_rt.codec.extradata,
+            "流 {si} extra_data"
+        );
+        assert_eq!(s_src.codec.video, s_rt.codec.video, "流 {si} 视频参数");
+        assert_eq!(s_src.codec.audio, s_rt.codec.audio, "流 {si} 音频参数");
         assert_eq!(
             so.sample_count(si).unwrap(),
             rt.sample_count(si).unwrap(),
             "流 {si} 样例数"
         );
-        let tb = s_src.timebase;
-        let tick_strict = tb.den != 0 && TICKS_PER_SECOND % tb.den == 0;
         for ii in 0..rt.sample_count(si).unwrap() {
             let po = so.read_packet(si, ii).unwrap();
             let pr = rt.read_packet(si, ii).unwrap();
             assert_eq!(po.data, pr.data, "流 {si} 样例 {ii} 数据逐字节一致");
+            assert_eq!(po.dts, pr.dts, "流 {si} 样例 {ii} dts（流时基原生单位）");
+            assert_eq!(po.pts, pr.pts, "流 {si} 样例 {ii} pts（流时基原生单位）");
             assert_eq!(
-                po.dts.to_units(tb),
-                pr.dts.to_units(tb),
-                "流 {si} 样例 {ii} dts（单位域）"
+                po.duration, pr.duration,
+                "流 {si} 样例 {ii} duration（流时基原生单位）"
             );
-            // pts 缺省语义 = dts（None 与 Some(dts) 等价处理）。
-            let po_pts = po.pts.unwrap_or(po.dts);
-            let pr_pts = pr.pts.unwrap_or(pr.dts);
-            assert_eq!(
-                po_pts.to_units(tb),
-                pr_pts.to_units(tb),
-                "流 {si} 样例 {ii} pts（单位域）"
-            );
-            assert_eq!(
-                po.duration.to_units(tb),
-                pr.duration.to_units(tb),
-                "流 {si} 样例 {ii} duration（单位域）"
-            );
-            assert_eq!(po.keyframe, pr.keyframe, "流 {si} 样例 {ii} keyframe");
-            if tick_strict {
-                assert_eq!(po.dts, pr.dts, "流 {si} 样例 {ii} dts（tick 域）");
-                assert_eq!(po_pts, pr_pts, "流 {si} 样例 {ii} pts（tick 域）");
-                assert_eq!(
-                    po.duration, pr.duration,
-                    "流 {si} 样例 {ii} duration（tick 域）"
-                );
-            }
+            assert_eq!(po.flags, pr.flags, "流 {si} 样例 {ii} flags（关键帧）");
             total += 1;
         }
     }

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "ye-codec",
  "ye-container",
+ "ye-container-mp4",
  "ye-device",
  "ye-filter",
  "ye-pixfmt",
@@ -38,12 +39,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ye-container-mp4"
+version = "0.1.0"
+dependencies = [
+ "ye-codec",
+ "ye-container",
+ "ye-pixfmt",
+ "ye-time",
+]
+
+[[package]]
 name = "ye-device"
 version = "0.1.0"
 
 [[package]]
 name = "ye-filter"
 version = "0.1.0"
+dependencies = [
+ "ye-codec",
+]
 
 [[package]]
 name = "ye-pixfmt"

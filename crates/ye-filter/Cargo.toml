@@ -6,3 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# 注：全库约定偏好根 Cargo.toml 的 [workspace.dependencies] + `workspace = true` 写法，
+# 但本轮施工范围限定为仅改本 crate 目录，故按 path 依赖直连（效果等价，无版本漂移）。
+# 垫的媒体类型复用 ye-codec::MediaType（帧来自 ye-codec，与 libavfilter
+# 依赖 libavcodec 对称）。
+ye-codec = { path = "../ye-codec" }

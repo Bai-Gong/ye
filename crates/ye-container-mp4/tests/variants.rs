@@ -1,9 +1,15 @@
 //! 用例 2（变体矩阵）与用例 3（音频轨）。
+//!
+//! 移植后语义：时戳/时长为流时基原生单位（黄金轨 1/1000、音频轨
+//! 1/48000），pts 恒 Some（无 ctts ⇒ pts==dts）。
 
 mod helpers;
 
 use helpers::*;
-use ye_container_mp4::{MediaKind, Mp4Reader, Rational, Timestamp};
+use ye_container_mp4::{
+    AudioParams, CodecId, MediaType, Mp4Reader, PacketFlags, Rational, Timestamp,
+};
+use ye_pixfmt::ChannelLayout;
 
 fn find_top<'a>(
     r: &'a Mp4Reader<std::io::Cursor<Vec<u8>>>,
@@ -32,14 +38,14 @@ fn co64_instead_of_stco() {
     assert_eq!(r.streams().len(), 1);
     assert_eq!(r.sample_count(0).unwrap(), 3);
     let s = r.stream(0).unwrap();
-    assert_eq!(s.timebase, Rational::new(1, 1000).unwrap());
-    assert_eq!(s.duration, Timestamp::from_ticks(211_680));
+    assert_eq!(s.time_base, Rational::new(1, 1000));
+    assert_eq!(s.duration, Some(Timestamp::new(30, Rational::new(1, 1000))));
 
     // 数据读取不受 co64 影响。
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 
     // 树里是 co64 而非 stco。
     let moov = find_top(&r, "moov");
@@ -56,7 +62,7 @@ fn co64_instead_of_stco() {
     assert!(find_child(stbl, "stco").is_none());
 }
 
-/// 定长 stsz + 无 ctts/stss（顺带验证缺省语义：视频全关键帧、pts=None）。
+/// 定长 stsz + 无 ctts/stss（顺带验证缺省语义：视频全关键帧、pts==dts）。
 #[test]
 fn stsz_fixed_sample_size() {
     let stbl = vec![
@@ -78,6 +84,7 @@ fn stsz_fixed_sample_size() {
     ];
     let mut r = Mp4Reader::from_vec(file_with(&[video_trak(&stbl, 1000, 30)])).unwrap();
 
+    let tb = Rational::new(1, 1000);
     assert_eq!(r.sample_count(0).unwrap(), 3);
     for (i, expect) in [
         vec![0xA0, 0xA1, 0xA2, 0xA3],
@@ -88,11 +95,15 @@ fn stsz_fixed_sample_size() {
     .enumerate()
     {
         let p = r.read_packet(0, i).unwrap();
-        assert_eq!(p.data, expect, "样例 {i}");
-        assert_eq!(p.duration, Timestamp::from_ticks(70_560));
-        // 无 ctts ⇒ pts None；视频轨无 stss ⇒ 恒关键帧。
-        assert_eq!(p.pts, None);
-        assert!(p.keyframe, "样例 {i} 应为关键帧");
+        assert_eq!(&*p.data, &expect, "样例 {i}");
+        assert_eq!(p.duration, Some(Timestamp::new(10, tb)));
+        // 无 ctts ⇒ pts==dts（打戳恒 Some）；视频轨无 stss ⇒ 恒关键帧。
+        assert_eq!(p.pts, Some(Timestamp::new(10 * i as i64, tb)));
+        assert_eq!(p.dts, p.pts);
+        assert!(
+            p.flags.contains(PacketFlags::KEYFRAME),
+            "样例 {i} 应为关键帧"
+        );
     }
 }
 
@@ -115,11 +126,11 @@ fn largesize_mdat() {
 
     let mut r = Mp4Reader::from_vec(f).unwrap();
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let mdat = find_top(&r, "mdat");
     assert_eq!(mdat.info.size, 16 + MDAT.len() as u64); // largesize 头 16 字节
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 }
 
 /// size==0 的顶层末 box：延伸到 EOF。
@@ -139,7 +150,7 @@ fn last_box_extends_to_eof() {
 
     let mut r = Mp4Reader::from_vec(f).unwrap();
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.data, (0xA4..=0xA8).collect::<Vec<u8>>());
+    assert_eq!(&*p1.data, &(0xA4..=0xA8).collect::<Vec<u8>>());
     let mdat = find_top(&r, "mdat");
     assert_eq!(mdat.info.offset, mdat_offset);
     assert_eq!(mdat.info.size, 8 + MDAT.len() as u64); // 到 EOF 即 24
@@ -186,16 +197,16 @@ fn unknown_boxes_are_skipped() {
     assert_eq!(r.streams().len(), 1);
     assert_eq!(r.sample_count(0).unwrap(), 3);
     let s = r.stream(0).unwrap();
-    assert_eq!(s.codec.as_str(), "avc1");
-    assert_eq!(s.extra_data, AVCC.to_vec());
+    assert_eq!(r.track_info(0).unwrap().codec.as_str(), "avc1");
+    assert_eq!(s.codec.extradata, Some(AVCC.to_vec()));
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
 }
 
 /// 用例 3：音频轨——hdlr=soun、mp4a(ch=2, rate=48000)+esds 进 extra_data、
-/// 无 stss ⇒ 全关键帧；无 ctts ⇒ pts=None。
+/// 无 stss ⇒ 全关键帧；无 ctts ⇒ pts==dts。
 #[test]
 fn audio_track_metadata_and_packets() {
     let audio_mdat: [u8; 6] = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
@@ -229,35 +240,46 @@ fn audio_track_metadata_and_packets() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.streams().len(), 1);
     let s = r.stream(0).unwrap();
-    assert_eq!(s.track_id, 3);
-    assert_eq!(s.kind, MediaKind::Audio);
-    assert_eq!(s.codec.as_str(), "mp4a");
-    assert_eq!(s.timebase, Rational::new(1, 48_000).unwrap());
-    // 时长：mdhd 3 @ 1/48000 s = 3 · 147 = 441 tick。
-    assert_eq!(s.duration, Timestamp::from_ticks(441));
-    assert_eq!(s.video, None);
+    assert_eq!(r.track_info(0).unwrap().track_id, 3);
+    assert_eq!(s.media_type, MediaType::Audio);
+    assert_eq!(s.codec.codec, CodecId::Aac);
+    assert_eq!(r.track_info(0).unwrap().codec.as_str(), "mp4a");
+    let tb = Rational::new(1, 48_000);
+    assert_eq!(s.time_base, tb);
+    // 时长：mdhd 3 单位 @ 1/48000，流时基原生精确。
+    assert_eq!(s.duration, Some(Timestamp::new(3, tb)));
+    assert_eq!(s.codec.video, None);
+    // 声道 2 → 默认布局 STEREO（声道数经 layout.channels() 保全）。
     assert_eq!(
-        s.audio,
-        Some(ye_container_mp4::AudioInfo {
-            channel_count: 2,
+        s.codec.audio,
+        Some(AudioParams {
             sample_rate: 48_000,
+            channel_layout: Some(ChannelLayout::STEREO),
+            sample_format: None,
         })
     );
+    assert_eq!(
+        s.codec
+            .audio
+            .as_ref()
+            .unwrap()
+            .channel_layout
+            .unwrap()
+            .channels(),
+        2
+    );
     // esds 载荷（含 4 字节版本/标志）原样透传。
-    assert_eq!(s.extra_data, ESDS.to_vec());
+    assert_eq!(s.codec.extradata, Some(ESDS.to_vec()));
 
-    let mut expect_dts = 0i64;
     for (i, bytes) in [&[0xC0, 0xC1][..], &[0xC2, 0xC3][..], &[0xC4, 0xC5][..]]
         .into_iter()
         .enumerate()
     {
         let p = r.read_packet(0, i).unwrap();
-        assert_eq!(p.dts, Timestamp::from_ticks(expect_dts), "样例 {i}");
-        assert_eq!(p.pts, None, "无 ctts ⇒ pts=None");
-        // 1 sample @48 kHz = 147 tick。
-        assert_eq!(p.duration, Timestamp::from_ticks(147));
-        assert!(p.keyframe, "音频轨恒关键帧");
-        assert_eq!(p.data, bytes.to_vec());
-        expect_dts += 147;
+        assert_eq!(p.dts, Some(Timestamp::new(i as i64, tb)), "样例 {i}");
+        assert_eq!(p.pts, p.dts, "无 ctts ⇒ pts==dts");
+        assert_eq!(p.duration, Some(Timestamp::new(1, tb)));
+        assert!(p.flags.contains(PacketFlags::KEYFRAME), "音频轨恒关键帧");
+        assert_eq!(&*p.data, bytes);
     }
 }

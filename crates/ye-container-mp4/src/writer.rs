@@ -5,11 +5,11 @@
 //! 回填真实总长——头长恒定 ⇒ 样例 chunk 偏移写入即定、免回填位移，文件
 //! >4 GiB 天然正确（自有 reader 支持 largesize box）。moov 后置同理。
 //!
-//! 样例表：单 stsd entry（avc1→avcC、mp4a→esds，`extra_data` 原样回写
-//! 不解释）；stts run-length 合并；ctts v1 仅当存在 pts≠dts（负偏移
-//! 合法）；stss 仅视频轨且非全关键帧；stsz 全等且非 0 时定长否则变长；
-//! 任一 chunk offset 超 u32::MAX 或 force_co64 ⇒ 全文件 co64。同轨在文件
-//! 内连续的样例自动合成一个 chunk（stsc 段最小）。
+//! 样例表：单 stsd entry（H264→avc1+avcC、Aac→mp4a+esds，`extra_data`
+//! 原样回写不解释）；stts run-length 合并；ctts v1 仅当存在 pts≠dts（负
+//! 偏移合法）；stss 仅视频轨且非全关键帧；stsz 全等且非 0 时定长否则
+//! 变长；任一 chunk offset 超 u32::MAX 或 force_co64 ⇒ 全文件 co64。
+//! 同轨在文件内连续的样例自动合成一个 chunk（stsc 段最小）。
 //!
 //! fMP4 布局硬契约（[`Layout::Fragmented`]）：`ftyp → 前置 moov（完整
 //! stsd + 空样例表 stts/stsc/stsz/stco + mvex(trex 默认全 0)）→
@@ -25,18 +25,24 @@
 //! 时以 >u32::MAX 占位值强制 v1（u64 定宽）⇒ 字段偏移恒定，从 box size
 //! 逐层定位后原位改写。
 //!
-//! 时戳换算：packet 携带全局 tick 时戳，入表前一律换到轨道时基单位域
-//! （`Timestamp::to_units`）。dts 衔接校验与 stts delta 因此都在单位域
-//! 进行（tick 域舍入会引入伪间隙）；timescale ≤ 7,056,000 时
-//! tick→单位→tick 往返在单位域严格无损（ye-time 半单位舍入互相抵消）。
-//! 两布局共用同一条 write_packet 校验链（负 dts/间隙/回退一律 Misuse）；
-//! 区别仅在首包：progressive 须 dts==0（stts 隐式 0 起算），fragmented
-//! 由 tfdt 承载任意非负首 dts。
+//! 时戳换算（2026-10-24 移植裁决）：包自带任意时基（自描述
+//! `Timestamp`），入表前一律重标度到轨道时基单位域
+//! （`Timestamp::rescale`，[`Rounding::NearInf`]——对齐 FFmpeg
+//! `av_rescale_q` 默认）。dts 衔接校验与 stts delta 因此都在单位域
+//! 进行；包时基与轨道时基一致（remux 常态）时重标度恒等、逐包精确。
+//! mvhd/tkhd 的 movie 时基（1/1000）换算同取 NearInf。
+//! `fragment_duration` 阈值比较走 `Timestamp::compare` 精确交叉相乘，
+//! 无舍入。两布局共用同一条 write_packet 校验链（负 dts/间隙/回退一律
+//! Misuse）；区别仅在首包：progressive 须 dts==0（stts 隐式 0 起算），
+//! fragmented 由 tfdt 承载任意非负首 dts。
 
+use std::cmp::Ordering;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::types::{AudioInfo, FourCc, MediaKind, Packet, Stream, VideoInfo};
+use ye_codec::{AudioParams, CodecId, MediaType, Packet, PacketFlags, VideoParams};
+
+use crate::types::{FourCc, fourcc_of_codec};
 use ye_time::{Rational, Timestamp};
 
 /// mdat 恒定 largesize 头长（size u32 + type 4 字节 + largesize u64）。
@@ -104,7 +110,7 @@ pub enum Layout {
 /// 硬性构造约定（写入 contracts.md）：任何代码（含全部测试）构造本类型
 /// 一律 `Mp4WriterOptions { layout: .., ..Default::default() }` 结构更新
 /// 语法，禁止全字段字面量——后续加字段不破调用方编译。形状本模块一次性
-/// 定形（含 `fragment_duration`），模块三不再改。
+/// 定形（含 `fragment_duration`）。
 #[derive(Clone, Debug)]
 pub struct Mp4WriterOptions {
     pub layout: Layout,
@@ -114,8 +120,9 @@ pub struct Mp4WriterOptions {
     pub free_size: u64,
     /// 强制 co64（测试/显式控制）；否则任一 chunk offset 超 u32::MAX 才升级。
     pub force_co64: bool,
-    /// 仅 Fragmented 生效：新到关键帧且本轨待切跨度（tick 域）≥ 此值时
+    /// 仅 Fragmented 生效：新到关键帧且本轨待切跨度（轨道时基）≥ 此值时
     /// 自动 `flush_fragment`；None ⇒ 仅手动 flush / finalize 冲尾。
+    /// 自描述 `Timestamp`，任意时基——比较走精确交叉相乘，无舍入。
     pub fragment_duration: Option<Timestamp>,
 }
 
@@ -130,38 +137,47 @@ impl Default for Mp4WriterOptions {
     }
 }
 
-/// 一路待封装轨的配置（`add_stream` 入参）。
+/// 一路待封装轨的配置（`add_stream` 入参）。develop 契约类型版：
+/// `media_type`/`codec`（[`CodecId`]）取代 m1 的 MediaKind/FourCc，
+/// `video`/`audio` 直接用 ye-codec 参数（stsd 表达不了的字段忽略）。
 #[derive(Clone, Debug)]
 pub struct TrackConfig {
-    /// 仅 Video/Audio；Other → [`WriterError::Unsupported`]。
-    pub kind: MediaKind,
-    /// 仅 avc1（Video）/ mp4a（Audio）；其他 → Unsupported。
-    pub codec: FourCc,
+    /// 仅 Video/Audio；Subtitle → [`WriterError::Unsupported`]。
+    pub media_type: MediaType,
+    /// 仅 H264（Video，写 avc1）/ Aac（Audio，写 mp4a）；其他 → Unsupported。
+    pub codec: CodecId,
     /// 须 num==1（`1/mdhd:timescale`）；否则 Misuse。
     pub timebase: Rational,
-    /// kind==Video 须 Some（width/height 进 stsd entry）。
-    pub video: Option<VideoInfo>,
-    /// kind==Audio 须 Some（声道/采样率 16.16）。
-    pub audio: Option<AudioInfo>,
+    /// media_type==Video 须 Some（width/height 进 stsd entry）。
+    pub video: Option<VideoParams>,
+    /// media_type==Audio 须 Some（声道布局/采样率 16.16）。
+    pub audio: Option<AudioParams>,
     /// avcC/esds 载荷（esds 含 4 字节版本/标志），原样写回不解释。
     pub extra_data: Vec<u8>,
 }
 
 impl TrackConfig {
-    /// 从读取端 [`Stream`] 直取封装配置（remux 场景）。
-    pub fn from_stream(s: &Stream) -> TrackConfig {
+    /// 从读取端 [`ye_container::Stream`] 直取封装配置（remux 场景）。
+    /// extra_data 取 `codec.extradata`（缺省为空——avc1/mp4a 轨正常
+    /// 均携带；缺失时产出无子 box 的 entry，合法性由 add_stream 校验）。
+    pub fn from_stream(s: &ye_container::Stream) -> TrackConfig {
         TrackConfig {
-            kind: s.kind,
-            codec: s.codec,
-            timebase: s.timebase,
-            video: s.video,
-            audio: s.audio,
-            extra_data: s.extra_data.clone(),
+            media_type: s.media_type,
+            codec: s.codec.codec,
+            timebase: s.time_base,
+            video: s.codec.video.clone(),
+            audio: s.codec.audio.clone(),
+            extra_data: s.codec.extradata.clone().unwrap_or_default(),
         }
     }
 }
 
-// —— pub(crate) 组装件（模块三 fMP4 组装的编译契约）——
+/// [`TrackConfig`] 视频判定（stss/handler/volume 走视频分支的判定点）。
+fn is_video_cfg(cfg: &TrackConfig) -> bool {
+    cfg.media_type == MediaType::Video
+}
+
+// —— pub(crate) 组装件（fMP4 组装的编译契约）——
 
 /// 大端字节追加器 + box 包装工具。
 /// 注意 `into_box`/`into_box64` 取 `self`（按值），不能接在返回
@@ -239,32 +255,34 @@ pub(crate) fn build_ftyp() -> Vec<u8> {
     b.into_box(b"ftyp")
 }
 
-/// timebase 须为 `1/timescale`（num==1，den ∈ [1, u32::MAX]）→ 返回 timescale。
+/// timebase 须为 `1/timescale`（num==1，den ∈ [1, u32::MAX∩i32 正域]）→
+/// 返回 timescale。
 pub(crate) fn validate_timebase(tb: &Rational) -> Result<u32, WriterError> {
-    if tb.num != 1 {
+    if tb.num() != 1 {
         return Err(WriterError::Misuse("timebase 须为 1/timescale（num==1）"));
     }
-    // Rational 不量 den>0，此处防御性再查（含 u32 字段宽度）。
-    if tb.den <= 0 || tb.den > u32::MAX as i64 {
+    // Rational 分母为正 i32（不变式保证 den > 0），天然落在 mdhd 的 u32
+    // 字段域内（i32::MAX < u32::MAX）——仅防御性拒绝非正值。
+    if tb.den() <= 0 {
         return Err(WriterError::Misuse(
             "timescale 须在 1..=u32::MAX（mdhd 字段宽度）",
         ));
     }
-    Ok(tb.den as u32)
+    Ok(tb.den() as u32)
 }
 
 /// stsd 单 entry（avc1+avcC / mp4a+esds），extra_data 原样回写。
 /// 返回 entry 本身（含 8 字节 box 头），由 [`build_stsd_box`] 包进 stsd。
 pub(crate) fn build_stsd_entry(cfg: &TrackConfig) -> Result<Vec<u8>, WriterError> {
-    match cfg.kind {
-        MediaKind::Video => {
-            if cfg.codec.as_bytes() != *b"avc1" {
+    match cfg.media_type {
+        MediaType::Video => {
+            if fourcc_of_codec(cfg.codec) != Some(FourCc::new(*b"avc1")) {
                 return Err(WriterError::Unsupported(
                     "仅支持 avc1（视频）与 mp4a（音频）",
                 ));
             }
-            let Some(v) = cfg.video else {
-                return Err(WriterError::Misuse("kind=Video 须带 video 信息"));
+            let Some(v) = &cfg.video else {
+                return Err(WriterError::Misuse("Video 流须带 video 信息"));
             };
             // visual entry 固定字段 78 字节，宽高为 u16 字段。
             if v.width > u16::MAX as u32 || v.height > u16::MAX as u32 {
@@ -293,16 +311,18 @@ pub(crate) fn build_stsd_entry(cfg: &TrackConfig) -> Result<Vec<u8>, WriterError
             e.bytes(&avcc.into_box(b"avcC"));
             Ok(e.into_box(b"avc1"))
         }
-        MediaKind::Audio => {
-            if cfg.codec.as_bytes() != *b"mp4a" {
+        MediaType::Audio => {
+            if fourcc_of_codec(cfg.codec) != Some(FourCc::new(*b"mp4a")) {
                 return Err(WriterError::Unsupported(
                     "仅支持 avc1（视频）与 mp4a（音频）",
                 ));
             }
-            let Some(a) = cfg.audio else {
-                return Err(WriterError::Misuse("kind=Audio 须带 audio 信息"));
+            let Some(a) = &cfg.audio else {
+                return Err(WriterError::Misuse("Audio 流须带 audio 信息"));
             };
-            if a.channel_count == 0 || a.channel_count > u16::MAX as u32 {
+            // 声道数取布局的 channels()（stsd 只收一个 u16）。
+            let channel_count = a.channel_layout.map(|l| l.channels()).unwrap_or(0);
+            if channel_count == 0 || channel_count > u16::MAX as u32 {
                 return Err(WriterError::Misuse("声道数须在 1..=u16（stsd 字段宽度）"));
             }
             // samplerate 为 16.16 定点，整数段即高 16 位。
@@ -321,7 +341,7 @@ pub(crate) fn build_stsd_entry(cfg: &TrackConfig) -> Result<Vec<u8>, WriterError
                 .u16(1) // data_reference_index
                 .u32(0)
                 .u32(0) // reserved u32[2]
-                .u16(a.channel_count as u16)
+                .u16(channel_count as u16)
                 .u16(16) // samplesize
                 .u16(0) // pre_defined
                 .u16(0) // reserved
@@ -331,7 +351,7 @@ pub(crate) fn build_stsd_entry(cfg: &TrackConfig) -> Result<Vec<u8>, WriterError
             e.bytes(&esds.into_box(b"esds"));
             Ok(e.into_box(b"mp4a"))
         }
-        MediaKind::Other => Err(WriterError::Unsupported("仅支持视频/音频轨（vide/soun）")),
+        MediaType::Subtitle => Err(WriterError::Unsupported("仅支持视频/音频轨（vide/soun）")),
     }
 }
 
@@ -372,6 +392,7 @@ pub(crate) fn build_mvhd(movie_timescale: u32, duration_units: u64, next_track_i
         .u32(0)
         .u32(0)
         .u32(0)
+        .u32(0)
         .u32(0x0001_0000)
         .u32(0)
         .u32(0)
@@ -398,9 +419,9 @@ pub(crate) fn build_trak_skeleton(
     duration_units: u64,
     stbl_children: Vec<Vec<u8>>,
 ) -> Vec<u8> {
-    let is_video = cfg.kind == MediaKind::Video;
+    let is_video = is_video_cfg(cfg);
     // tkhd 16.16 宽高（clamp 到 u16 段，字段上限）。
-    let (w, h) = cfg.video.map_or((0u32, 0u32), |v| {
+    let (w, h) = cfg.video.as_ref().map_or((0u32, 0u32), |v| {
         (v.width.min(0xFFFF), v.height.min(0xFFFF))
     });
 
@@ -502,13 +523,12 @@ pub(crate) fn build_trak_skeleton(
 // —— 轨内累积状态 ——
 
 /// 单样例记录。单位域 = 轨道时基单位；offset 为绝对文件偏移。
+/// （时戳不再保留 tick 域副本——单位 + 轨道时基即完备表达，
+/// movie 时基换算在 finalize 一次完成。）
 struct SampleRec {
     dts_units: u64,
     /// 本样例时长（单位域）；stts 尾段 delta 直接用它。
     dur_units: u64,
-    /// tick 域保留（mvhd 时长累计用），非负。
-    dts_ticks: i64,
-    dur_ticks: i64,
     offset: u64,
     size: u32,
     /// pts−dts（单位域，i64 可负 → ctts v1）。
@@ -522,8 +542,6 @@ struct SampleRec {
 struct PendingSample {
     dts_units: u64,
     dur_units: u64,
-    dts_ticks: i64,
-    dur_ticks: i64,
     size: u32,
     /// pts−dts（单位域，可负 → trun v1 有符号 cts）。
     cts_units: i64,
@@ -544,10 +562,9 @@ struct TrackState {
     frag_pending_data: Vec<u8>,
     /// 跨 fragment 的 (本轨末样例 dts, 下一期望 dts)（单位域）。
     frag_last: Option<(u64, u64)>,
-    /// 已写样例 (首 dts, 尾 dts+dur)（单位域；finalize 回填 mdhd 用）。
+    /// 已写样例 (首 dts, 尾 dts+dur)（单位域；finalize 回填 mdhd 用，
+    /// tkhd/mvhd 经轨道时基重标度后回填）。
     frag_span_units: Option<(u64, u64)>,
-    /// 已写样例 (首 dts, 尾 dts+dur)（tick 域；finalize 回填 tkhd/mvhd 用）。
-    frag_span_ticks: Option<(i64, i64)>,
 }
 
 /// run-length 合并相邻相等值：(count, value) 序列。
@@ -622,10 +639,7 @@ fn build_stbl_children(t: &TrackState, use_co64: bool) -> Result<Vec<Vec<u8>>, W
     }
 
     // —— stss：仅视频轨且非全关键帧（缺省语义 = 全关键帧）——
-    if t.cfg.kind == MediaKind::Video
-        && !t.samples.is_empty()
-        && !t.samples.iter().all(|s| s.keyframe)
-    {
+    if is_video_cfg(&t.cfg) && !t.samples.is_empty() && !t.samples.iter().all(|s| s.keyframe) {
         let mut stss = BoxBuf::new();
         let keys: Vec<u64> = t
             .samples
@@ -783,24 +797,24 @@ impl<W: Write + Seek> Mp4Writer<W> {
             return Err(WriterError::Misuse("首包已写后不可再 add_stream"));
         }
         let timescale = validate_timebase(&cfg.timebase)?;
-        match cfg.kind {
-            MediaKind::Video => {
+        match cfg.media_type {
+            MediaType::Video => {
                 if cfg.video.is_none() {
-                    return Err(WriterError::Misuse("kind=Video 须带 video 信息"));
+                    return Err(WriterError::Misuse("Video 流须带 video 信息"));
                 }
                 if cfg.audio.is_some() {
-                    return Err(WriterError::Misuse("kind=Video 不应带 audio 信息"));
+                    return Err(WriterError::Misuse("Video 流不应带 audio 信息"));
                 }
             }
-            MediaKind::Audio => {
+            MediaType::Audio => {
                 if cfg.audio.is_none() {
-                    return Err(WriterError::Misuse("kind=Audio 须带 audio 信息"));
+                    return Err(WriterError::Misuse("Audio 流须带 audio 信息"));
                 }
                 if cfg.video.is_some() {
-                    return Err(WriterError::Misuse("kind=Audio 不应带 video 信息"));
+                    return Err(WriterError::Misuse("Audio 流不应带 video 信息"));
                 }
             }
-            MediaKind::Other => {
+            MediaType::Subtitle => {
                 return Err(WriterError::Unsupported("仅支持视频/音频轨（vide/soun）"));
             }
         }
@@ -814,7 +828,6 @@ impl<W: Write + Seek> Mp4Writer<W> {
             frag_pending_data: Vec::new(),
             frag_last: None,
             frag_span_units: None,
-            frag_span_ticks: None,
         });
         Ok(self.tracks.len() - 1)
     }
@@ -827,49 +840,58 @@ impl<W: Write + Seek> Mp4Writer<W> {
     /// 写入契约见模块头注与 contracts.md；校验失败即拒，不落半字节数据。
     /// 两布局共用同一条校验链，仅分摊方式不同：progressive 直接落盘
     /// mdat，fragmented 攒进待切 fragment。
+    ///
+    /// 时戳契约：包时基任意（自描述）；入轨前按 NearInf 重标度到轨道
+    /// 时基单位域，校验与入表均在单位域进行。
     pub fn write_packet(&mut self, pkt: &Packet) -> Result<(), WriterError> {
-        if pkt.stream_index >= self.tracks.len() {
+        let si = usize::try_from(pkt.stream_index).unwrap_or(usize::MAX);
+        if si >= self.tracks.len() {
             return Err(WriterError::InvalidStreamIndex {
-                index: pkt.stream_index,
+                index: si,
                 count: self.tracks.len(),
             });
         }
-        let dts_ticks = pkt.dts.as_ticks();
-        let dur_ticks = pkt.duration.as_ticks();
-        if dts_ticks < 0 {
+        let dts = pkt.dts.ok_or(WriterError::Misuse(
+            "缺 dts（M1 封装不推断时戳，请调用方补齐）",
+        ))?;
+        let dur = pkt.duration.ok_or(WriterError::Misuse(
+            "缺 duration（M1 封装不推断时长，请调用方补齐）",
+        ))?;
+        // 符号在重标度下不变，先按包时基判负。
+        if dts.ticks() < 0 {
             return Err(WriterError::Misuse(
                 "负 dts 不可表达（stts 0 起/tfdt u64），请调用方整体平移",
             ));
         }
-        if dur_ticks < 0 {
+        if dur.ticks() < 0 {
             return Err(WriterError::Misuse("duration 不可为负"));
         }
-        let tb = self.tracks[pkt.stream_index].cfg.timebase;
-        // tick → 单位域（dts/dur 非负 ⇒ 单位域非负）。
-        let dts_units = Timestamp::from_ticks(dts_ticks)
-            .to_units(tb)
-            .ok_or(WriterError::Misuse("dts 换算轨道时基单位溢出"))?;
-        let dur_units = Timestamp::from_ticks(dur_ticks)
-            .to_units(tb)
-            .ok_or(WriterError::Misuse("duration 换算轨道时基单位溢出"))?;
+        let tb = self.tracks[si].cfg.timebase;
+        // 包时基 → 轨道时基单位域（NearInf；dts/dur 非负 ⇒ 单位域非负）。
+        let rescale = |t: Timestamp| -> Result<i64, WriterError> {
+            t.rescale(tb)
+                .map(|v| v.ticks())
+                .map_err(|_| WriterError::Misuse("时戳重标度到轨道时基溢出"))
+        };
+        let dts_units = rescale(dts)?;
+        let dur_units = rescale(dur)?;
         let cts_offset = match pkt.pts {
             None => 0i64,
             Some(p) => {
-                let p_units = p
-                    .to_units(tb)
-                    .ok_or(WriterError::Misuse("pts 换算轨道时基单位溢出"))?;
+                let p_units = rescale(p)?;
                 p_units
                     .checked_sub(dts_units)
                     .ok_or(WriterError::Misuse("pts−dts 偏移溢出"))?
             }
         };
-        // 单位域单调/衔接校验：单位域是 stts/trun 的真实存储域，tick 域
-        // 舍入会引入伪间隙/伪重叠。
-        match self.last_of_track(pkt.stream_index)? {
+        let keyframe = pkt.flags.contains(PacketFlags::KEYFRAME);
+        // 单位域单调/衔接校验：单位域是 stts/trun 的真实存储域，跨时基
+        // 舍入不参与（包时基与轨道时基一致时重标度恒等）。
+        match self.last_of_track(si)? {
             None => {
                 // progressive 的 stts 隐式从 0 起算；fragmented 由 tfdt
                 // 承载任意非负首 dts，故不加此约束。
-                if self.options.layout == Layout::Progressive && dts_ticks != 0 {
+                if self.options.layout == Layout::Progressive && dts_units != 0 {
                     return Err(WriterError::Misuse(
                         "首包 dts 须为 0（stts 从 0 起算，偏移请调用方平移）",
                     ));
@@ -895,23 +917,24 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 let offset = self.pos;
                 self.w.write_all(&pkt.data)?;
                 self.pos += pkt.data.len() as u64;
-                self.tracks[pkt.stream_index].samples.push(SampleRec {
+                self.tracks[si].samples.push(SampleRec {
                     dts_units: dts_units as u64,
                     dur_units: dur_units as u64,
-                    dts_ticks,
-                    dur_ticks,
                     offset,
                     size,
                     cts_offset_units: cts_offset,
-                    keyframe: pkt.keyframe,
+                    keyframe,
                 });
             }
             Layout::Fragmented => {
                 // fragment_duration 自动切：新到的关键帧 + 本轨待切跨度
-                // 已达阈值 ⇒ 先切再攒（片段起点落在关键帧上）。
+                // 已达阈值 ⇒ 先切再攒（片段起点落在关键帧上）。阈值比较
+                // 走 Timestamp::compare 精确交叉相乘，无舍入。
                 if let Some(threshold) = self.options.fragment_duration {
-                    let span = frag_pending_span_ticks(&self.tracks[pkt.stream_index]);
-                    if pkt.keyframe && span.is_some_and(|s| s >= threshold.as_ticks()) {
+                    let span = frag_pending_span(&self.tracks[si], tb);
+                    if keyframe
+                        && span.is_some_and(|s| Timestamp::compare(s, threshold) != Ordering::Less)
+                    {
                         self.flush_fragment()?;
                     }
                 }
@@ -924,16 +947,14 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 i32::try_from(cts_offset).map_err(|_| {
                     WriterError::Misuse("pts−dts 偏移超出 i32（trun v1 cts 字段宽度）")
                 })?;
-                let t = &mut self.tracks[pkt.stream_index];
+                let t = &mut self.tracks[si];
                 t.frag_pending_data.extend_from_slice(&pkt.data);
                 t.frag_pending.push(PendingSample {
                     dts_units: dts_units as u64,
                     dur_units: dur_units as u64,
-                    dts_ticks,
-                    dur_ticks,
                     size,
                     cts_units: cts_offset,
-                    keyframe: pkt.keyframe,
+                    keyframe,
                 });
             }
         }
@@ -973,9 +994,14 @@ impl<W: Write + Seek> Mp4Writer<W> {
         // 之前：溢出即 Misuse，不落半字节（8+free_size 曾为未检加法，
         // debug panic / release 回绕成错位布局）。
         let free_total = if self.options.free_size > 0 {
-            Some(self.options.free_size.checked_add(8).ok_or(WriterError::Misuse(
-                "free_size 超出可表示范围（8+free_size 溢出 u64）",
-            ))?)
+            Some(
+                self.options
+                    .free_size
+                    .checked_add(8)
+                    .ok_or(WriterError::Misuse(
+                        "free_size 超出可表示范围（8+free_size 溢出 u64）",
+                    ))?,
+            )
         } else {
             None
         };
@@ -1041,8 +1067,9 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 .iter()
                 .any(|t| chunk_runs(&t.samples).iter().any(|c| c.0 > u32::MAX as u64));
 
+        let movie_tb = Rational::new(1, MOVIE_TIMESCALE as i32);
+        let mut movie_dur_max: u64 = 0;
         let mut traks = Vec::with_capacity(self.tracks.len());
-        let mut max_end_ticks: i64 = 0;
         for (i, t) in self.tracks.iter().enumerate() {
             let stbl_children = build_stbl_children(t, use_co64)?;
             // dts_units[0]==0 ⇒ mdhd 时长 = 末样例 dts + 尾 delta（前缀和）。
@@ -1056,17 +1083,12 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 })
                 .transpose()?
                 .unwrap_or(0);
-            let end_ticks = t
-                .samples
-                .last()
-                .map(|s| {
-                    s.dts_ticks
-                        .checked_add(s.dur_ticks)
-                        .ok_or(WriterError::Misuse("mvhd 时长累计溢出"))
-                })
-                .transpose()?
-                .unwrap_or(0);
-            max_end_ticks = max_end_ticks.max(end_ticks);
+            let end = i64::try_from(duration_units)
+                .map_err(|_| WriterError::Misuse("mdhd 时长累计溢出"))?;
+            let movie_end = Timestamp::new(end, t.cfg.timebase)
+                .rescale(movie_tb)
+                .map_or(u32::MAX as u64 + 1, |v| v.ticks().max(0) as u64);
+            movie_dur_max = movie_dur_max.max(movie_end);
             traks.push(build_trak_skeleton(
                 i as u32 + 1,
                 &t.cfg,
@@ -1075,16 +1097,10 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 stbl_children,
             ));
         }
-        let movie_tb = Rational::new(1, MOVIE_TIMESCALE as i64).expect("1/1000 必可构造");
-        // 换算失败（时长天文数字）时给超 u32 值触发 mvhd v1。
-        let movie_dur = Timestamp::from_ticks(max_end_ticks)
-            .to_units(movie_tb)
-            .map_or(u32::MAX as u64 + 1, |v| v.max(0) as u64);
-
         let mut moov = BoxBuf::new();
         moov.bytes(&build_mvhd(
             MOVIE_TIMESCALE,
-            movie_dur,
+            movie_dur_max,
             self.tracks.len() as u32 + 1,
         ));
         for t in &traks {
@@ -1167,15 +1183,9 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 .dts_units
                 .checked_add(last.dur_units)
                 .ok_or(WriterError::Misuse("fragment 尾 dts 累计溢出"))?;
-            let end_ticks = last
-                .dts_ticks
-                .checked_add(last.dur_ticks)
-                .ok_or(WriterError::Misuse("fragment 尾 dts 累计溢出"))?;
             t.frag_last = Some((last.dts_units, end_units));
             let start_units = t.frag_span_units.map_or(first.dts_units, |(f, _)| f);
             t.frag_span_units = Some((start_units, end_units));
-            let start_ticks = t.frag_span_ticks.map_or(first.dts_ticks, |(f, _)| f);
-            t.frag_span_ticks = Some((start_ticks, end_ticks));
             t.frag_pending.clear();
             t.frag_pending_data.clear();
         }
@@ -1240,30 +1250,34 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Ok(())
     }
 
-    /// 回填前置 moov 的时长：mvhd/tkhd（movie 时基单位，取各轨 tick
-    /// 跨度换算）与 mdhd（轨道时基单位）。0 包 ⇒ 全 0。
+    /// 回填前置 moov 的时长：mvhd/tkhd（movie 时基单位，取各轨轨道时基
+    /// 跨度经 NearInf 重标度）与 mdhd（轨道时基单位）。0 包 ⇒ 全 0。
     fn backfill_frag_durations(&mut self) -> Result<(), WriterError> {
-        let movie_tb = Rational::new(1, MOVIE_TIMESCALE as i64).expect("1/1000 必可构造");
-        let to_movie = |ticks: i64| -> u64 {
+        let movie_tb = Rational::new(1, MOVIE_TIMESCALE as i32);
+        let to_movie = |span_units: u64, track_tb: Rational| -> u64 {
             // 换算失败（时长天文数字）按 0 写——布局已是 v1，无需触发升级。
-            Timestamp::from_ticks(ticks)
-                .to_units(movie_tb)
-                .map_or(0, |v| v.max(0) as u64)
+            let Ok(end) = i64::try_from(span_units) else {
+                return 0;
+            };
+            Timestamp::new(end, track_tb)
+                .rescale(movie_tb)
+                .map_or(0, |v| v.ticks().max(0) as u64)
         };
-        let spans: Vec<(u64, i64)> = self
+        let spans: Vec<(u64, Rational)> = self
             .tracks
             .iter()
-            .map(|t| {
-                (
-                    t.frag_span_units.map_or(0, |(f, e)| e - f),
-                    t.frag_span_ticks.map_or(0, |(f, e)| e - f),
-                )
-            })
+            .map(|t| (t.frag_span_units.map_or(0, |(f, e)| e - f), t.cfg.timebase))
             .collect();
         let mut vals = Vec::with_capacity(1 + 2 * self.tracks.len());
-        vals.push(to_movie(spans.iter().map(|&(_, tk)| tk).max().unwrap_or(0)));
-        for &(units, ticks) in &spans {
-            vals.push(to_movie(ticks)); // tkhd（movie 时基）
+        vals.push(
+            spans
+                .iter()
+                .map(|&(units, tb)| to_movie(units, tb))
+                .max()
+                .unwrap_or(0),
+        );
+        for &(units, tb) in &spans {
+            vals.push(to_movie(units, tb)); // tkhd（movie 时基）
             vals.push(units); // mdhd（轨道时基）
         }
         for (off, v) in self.frag_dur_offsets.iter().zip(vals) {
@@ -1276,15 +1290,16 @@ impl<W: Write + Seek> Mp4Writer<W> {
 
 // —— fMP4 组装辅助 ——
 
-/// 本轨待切批的 tick 域跨度（末样例尾 − 首样例 dts）；空批 → None。
-fn frag_pending_span_ticks(t: &TrackState) -> Option<i64> {
+/// 本轨待切批的跨度（末样例尾 − 首样例 dts，轨道时基时间戳）；
+/// 空批 → None。供 fragment_duration 阈值的精确比较。
+/// 饱和算术（同 m1）：天文数字跨度只会令比较判大，不 panic。
+fn frag_pending_span(t: &TrackState, tb: Rational) -> Option<Timestamp> {
     let first = t.frag_pending.first()?;
     let last = t.frag_pending.last()?;
-    Some(
-        last.dts_ticks
-            .saturating_add(last.dur_ticks)
-            .saturating_sub(first.dts_ticks),
-    )
+    let end = last.dts_units.saturating_add(last.dur_units);
+    let span = end.checked_sub(first.dts_units)?;
+    let ticks = i64::try_from(span).ok()?;
+    Some(Timestamp::new(ticks, tb))
 }
 
 /// traf = tfhd + tfdt + trun（单 trun；轨内数据连续是前提）。

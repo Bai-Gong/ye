@@ -1,8 +1,14 @@
-//! 基础数据类型：FourCc、媒体类别、[`Stream`] 与 [`Packet`]。
+//! 基础数据类型：四字符码 [`FourCc`] 与 stsd codec ↔ [`CodecId`] 映射。
+//!
+//! 移植裁决（见 docs/contracts.md）：`Stream`/`Packet` 已换成 develop 的
+//! `ye_container::Stream`/`ye_codec::Packet`；`FourCc` 保留在本 crate——
+//! box 类型（moov/stts/…）与 stsd entry 类型不是 codec，`CodecId` 表达不了，
+//! 仅在流元数据处映射为 `CodecId`。
 
 use std::fmt;
 
-use ye_time::{Rational, Timestamp};
+use ye_codec::CodecId;
+use ye_pixfmt::ChannelLayout;
 
 /// 四字符码（如 `avc1`、`mp4a`）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,70 +53,50 @@ impl fmt::Debug for FourCc {
     }
 }
 
-/// 媒体类别（hdlr：vide/soun/其他）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MediaKind {
-    Video,
-    Audio,
-    Other,
+/// stsd entry 类型 → [`CodecId`]（读取方向）。
+///
+/// 覆盖 M1/M2 够用集内的常见 fourcc；未映射的 entry 一律
+/// [`CodecId::Unknown`]（原始 fourcc 经 [`crate::Mp4Reader::track_info`]
+/// 仍可查到）。
+pub(crate) fn codec_id_of(codec: &FourCc) -> CodecId {
+    match &codec.bytes {
+        b"avc1" | b"avc3" => CodecId::H264,
+        b"hvc1" | b"hev1" => CodecId::Hevc,
+        b"mp4a" => CodecId::Aac,
+        _ => CodecId::Unknown,
+    }
 }
 
-/// 视频参数，取自 stsd visual entry（像素），不取 tkhd 的 16.16 显示尺寸。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VideoInfo {
-    pub width: u32,
-    pub height: u32,
+/// [`CodecId`] → stsd entry 类型（写入方向）；本封装器仅支持
+/// H264→`avc1`、Aac→`mp4a`。
+pub(crate) fn fourcc_of_codec(codec: CodecId) -> Option<FourCc> {
+    match codec {
+        CodecId::H264 => Some(FourCc::new(*b"avc1")),
+        CodecId::Aac => Some(FourCc::new(*b"mp4a")),
+        _ => None,
+    }
 }
 
-/// 音频参数，取自 stsd audio entry 字段。`sample_rate` 为 16.16 定点取高 16 位。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AudioInfo {
-    pub channel_count: u32,
-    pub sample_rate: u32,
-}
-
-/// 一路 trak 的元数据（对应 architecture.md 的 Stream）。
-#[derive(Clone, Debug)]
-pub struct Stream {
-    /// 0 起，按 moov 内 trak 出现顺序。
-    pub index: usize,
-    /// tkhd。
-    pub track_id: u32,
-    /// hdlr：vide/soun/其他。
-    pub kind: MediaKind,
-    /// stsd 首 entry 类型：avc1/mp4a/…。
-    pub codec: FourCc,
-    /// `1/mdhd:timescale`，方向「每单位=多少秒」。
-    pub timebase: Rational,
-    /// mdhd 时长换算到全局 tick（rescale 舍入）。
-    pub duration: Timestamp,
-    /// kind==Video 时 Some。
-    pub video: Option<VideoInfo>,
-    /// kind==Audio 时 Some。
-    pub audio: Option<AudioInfo>,
-    /// stsd 子 box 的载荷（去掉 8 字节 box 头后的全部字节）：
-    /// avc1→avcC 载荷即 AVCDecoderConfigurationRecord 本体；
-    /// mp4a→esds 载荷（含 4 字节版本/标志）。
-    /// 契约：原样透传给解码器，本 crate 不解释。
-    pub extra_data: Vec<u8>,
-}
-
-/// 压缩域数据 + 流索引 + 时戳（对应 architecture.md 的 Packet，
-/// 时戳为全局 tick 整数）。
-#[derive(Clone, Debug)]
-pub struct Packet {
-    pub stream_index: usize,
-    /// 本轨内 0 起序号。
-    pub sample_index: usize,
-    /// 解码时戳，全局 tick，可为负。
-    pub dts: Timestamp,
-    /// 展示时戳（ctts 已应用）；`None` 表示等于 dts。
-    pub pts: Option<Timestamp>,
-    /// 本样例时长（stts delta 换算）。
-    pub duration: Timestamp,
-    /// stss 含此样例（1-based 样号）；视频轨无 stss 表则恒 true；音频轨恒 true。
-    pub keyframe: bool,
-    /// 压缩数据，容器存储原样——H.264 为 AVCC（长度前缀 NAL），不转 Annex B；
-    /// 长度 = stsz 该样例大小。
-    pub data: Vec<u8>,
+/// 声道数 → FFmpeg 默认声道布局（`av_get_default_channel_layout` 语义）。
+///
+/// stsd 只携带 channelcount 一个 u16，不含布局；develop 的
+/// `AudioParams` 无 channel_count 字段，声道数经默认布局的
+/// `channels()` 保全。1..=8 按 FFmpeg 表，其余 `None`（不猜）。
+///
+/// 位序对齐 `ChannelLayout::CH_*`（前左 0x1 / 前右 0x2 / 前中 0x4 /
+/// LFE 0x8 / 后左 0x10 / 后右 0x20）；7/8 声道额外用到 FFmpeg 位序的
+/// 后中 0x100 / 侧左 0x200 / 侧右 0x400（本表以原始掩码写出）。
+pub(crate) fn default_channel_layout(channels: u32) -> Option<ChannelLayout> {
+    let mask = match channels {
+        1 => 0x004, // mono：前中
+        2 => 0x003, // stereo：前左|前右
+        3 => 0x00B, // 2.1：前左|前右|LFE
+        4 => 0x033, // quad：前左|前右|后左|后右
+        5 => 0x037, // 5.0：quad + 前中
+        6 => 0x03F, // 5.1：5.0 + LFE
+        7 => 0x13F, // 6.1：5.1 + 后中
+        8 => 0x63F, // 7.1：5.1 + 后左后右换成侧左侧右+后左后右
+        _ => return None,
+    };
+    ChannelLayout::try_from_mask(mask).ok()
 }

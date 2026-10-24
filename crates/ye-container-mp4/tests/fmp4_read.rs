@@ -9,8 +9,11 @@
 //! ⑧ 多 moof、多 traf/轨（音视频交错）；⑨ 空 stbl+mvex 跨 fragment 编址；
 //! ⑩ mvex+非空 stbl+无 moof ⇒ 正常 progressive 读；
 //! ⑪ 顶层 mfra/sidx/styp 跳过后仍正确读；⑫ 错误路径。
+//!
+//! 移植后语义：时戳为流时基（1/timescale）原生单位——`t(units)` 即
+//! `Timestamp::new(units, 1/1000)`，pts 恒 Some（无 cts 字段 ⇒ pts==dts）。
 
-use ye_container_mp4::{BoxNode, MediaKind, Mp4Error, Mp4Reader, Rational, Timestamp};
+use ye_container_mp4::{CodecId, MediaType, Mp4Error, Mp4Reader, PacketFlags, Rational, Timestamp};
 
 // —— 字节构造（helpers 风格的内联副本）——
 
@@ -463,23 +466,29 @@ fn video_fmp4_moov(trexes: &[(u32, u32, u32, u32)]) -> Vec<u8> {
     )
 }
 
-/// 视频轨时基（1/1000）下单位 → tick。
+/// 视频轨时基（1/1000）下的时间戳。
 fn t(units: i64) -> Timestamp {
-    Timestamp::from_units(units, Rational::new(1, 1000).unwrap()).unwrap()
+    Timestamp::new(units, Rational::new(1, 1000))
 }
 
-fn find_top<'a>(r: &'a Mp4Reader<std::io::Cursor<Vec<u8>>>, kind: &str) -> &'a BoxNode {
+fn find_top<'a>(
+    r: &'a Mp4Reader<std::io::Cursor<Vec<u8>>>,
+    kind: &str,
+) -> &'a ye_container_mp4::BoxNode {
     r.box_tree()
         .iter()
         .find(|n| n.info.kind.as_str() == kind)
         .unwrap()
 }
 
-fn child<'a>(node: &'a BoxNode, kind: &str) -> Option<&'a BoxNode> {
+fn child<'a>(
+    node: &'a ye_container_mp4::BoxNode,
+    kind: &str,
+) -> Option<&'a ye_container_mp4::BoxNode> {
     node.children.iter().find(|c| c.info.kind.as_str() == kind)
 }
 
-fn kinds(node: &BoxNode) -> Vec<String> {
+fn kinds(node: &ye_container_mp4::BoxNode) -> Vec<String> {
     node.children.iter().map(|c| c.info.kind.as_str()).collect()
 }
 
@@ -530,35 +539,39 @@ fn golden_fmp4() -> Vec<u8> {
 /// ①/⑪ 共用的逐样例断言。
 fn assert_golden_reads(r: &mut Mp4Reader<std::io::Cursor<Vec<u8>>>) {
     let s = r.stream(0).unwrap();
-    assert_eq!(s.track_id, 7);
-    assert_eq!(s.kind, MediaKind::Video);
-    assert_eq!(s.codec.as_str(), "avc1");
-    assert_eq!(s.timebase, Rational::new(1, 1000).unwrap());
+    assert_eq!(r.track_info(0).unwrap().track_id, 7);
+    assert_eq!(s.media_type, MediaType::Video);
+    assert_eq!(s.codec.codec, CodecId::H264);
+    assert_eq!(r.track_info(0).unwrap().codec.as_str(), "avc1");
+    assert_eq!(s.time_base, Rational::new(1, 1000));
     // Stream.duration = 末 fragment 尾 dts+dur = 100+10+10 = 120 单位
     // （mdhd 为 0 亦然）。
-    assert_eq!(s.duration, t(120));
+    assert_eq!(s.duration, Some(t(120)));
     assert_eq!(r.sample_count(0).unwrap(), 2);
 
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, t(100)); // tfdt v0 base=100
+    assert_eq!(p0.dts, Some(t(100))); // tfdt v0 base=100
     assert_eq!(p0.pts, Some(t(100))); // cts=0 ⇒ pts=dts
-    assert_eq!(p0.duration, t(10));
-    assert!(p0.keyframe, "flags=0x02000000（非 sync 位清零）⇒ 关键帧");
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(p0.duration, Some(t(10)));
+    assert!(
+        p0.flags.contains(PacketFlags::KEYFRAME),
+        "flags=0x02000000（非 sync 位清零）⇒ 关键帧"
+    );
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
 
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.dts, t(110));
+    assert_eq!(p1.dts, Some(t(110)));
     assert_eq!(p1.pts, Some(t(115))); // cts=5
-    assert_eq!(p1.duration, t(10));
+    assert_eq!(p1.duration, Some(t(10)));
     assert!(
-        !p1.keyframe,
+        !p1.flags.contains(PacketFlags::KEYFRAME),
         "flags=0x01010000（0x00010000 置位）⇒ 非关键帧"
     );
-    assert_eq!(p1.data, (0xA4..=0xA8).collect::<Vec<u8>>());
+    assert_eq!(&*p1.data, &(0xA4..=0xA8).collect::<Vec<u8>>());
 
     // 乱序随机访问重读。
     let again = r.read_packet(0, 0).unwrap();
-    assert_eq!(again.data, p0.data);
+    assert_eq!(&*again.data, &*p0.data);
 }
 
 /// ① 最小 fMP4 黄金：default-base-is-moof + tfdt v0 + trun v0 全显式字段。
@@ -643,13 +656,13 @@ fn fmp4_tfdt_v1_trun_v1_signed_cts() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.sample_count(0).unwrap(), 2);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, t(100));
+    assert_eq!(p0.dts, Some(t(100)));
     assert_eq!(p0.pts, Some(t(92)), "v1 负 cts：100-8");
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p1 = r.read_packet(0, 1).unwrap();
-    assert_eq!(p1.dts, t(110));
+    assert_eq!(p1.dts, Some(t(110)));
     assert_eq!(p1.pts, Some(t(113)), "v1 正 cts：110+3");
-    assert_eq!(p1.data, vec![0xB0, 0xB1, 0xB2, 0xB3]);
+    assert_eq!(&*p1.data, &[0xB0, 0xB1, 0xB2, 0xB3]);
 }
 
 // —— ③ tfhd 显式 base_data_offset ——
@@ -692,11 +705,11 @@ fn fmp4_explicit_base_data_offset() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     let p0 = r.read_packet(0, 0).unwrap();
     assert_eq!(
-        p0.data,
-        vec![0xC0, 0xC1, 0xC2, 0xC3],
+        &*p0.data,
+        &[0xC0, 0xC1, 0xC2, 0xC3],
         "显式基值须越过 free 指向 mdat"
     );
-    assert_eq!(p0.dts, Timestamp::ZERO);
+    assert_eq!(p0.dts, Some(t(0)));
 }
 
 // —— ④ 无 data_offset 的 trun 接续前一 trun 数据末尾 ——
@@ -777,26 +790,26 @@ fn fmp4_trun_without_data_offset_continues() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.sample_count(0).unwrap(), 4);
     assert_eq!(
-        r.read_packet(0, 0).unwrap().data,
-        vec![0xA0, 0xA1, 0xA2, 0xA3]
+        &*r.read_packet(0, 0).unwrap().data,
+        &[0xA0, 0xA1, 0xA2, 0xA3]
     );
     assert_eq!(
-        r.read_packet(0, 1).unwrap().data,
-        (0xA4..=0xA8).collect::<Vec<u8>>()
+        &*r.read_packet(0, 1).unwrap().data,
+        &(0xA4..=0xA8).collect::<Vec<u8>>()
     );
     // trunB：接 trunA 数据末尾（载荷偏移 9）。
     assert_eq!(
-        r.read_packet(0, 2).unwrap().data,
-        (0xA9..=0xAE).collect::<Vec<u8>>()
+        &*r.read_packet(0, 2).unwrap().data,
+        &(0xA9..=0xAE).collect::<Vec<u8>>()
     );
     // trunC（moof2，无基值信息无 data_offset）：跨 moof 接 trunB 末尾（+15）。
     assert_eq!(
-        r.read_packet(0, 3).unwrap().data,
-        (0xAF..=0xB2).collect::<Vec<u8>>()
+        &*r.read_packet(0, 3).unwrap().data,
+        &(0xAF..=0xB2).collect::<Vec<u8>>()
     );
     // dts 无 tfdt 接续：0/10/20/30。
     for (i, dts) in [0, 10, 20, 30].into_iter().enumerate() {
-        assert_eq!(r.read_packet(0, i).unwrap().dts, t(dts), "样例 {i}");
+        assert_eq!(r.read_packet(0, i).unwrap().dts, Some(t(dts)), "样例 {i}");
     }
 }
 
@@ -857,10 +870,10 @@ fn fmp4_first_sample_flags_with_tfhd_defaults() {
         let p = r.read_packet(0, i).unwrap();
         assert_eq!(
             p.duration,
-            t(10),
+            Some(t(10)),
             "时长取 tfhd 默认 10（非 trex 777）——样例 {i}"
         );
-        assert_eq!(p.dts, t(10 * i as i64), "样例 {i}");
+        assert_eq!(p.dts, Some(t(10 * i as i64)), "样例 {i}");
         assert_eq!(
             p.pts,
             Some(t(10 * i as i64 + i as i64)),
@@ -872,11 +885,11 @@ fn fmp4_first_sample_flags_with_tfhd_defaults() {
             _ => (0xA9..=0xAE).collect(),
         };
         assert_eq!(
-            p.data, expect,
+            &*p.data, &expect,
             "大小取逐样例 size（非 tfhd 默认 999）——样例 {i}"
         );
         assert_eq!(
-            p.keyframe,
+            p.flags.contains(PacketFlags::KEYFRAME),
             i == 0,
             "首样例用 first_sample_flags，其余落 tfhd 默认链"
         );
@@ -918,8 +931,11 @@ fn fmp4_unknown_flags_default_to_keyframe() {
     assert_eq!(r.sample_count(0).unwrap(), 3);
     for i in 0..3 {
         let p = r.read_packet(0, i).unwrap();
-        assert!(p.keyframe, "flags 全缺省 ⇒ true（样例 {i}）");
-        assert_eq!(p.pts, None, "无 cts 字段 ⇒ pts==dts");
+        assert!(
+            p.flags.contains(PacketFlags::KEYFRAME),
+            "flags 全缺省 ⇒ true（样例 {i}）"
+        );
+        assert_eq!(p.pts, p.dts, "无 cts 字段 ⇒ pts==dts（恒 Some）");
     }
 }
 
@@ -964,13 +980,16 @@ fn fmp4_trex_defaults() {
     .enumerate()
     {
         let p = r.read_packet(0, i).unwrap();
-        assert_eq!(p.duration, t(10), "trex 默认 duration——样例 {i}");
-        assert_eq!(p.data, bytes, "trex 默认 size——样例 {i}");
-        assert!(p.keyframe, "trex 默认 flags=0x02000000 ⇒ 关键帧");
-        assert_eq!(p.dts, t(10 * i as i64));
+        assert_eq!(p.duration, Some(t(10)), "trex 默认 duration——样例 {i}");
+        assert_eq!(&*p.data, &bytes, "trex 默认 size——样例 {i}");
+        assert!(
+            p.flags.contains(PacketFlags::KEYFRAME),
+            "trex 默认 flags=0x02000000 ⇒ 关键帧"
+        );
+        assert_eq!(p.dts, Some(t(10 * i as i64)));
     }
     // Stream.duration = 末 fragment 尾 = 30 单位。
-    assert_eq!(r.stream(0).unwrap().duration, t(30));
+    assert_eq!(r.stream(0).unwrap().duration, Some(t(30)));
 }
 
 // —— ⑧ 多 moof、多 traf/轨（音视频交错）+ ⑨ 空 stbl 跨 fragment ——
@@ -1060,31 +1079,40 @@ fn fmp4_interleaved_av_two_moofs() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.streams().len(), 2);
     let (v, a) = (r.stream(0).unwrap(), r.stream(1).unwrap());
-    assert_eq!((v.kind, a.kind), (MediaKind::Video, MediaKind::Audio));
-    assert_eq!(a.timebase, Rational::new(1, 48_000).unwrap());
+    assert_eq!(
+        (v.media_type, a.media_type),
+        (MediaType::Video, MediaType::Audio)
+    );
+    assert_eq!(a.time_base, Rational::new(1, 48_000));
     // 空 stbl ⇒ sample_count 完全来自 fragment。
     assert_eq!(r.sample_count(0).unwrap(), 2);
     assert_eq!(r.sample_count(1).unwrap(), 2);
 
     let v0 = r.read_packet(0, 0).unwrap();
-    assert!(v0.keyframe);
-    assert_eq!(v0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
-    assert_eq!(v0.dts, t(0));
+    assert!(v0.flags.contains(PacketFlags::KEYFRAME));
+    assert_eq!(&*v0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(v0.dts, Some(t(0)));
     let v1 = r.read_packet(0, 1).unwrap();
-    assert!(!v1.keyframe, "0x01010000 ⇒ 非关键帧");
-    assert_eq!(v1.data, vec![0xA4, 0xA5, 0xA6, 0xA7]);
-    assert_eq!(v1.dts, t(10), "moof2 tfdt=10");
+    assert!(
+        !v1.flags.contains(PacketFlags::KEYFRAME),
+        "0x01010000 ⇒ 非关键帧"
+    );
+    assert_eq!(&*v1.data, &[0xA4, 0xA5, 0xA6, 0xA7]);
+    assert_eq!(v1.dts, Some(t(10)), "moof2 tfdt=10");
 
-    let at = |u: i64| Timestamp::from_units(u, Rational::new(1, 48_000).unwrap()).unwrap();
+    let at = |u: i64| Timestamp::new(u, Rational::new(1, 48_000));
     let a0 = r.read_packet(1, 0).unwrap();
-    assert!(a0.keyframe, "音频轨恒关键帧（flags 带 0x00010000 亦然）");
-    assert_eq!(a0.data, vec![0xC0, 0xC1]);
-    assert_eq!(a0.dts, at(0));
-    assert_eq!(a0.duration, at(48));
+    assert!(
+        a0.flags.contains(PacketFlags::KEYFRAME),
+        "音频轨恒关键帧（flags 带 0x00010000 亦然）"
+    );
+    assert_eq!(&*a0.data, &[0xC0, 0xC1]);
+    assert_eq!(a0.dts, Some(at(0)));
+    assert_eq!(a0.duration, Some(at(48)));
     let a1 = r.read_packet(1, 1).unwrap();
-    assert!(a1.keyframe);
-    assert_eq!(a1.data, vec![0xC2, 0xC3]);
-    assert_eq!(a1.dts, at(48), "无 tfdt ⇒ 接前一 fragment 尾 dts");
+    assert!(a1.flags.contains(PacketFlags::KEYFRAME));
+    assert_eq!(&*a1.data, &[0xC2, 0xC3]);
+    assert_eq!(a1.dts, Some(at(48)), "无 tfdt ⇒ 接前一 fragment 尾 dts");
 }
 
 /// ⑨ 同轨两个 moof×2 样例：统一编址 0..4，dts 跨 moof 连续（moof2 无 tfdt）。
@@ -1156,12 +1184,12 @@ fn fmp4_same_track_two_moofs_continuous_addressing() {
     .enumerate()
     {
         let p = r.read_packet(0, i).unwrap();
-        assert_eq!(p.dts, t(dts), "样例 {i}：dts 跨 moof 连续");
-        assert_eq!(p.data, bytes, "样例 {i}");
+        assert_eq!(p.dts, Some(t(dts)), "样例 {i}：dts 跨 moof 连续");
+        assert_eq!(&*p.data, &bytes, "样例 {i}");
     }
     assert_eq!(
         r.stream(0).unwrap().duration,
-        t(45),
+        Some(t(45)),
         "末 fragment 尾 dts+dur=45"
     );
 }
@@ -1205,15 +1233,18 @@ fn fmp4_mvex_without_moof_reads_progressive() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.sample_count(0).unwrap(), 3);
     let p0 = r.read_packet(0, 0).unwrap();
-    assert_eq!(p0.dts, Timestamp::ZERO);
+    assert_eq!(p0.dts, Some(t(0)));
     assert_eq!(p0.pts, Some(t(-5)), "ctts 不受 mvex 影响");
-    assert_eq!(p0.duration, t(10));
-    assert!(p0.keyframe, "无 stss 表 ⇒ 恒关键帧（trex flags 不参与）");
-    assert_eq!(p0.data, vec![0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(p0.duration, Some(t(10)));
+    assert!(
+        p0.flags.contains(PacketFlags::KEYFRAME),
+        "无 stss 表 ⇒ 恒关键帧（trex flags 不参与）"
+    );
+    assert_eq!(&*p0.data, &[0xA0, 0xA1, 0xA2, 0xA3]);
     let p2 = r.read_packet(0, 2).unwrap();
-    assert_eq!(p2.data, (0xA9..=0xAE).collect::<Vec<u8>>());
+    assert_eq!(&*p2.data, &(0xA9..=0xAE).collect::<Vec<u8>>());
     // 无 moof ⇒ duration 沿用 mdhd（构造为 0）。
-    assert_eq!(r.stream(0).unwrap().duration, Timestamp::ZERO);
+    assert_eq!(r.stream(0).unwrap().duration, Some(t(0)));
 }
 
 // —— ⑫ 错误路径 ——
@@ -1441,12 +1472,12 @@ fn fmp4_implicit_base_falls_back_to_moof_start() {
     let mut r = Mp4Reader::from_vec(f).unwrap();
     assert_eq!(r.sample_count(0).unwrap(), 2);
     assert_eq!(
-        r.read_packet(0, 0).unwrap().data,
-        vec![0xD0, 0xD1, 0xD2, 0xD3]
+        &*r.read_packet(0, 0).unwrap().data,
+        &[0xD0, 0xD1, 0xD2, 0xD3]
     );
     assert_eq!(
-        r.read_packet(0, 1).unwrap().data,
-        vec![0xD4, 0xD5, 0xD6, 0xD7]
+        &*r.read_packet(0, 1).unwrap().data,
+        &[0xD4, 0xD5, 0xD6, 0xD7]
     );
 }
 

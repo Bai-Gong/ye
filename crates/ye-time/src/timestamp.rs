@@ -132,7 +132,7 @@ impl Timestamp {
         let t = seconds * (time_base.den() as f64) / (time_base.num() as f64);
         let t = t.round();
         // ±2^63 恰可被 f64 精确表示；越过即落不回 i64
-        if t >= 9223372036854775808.0 || t < -9223372036854775808.0 {
+        if !(-9223372036854775808.0..9223372036854775808.0).contains(&t) {
             return Err(TimeError::Overflow);
         }
         Ok(Timestamp::new(t as i64, time_base))

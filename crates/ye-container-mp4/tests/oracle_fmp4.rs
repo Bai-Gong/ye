@@ -10,10 +10,10 @@
 //! 对拍内容（①④，两种源形态各跑一遍——显式 base_data_offset 源覆盖
 //! 读取端两条基值路径）：
 //! ① ffprobe -show_streams 字段一致 + -show_packets 逐包 dts/pts/duration
-//!    （流时基单位域严格相等；fMP4 无 elist 平移，偏移恒 0 即严格相等）、
+//!    （流时基原生单位严格相等；fMP4 无 elist 平移，偏移恒 0）、
 //!    size、keyframe（flags=K）；
 //! ② roundtrip：自有 reader 源/出两侧逐包 data/dts/pts/duration/keyframe
-//!    严格相等（单位域；整除时基另作 tick 域断言，规则同模块二）；
+//!    严格相等（流时基直通，重标度恒等）；
 //! ③ ffmpeg -v error -i out.mp4 -f null - 退出码 0（解码冒烟）；
 //! ④ 重封装产物 moof ≥ 2（fragment_duration 自动切在 oracle 侧真实生效）。
 
@@ -21,8 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use ye_container_mp4::{Layout, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet, TrackConfig};
-use ye_time::{TICKS_PER_SECOND, Timestamp};
+use ye_container_mp4::{
+    Layout, Mp4Reader, Mp4Writer, Mp4WriterOptions, Packet, Timestamp, TrackConfig,
+};
+use ye_time::Rational;
 
 // —— 工具查找与素材生成（同模块一）——
 
@@ -125,7 +127,7 @@ struct FfStream {
     codec_name: String,
     width: u32,
     height: u32,
-    time_base: (i64, i64),
+    time_base: (i32, i32),
 }
 
 struct FfPacket {
@@ -198,13 +200,14 @@ fn ff_packets(file: &Path) -> Vec<Vec<FfPacket>> {
 
 /// 读源 → Mp4Writer(Fragmented, fragment_duration=0.5s 关键帧自动切) 重封装
 /// （按 dts 交错写；ffmpeg 源为单视频轨，自动切落在 I 帧上）。
+/// 阈值自描述时基：500 单位 @1/1000 = 0.5s（比较走精确交叉相乘）。
 fn remux_frag(src: &Path, dst: &Path) {
     let mut rd = Mp4Reader::open(src).unwrap();
     let mut w = Mp4Writer::create(
         dst,
         Mp4WriterOptions {
             layout: Layout::Fragmented,
-            fragment_duration: Some(Timestamp::from_ticks(TICKS_PER_SECOND / 2)),
+            fragment_duration: Some(Timestamp::new(500, Rational::new(1, 1000))),
             ..Default::default()
         },
     )
@@ -218,7 +221,12 @@ fn remux_frag(src: &Path, dst: &Path) {
             all.push(rd.read_packet(si, ii).unwrap());
         }
     }
-    all.sort_by_key(|p| (p.dts, p.stream_index));
+    all.sort_by(|a, b| {
+        a.dts
+            .unwrap()
+            .compare(b.dts.unwrap())
+            .then_with(|| a.stream_index.cmp(&b.stream_index))
+    });
     for p in &all {
         w.write_packet(p).unwrap();
     }
@@ -254,71 +262,46 @@ fn remux_and_compare(name: &str, src: &Path) -> PathBuf {
         assert_eq!(a.time_base, b.time_base, "{name}：time_base");
     }
 
-    // ② roundtrip：自有 reader 两侧逐包严格对拍。
+    // ② roundtrip：自有 reader 两侧逐包严格对拍（流时基直通）。
     assert_eq!(so.streams().len(), rt.streams().len());
     for si in 0..so.streams().len() {
         let s_src = so.stream(si).unwrap();
         let s_rt = rt.stream(si).unwrap();
+        assert_eq!(s_src.codec.codec, s_rt.codec.codec, "{name}：流 {si} codec");
+        assert_eq!(s_src.time_base, s_rt.time_base, "{name}：流 {si} 时基");
         assert_eq!(
-            s_src.codec.as_str(),
-            s_rt.codec.as_str(),
-            "{name}：流 {si} codec"
-        );
-        assert_eq!(s_src.timebase, s_rt.timebase, "{name}：流 {si} 时基");
-        assert_eq!(
-            s_src.extra_data, s_rt.extra_data,
+            s_src.codec.extradata, s_rt.codec.extradata,
             "{name}：流 {si} extra_data"
         );
-        assert_eq!(s_src.video, s_rt.video, "{name}：流 {si} 视频参数");
+        assert_eq!(
+            s_src.codec.video, s_rt.codec.video,
+            "{name}：流 {si} 视频参数"
+        );
         assert_eq!(
             so.sample_count(si).unwrap(),
             rt.sample_count(si).unwrap(),
             "{name}：流 {si} 样例数"
         );
-        let tb = s_src.timebase;
-        let tick_strict = tb.den != 0 && TICKS_PER_SECOND % tb.den == 0;
         for ii in 0..rt.sample_count(si).unwrap() {
             let po = so.read_packet(si, ii).unwrap();
             let pr = rt.read_packet(si, ii).unwrap();
             assert_eq!(po.data, pr.data, "{name}：流 {si} 样例 {ii} 数据");
+            assert_eq!(po.dts, pr.dts, "{name}：流 {si} 样例 {ii} dts");
+            assert_eq!(po.pts, pr.pts, "{name}：流 {si} 样例 {ii} pts");
             assert_eq!(
-                po.dts.to_units(tb),
-                pr.dts.to_units(tb),
-                "{name}：流 {si} 样例 {ii} dts（单位域）"
+                po.duration, pr.duration,
+                "{name}：流 {si} 样例 {ii} duration"
             );
-            let po_pts = po.pts.unwrap_or(po.dts);
-            let pr_pts = pr.pts.unwrap_or(pr.dts);
-            assert_eq!(
-                po_pts.to_units(tb),
-                pr_pts.to_units(tb),
-                "{name}：流 {si} 样例 {ii} pts（单位域）"
-            );
-            assert_eq!(
-                po.duration.to_units(tb),
-                pr.duration.to_units(tb),
-                "{name}：流 {si} 样例 {ii} duration（单位域）"
-            );
-            assert_eq!(
-                po.keyframe, pr.keyframe,
-                "{name}：流 {si} 样例 {ii} keyframe"
-            );
-            if tick_strict {
-                assert_eq!(po.dts, pr.dts, "{name}：流 {si} 样例 {ii} dts（tick 域）");
-                assert_eq!(po_pts, pr_pts, "{name}：流 {si} 样例 {ii} pts（tick 域）");
-                assert_eq!(
-                    po.duration, pr.duration,
-                    "{name}：流 {si} 样例 {ii} duration（tick 域）"
-                );
-            }
+            assert_eq!(po.flags, pr.flags, "{name}：流 {si} 样例 {ii} keyframe");
         }
     }
 
-    // ① ffprobe -show_packets 对拍重封装产物：时戳流单位域严格相等
+    // ① ffprobe -show_packets 对拍重封装产物：时戳流时基原生单位严格相等
     // （fMP4 无 elist 平移，ye 与 ffprobe 读同一组 tfdt/trun 值）、size、K。
     let ff = ff_packets(&out);
     assert_eq!(ff.len(), rt.streams().len(), "{name}：有包流数");
     for (si, ff_pk) in ff.iter().enumerate() {
-        let tb = rt.stream(si).unwrap().timebase;
+        let tb = rt.stream(si).unwrap().time_base;
         let count = rt.sample_count(si).unwrap();
         assert_eq!(count, ff_pk.len(), "{name}：流 {si} 包数");
         for (i, f) in ff_pk.iter().enumerate() {
@@ -326,27 +309,29 @@ fn remux_and_compare(name: &str, src: &Path) -> PathBuf {
             assert_eq!(p.data.len() as i64, f.size, "{name}：流 {si} 包 {i} 大小");
             if let Some(fd) = f.dts {
                 assert_eq!(
-                    p.dts.to_units(tb).unwrap(),
+                    p.dts.unwrap().ticks(),
                     fd,
-                    "{name}：流 {si} 包 {i} dts（单位域严格相等）"
+                    "{name}：流 {si} 包 {i} dts（单位严格相等）"
                 );
+                assert_eq!(p.dts.unwrap().time_base(), tb);
             }
             if let (Some(fp), true) = (f.pts, f.dts.is_some()) {
-                let ypts = p
-                    .pts
-                    .map(|v| v.to_units(tb).unwrap())
-                    .unwrap_or_else(|| p.dts.to_units(tb).unwrap());
-                assert_eq!(ypts, fp, "{name}：流 {si} 包 {i} pts（单位域严格相等）");
+                assert_eq!(
+                    p.pts.unwrap().ticks(),
+                    fp,
+                    "{name}：流 {si} 包 {i} pts（单位严格相等）"
+                );
             }
             if let Some(fdur) = f.duration {
                 assert_eq!(
-                    p.duration.to_units(tb).unwrap(),
+                    p.duration.unwrap().ticks(),
                     fdur,
                     "{name}：流 {si} 包 {i} 时长"
                 );
             }
             assert_eq!(
-                p.keyframe, f.keyframe,
+                p.flags.contains(ye_container_mp4::PacketFlags::KEYFRAME),
+                f.keyframe,
                 "{name}：流 {si} 包 {i} 关键帧（flags=K）"
             );
         }

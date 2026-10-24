@@ -5,12 +5,19 @@
 合入的代码为准并须立刻修正其一。
 
 本文记录 M1 已落地的各层：门面/feature 接线、`ye-time`、`ye-pixfmt`、
-`ye-container-mp4`（读取端 + 封装端 `Mp4Writer`），外加 `ye-cli`
-（`probe` 输出与 `remux` 直通）的契约。
+`ye-container-mp4`（读取端 + 封装端 `Mp4Writer`）、`ye-cli`
+（`probe` / `remux` / `convert` 占位），外加合流后定形的
+「锻的最小 API 面」与「M2+ 接口桩契约」。
 
 > 2026-10-24 合流后：本文 m1 侧各节（`ye-time` / `ye-pixfmt` /
-> `ye-container-mp4` / `ye-cli` 及 feature 链）描述的是并入待重写的
-> m1-mp4 实现，其与 develop 契约层的冲突以下节裁决为准。
+> `ye-container-mp4` / `ye-cli` / `Mp4Writer` 及 feature 链）描述的是
+> 并入的 m1-mp4 实现。其中**类型与时戳层**已被「合流裁决记录」第
+> 1–4 条与「移植裁决记录」取代——`ye-time` / `ye-pixfmt` 两节的
+> 签名块是 m1 方案（全局 tick 域、`pub i64` 字段、无错误枚举），
+> 现行签名以 [architecture.md](architecture.md)「接口契约」四节与
+> 源码为准；**box 解析与 fMP4/writer 硬契约**（解析规则 1–13、
+> 写入契约、`Layout::Fragmented` 语义）在移植后原样存活，仍以
+> 这些节为准。
 
 ## 合流裁决记录（2026-10-24，B 案）
 
@@ -20,6 +27,8 @@ m1-mp4（MP4 全功能实现）合入 develop（契约层）。裁决：**以 or
 develop 版胜出；`ye-cli` 以 m1 版为底；`Cargo.lock` 重新生成；
 `docs/roadmap.md` 双方内容都保留；`ye-container-mp4` 整目录并入、
 暂从 workspace members 排除（根 `Cargo.toml` `exclude`）。
+（「暂从 workspace 排除」与「`ye-cli` 以 m1 版为底」为合流时点的
+过渡态，已分别由移植与接线阶段终结——见下两节。）
 
 语义级四处裁决（重写 `ye-container-mp4` 时必须遵守，以 develop 版代码为准）：
 
@@ -43,29 +52,178 @@ develop 版胜出；`ye-cli` 以 m1 版为底；`Cargo.lock` 重新生成；
    写包时向目标流时基重标度（`crates/ye-codec/src/packet.rs`、
    `crates/ye-container/src/demuxer.rs`）。
 
+## 移植裁决记录（2026-10-24，ye-container-mp4 重写挂 develop 类型）
+
+按上节四条语义裁决完成 `ye-container-mp4` 整 crate 移植（m1 实现 →
+develop 契约类型），恢复为 workspace 成员（根 `Cargo.toml` 的
+`exclude` 移除）。逐项裁决：
+
+1. **读取端时戳 = 流时基原生单位**：`read_packet` 产出的
+   `pts/dts/duration` 为 `Some(Timestamp::new(轨道单位, 1/timescale))`
+   ——单位即 tick，**全程无换算无舍入**（m1 的全局 tick 换算及其
+   half-away 舍入路径在读端消失，任何 timescale 下逐包精确）。
+   `Stream.duration = Some(mdhd/末 fragment 尾的轨道单位值)`，
+   `nb_frames = Some(样例数)`，`start_time = None`（无 elst 解析）。
+   `pts` 恒 `Some(dts+cts)`（ctts 缺省 ⇒ cts=0）——比 m1 的
+   `None 表示等于 dts` 更显式。
+2. **写入端重标度 = NearInf**：`write_packet` 收到任意时基的自描述
+   包后，`Timestamp::rescale`（默认 [`Rounding::NearInf`]，对齐 FFmpeg
+   `av_rescale_q` 默认）到轨道时基单位域，衔接校验与入表均在单位域；
+   mvhd/tkhd 的 movie 时基（1/1000）换算同取 NearInf；
+   `fragment_duration` 阈值比较走 `Timestamp::compare` 精确交叉相乘
+   （无舍入）。新增契约：包缺 `dts`/`duration` ⇒ `Misuse`（M1 封装
+   不推断时戳）；时基不符先重标度后校验。
+3. **类型映射**：`Stream` → `ye_container::Stream`（本 crate 不再
+   自定义，经门面 re-export）；`Packet` → `ye_codec::Packet`
+   （`keyframe` → `PacketFlags::KEYFRAME`、`data` → `Arc<[u8]>`、
+   `stream_index` 为 u32、`sample_index` 字段删除——随机访问 API 的
+   序号由调用方自带）；`MediaKind` → `MediaType`；`VideoInfo`/
+   `AudioInfo` → `ye_codec::VideoParams`/`AudioParams`（stsd 表达不了
+   的 `pixel_format`/`frame_rate`/`sample_format` 置 None）。
+4. **四字符码保留，codec 处映射 [`CodecId`]**：box 类型（moov/stts/…）
+   与 stsd entry 类型不是 codec，`FourCc` 留在本 crate（box_tree 公开
+   面）。映射：读取向 `avc1|avc3→H264、hvc1|hev1→Hevc、mp4a→Aac、
+   其余 Unknown`；写入向仅 `H264→avc1、Aac→mp4a`（其余
+   `Unsupported`）。原始 fourcc 与 tkhd `track_id` 经新增只读查询
+   `Mp4Reader::track_info(stream_index)` 暴露（develop `Stream` 无处
+   安放这两个 MP4 特有字段）。
+5. **非 vide/soun 轨的媒体类别**：develop `MediaType` 无 Other——
+   内部仍按三值 TrackKind 处理（entry 布局取 8 字节基座、关键帧走
+   stss 链），公开面映射 `Subtitle` + `CodecId::Unknown`。
+6. **声道**：stsd 只有 channelcount；develop `AudioParams` 无
+   channel_count 字段——按 FFmpeg `av_get_default_channel_layout`
+   表映射 1..=8 声道为默认布局（声道数经 `layout.channels()` 保全），
+   其余 `None`。
+7. **trait 面（本阶段零改动）**：`Demuxer`/`Muxer` 及注册表未动。
+   trait 面放不下的 mp4 专属面保留在本 crate 具体类型上，接线阶段
+   再挂 trait：`Mp4WriterOptions`/`Layout`/`flush_fragment`（封装
+   选项与 fMP4 切片，`MuxerFactory::open` 无参承载不了）、
+   `read_packet(stream_index, sample_index)` 随机访问与 `sample_count`/
+   `box_tree`（`Demuxer::read_packet` 是顺序游标语义）、`TrackConfig`
+   （`StreamTemplate` 之外的 stsd 级配置）。
+8. **新增只读查询（接线阶段 `Demuxer::seek` 的依据，不添行为）**：
+   `Mp4Reader::keyframe_index_before(stream_index, sample_index)`
+   （≤ 该序号的最近关键帧序号，stss/fragment flags 既有判定回溯）与
+   `Mp4Reader::sample_timing(stream_index, sample_index)`
+   （dts/pts/duration 三元组，stts/ctts/tfdt 既有计算，不读数据）；
+   两者错误语义与 `read_packet` 一致。
+9. **oracle 对拍口径更新**：ffprobe 逐包对拍与时戳 roundtrip 一律
+   流时基原生单位严格相等（取代 m1 的「单位域相等、tick 域须整除」
+   分组——新时戳模型下整除条件不存在）；m1 的「ye probe 冒烟」用例
+   （构建 ye-cli 真二进制）随合流移出 oracle_demux——ye-cli 为 m1 版、
+   develop 上暂不编译（超出本 crate 移植范围），待其按新契约重写后
+   回归。
+
+测试基线（本次移植后）：`cargo test -p ye-container-mp4` 84 项全绿
+（手工字节单元层 + ffmpeg/ffprobe oracle 对拍，oracle 组在 PATH 无
+工具时自动跳过）；develop 既有 113 项（ye-time 27 / ye-pixfmt 28 /
+ye-codec 34 / ye-container 24，合流时基线）经 `cargo test --workspace
+--exclude ye-cli` 验证无回退；ye-cli 在 develop 上维持合流时的既有编译
+失败（引用已删除的 m1 ye-time API），待接线阶段处理。
+
+## 接线与桩裁决记录（2026-10-24，合流第三阶段）
+
+移植裁决第 7/8 条预留的工作随后完成：trait 挂接、注册探测、ye-cli
+重写、门面上提、convert 占位与 M2+ 桩。逐项裁决（实现见
+`crates/ye-container-mp4/src/adapter.rs`、`crates/ye-cli/src/`、
+`crates/ye/src/`、`crates/ye-codec/src/stubs.rs`、`crates/ye-filter/src/`）：
+
+1. **trait 面零改动**：`Demuxer`/`Muxer`/`ContainerRegistry`/
+   `CodecRegistry` 均未动——接线只做包装与注册，不添 trait 行为；
+   mp4 专属面（移植裁决第 7 条）保持具体类型直达，不经 trait。
+2. **`Mp4Demuxer`**（adapter.rs，只加新文件、未改 reader/writer）包
+   `Mp4Reader<Box<dyn ReadSeek>>`：`read_packet` 把随机访问折成顺序
+   游标——跨轨按 `Timestamp::compare` 精确交叉相乘比较 dts 归并，
+   并列取流号小者，EOF 幂等；`seek` 二分找到 ≤ target 的最大 dts
+   样例后，经只读查询 `keyframe_index_before` 回溯关键帧（合流裁决
+   第 3 条「不靠可变游标」的落实），其余轨前向恢复到首个
+   dts ≥ 落地时刻——契约未约束其余轨的恢复策略，该选择在 adapter
+   头注声明。包打戳契约（合流裁决第 4 条）由 `Mp4Reader::read_packet`
+   原生满足（流时基），本层零换算透传。
+3. **`Mp4Muxer`** 包 `Mp4Writer<Box<dyn WriteSeek>>`（progressive
+   布局）：trait 状态机（未写头/写入中/已收尾）映射
+   `ContainerError::InvalidState`；fMP4 布局选项走具体类型（移植裁决
+   第 7 条）。错误映射：`Mp4Error`/`WriterError` → `ContainerError`
+   （Io 原样透传、流索引 → `StreamNotFound`、其余 → `InvalidData`
+   带原文案）。
+4. **探测评分**：`DemuxerFactory::probe` 做 ftyp/styp box 嗅探——
+   size ≥ 8 + box 类型四字符命中 + major brand 在常见集（14 项，对齐
+   FFmpeg mov probe 常用子集）→ `ProbeScore::MAXIMUM`；brand 可读但
+   不在集内 → `EXTENSION`；乱数据 → `NONE`。`register_mp4` 以格式名
+   `"mp4"` 注册 demuxer/muxer 双工厂，auto-probe 由
+   `ContainerRegistry::open_demuxer` 驱动；`ye-container` 本体零改动。
+5. **门面 feature 上提**（取代 m1 设想的 `ye-container/mp4` 链）：
+   合流后 `ye-container-mp4` 依赖 `ye-container`（契约类型），抽象层
+   反向 optional 转发会成环——汇总点上提至门面
+   `ye/mp4 = ["dep:ye-container-mp4"]`，re-export 在
+   `ye::container::mp4`。`ye::container` 从纯 re-export 改为包装模块
+   （`pub use ye_container::*` + `mp4` 子模块），`ye::container::<Item>`
+   路径全部不变。
+6. **remux 上提门面**：`ye::container::remux`（约 80 行归并泵，自 m1
+   ye-cli 上提，时戳域换成流内自描述 `Timestamp`；跨轨归并已内化到
+   `Demuxer::read_packet`，本层不重排）——auto-probe 打开 →
+   `StreamTemplate` 建流 → 每轨整体平移到首包 dts = 0 → 逐包直通。
+   回归 `crates/ye/tests/remux.rs`（fMP4 非零 tfdt 首 dts →
+   progressive 平移验证）。
+7. **convert 占位定形**：ye-cli 子命令 + lib 层 `convert`，参数形态即
+   锻的进程内接入契约（进度 `(processed_us, total_us)` 微秒 +
+   `&AtomicBool` 取消）；调用即返回含「M3 落地」的桩错误、不产出
+   文件——完整契约见下文「锻的最小 API 面」。
+8. **ye-codec 桩**：新增 `CodecError::UnsupportedStub(&'static str)`
+   变体（不动既有变体）与 `stubs` 模块（H.264/AAC × 解码/编码四个
+   桩工厂 + `register_stubs`）——语义见下文「M2+ 接口桩契约」。
+9. **ye-filter 最小契约**：`PadDescriptor`/`FilterDescriptor`
+   （纯数据）、`FilterError`、`FilterGraph` + `PadRef` + `NodeId`
+   （`add_filter`/`connect` 真实生效并校验节点/垫索引，不去重不成环
+   检测，`topological_order` 调用即 `Unsupported`）。垫的媒体类型复用
+   `ye_codec::MediaType`（path 依赖，与 lavfi 依赖 lavcodec 的方向
+   对称）。
+10. **桩里程碑文案与现行排期的出入（遗留，待改常量）**：桩文案按
+    roadmap 顶部**原始**里程碑表（M2 解码 / M4 编码）标注——解码
+    「桩：M2 交付」、编码「桩：M4 交付」、处理图排序「桩：M4 交付」；
+    而 roadmap 现行「里程碑」一节（2026-10-22 重排，其顶部注释声明
+    现行排期以该节为准）把 H.264/AAC 编码与处理图**最小集**排在
+    **M3**（M4 是合成导出全集）。以现行节为准修正时，改
+    `crates/ye-codec/src/stubs.rs` 的 `H264_ENCODE_MSG`/
+    `AAC_ENCODE_MSG` 与 `crates/ye-filter/src/graph.rs` 的
+    `TOPOSORT_STUB_MSG` 各一处文案即可（本轮属地限 docs 与
+    crates/ye，未改；解码文案 M2 与两版排期一致，无出入）。
+
 ## 门面与 feature 接线
 
 依赖方向是硬规则，防止抽象层倒挂：
 
 1. 创作工具（jian/duan/yue）只依赖门面 `ye`，不直接依赖任何 `ye-*` 实现 crate。
-2. 具体实现 crate（如 `ye-container-mp4`）挂在对应抽象层
-   （`ye-container`）的 optional 依赖 + **同名 feature** 下，由抽象层
-   `pub use ... as <名>;` re-export。
-3. 门面 `ye` 用同名 feature 转发开启，并在 `ye/src/lib.rs` 的 feature 表
-   汇总；`ye-cli` 显式声明所需 feature（`features = ["mp4"]`），
-   不依赖 default 的默认值。
+2. 具体实现 crate（如 `ye-container-mp4`）挂在 optional 依赖 + 同名
+   feature 下，由门面 re-export。**例外（2026-10-24 合流裁决）**：实现
+   crate 反向依赖抽象层取契约类型时（`ye-container-mp4` →
+   `ye-container`），抽象层转发会成环——此类汇总点一律上提到门面
+   （接线裁决第 5 条）。
+3. `ye-cli` 显式声明所需 feature（`features = ["mp4"]`），不依赖
+   default 的默认值。
 
-当前 feature 链（M1 第一轮）：
+当前 feature 表（接线阶段后，`crates/ye/Cargo.toml`）：
 
 ```
-ye/mp4  →  ye-container/mp4  →  dep:ye-container-mp4   →  ye::container::mp4
-（默认开启）
+ye/mp4          →  dep:ye-container-mp4  →  ye::container::mp4     （默认开启）
+ye/codec-stubs  →  （桩本体在 ye-codec 恒编译）→  ye::stubs::codec  （默认关闭）
+ye/filter-stubs →  （桩本体在 ye-filter 恒编译）→  ye::stubs::filter （默认关闭）
 ```
 
 关闭 `mp4`（`ye = { default-features = false }`）时 `ye::container::mp4`
 不存在；`ye-cli` 因显式声明 feature 而不受门面 default 变更影响。
+`codec-stubs`/`filter-stubs` 是 M2+ 接口桩的门面聚合入口（语义见
+「M2+ 接口桩契约」）：显式开启即把「本构建依赖桩」记进依赖声明，
+真实现 crate（`ye-codec-h264` 等）落地后由 `h264`/`aac` 等实现
+feature 取代。
 
 ## ye-time（基础类型层）
+
+> **m1 侧描述，签名块已被取代**：全局 tick 域、`pub i64` 字段、
+> 无错误枚举均为 m1 方案，现行 `Rational`（私有 `i32` 字段）/
+> `Timestamp`（`ticks + time_base` 自描述）/ `TimeError` 以
+> [architecture.md](architecture.md)「ye-time 接口契约」与源码为准
+> （合流裁决第 1/2 条）。
 
 对标 `AVRational` + `av_rescale_q`。**无错误枚举**：所有可失败操作返回
 `Option`（契约评审时定下"错误枚举必为死代码"）。
@@ -111,6 +269,11 @@ pub fn sample_duration_ticks(sample_rate: i64) -> Option<Timestamp>;
   `None`（如 `new(i64::MIN, -1)`、`new(1, i64::MIN)`）；可表示的都正确。
 
 ## ye-pixfmt（基础类型层）
+
+> **m1 侧描述，签名块已被 develop 版取代**：如 `PixfmtError` 现为
+> `BadAlignment(usize)` 等带载荷变体（m1 写作 `BadStrideAlign`）——
+> 现行签名以 [architecture.md](architecture.md)「ye-pixfmt 接口契约」
+> 与源码为准。
 
 对标 `AVPixelFormat` 家族，只做描述与布局，转换内核归 `ye-filter`。
 
@@ -163,6 +326,12 @@ pub enum PixfmtError { ZeroDimension, BadStrideAlign, PlaneIndexOutOfRange }
   别名，规范名 `"gray"`）。
 
 ## ye-container-mp4（容器层，feature `mp4`）
+
+> **类型面已被移植裁决第 1–6 条取代**：`Stream`/`Packet`/
+> `MediaKind` 现为 `ye_container::Stream` / `ye_codec::Packet` /
+> `ye_codec::MediaType`（时戳 `Option<Timestamp>` 流内自描述、
+> `keyframe` → `PacketFlags::KEYFRAME`、`data` → `Arc<[u8]>` 等）。
+> 下文 **box 解析硬契约 1–13 存活有效**；签名块以源码为准。
 
 对标 libavformat mov demuxer 的只读子集（progressive 与 fMP4 均支持）。
 封装（mux）由 `Mp4Writer` 提供——契约见文末
@@ -278,62 +447,175 @@ fragment 连续，`sample_count`=Σ(stbl+fragment) 样例数）：
 
 ## ye-cli（命令行层）
 
-命令面（M1）：`ye probe <FILE>`、`ye remux <IN> <OUT>`、
-`ye --help|-h`、`ye --version|-V`。
-退出码约定：**0** 成功；**1** 运行失败（I/O、解析错误，stderr 带
-`ye: <路径>: <错误>`）；**2** 用法错误（stderr 带用法全文）。
-参数解析手写零第三方依赖；M3 `convert` 选项成体系后再评估 clap。
+命令面（接线阶段后）：`ye probe <FILE>`、`ye remux <IN> <OUT>`、
+`ye convert <IN> <OUT>`（占位桩）、`ye --help|-h`、`ye --version|-V`。
+退出码约定：**0** 成功；**1** 运行失败（stderr 带 `ye: <错误>`）；
+**2** 用法错误（stderr 带用法全文）。参数解析手写零第三方依赖；M3
+`convert` 选项成体系后再评估 clap。
+
+probe/remux 全部走 `ContainerRegistry`（`ye_cli::registry()` 注册 MP4
+工厂，输入 auto-probe ftyp/styp 嗅探）——命令面与未来容器
+（MOV/MKV…）解耦。逻辑在 `ye_cli` lib（`parse_args`/`probe`/`remux`/
+`convert`），`main.rs` 只做 argv 分发与输出，集成测试直接调 lib 并以
+`CARGO_BIN_EXE_ye` 走真二进制端到端。
 
 `probe` 输出契约（机器可 grep，勿随意改字段名与顺序）：
 
 ```
-<路径>: MP4, <n> 路流
-流 #<i> [视频] codec=<四字符码> 时基=<num/den> 时长=<x.xxx>s (<tick> tick) 样例数=<n> 尺寸=<w>x<h>
-流 #<i> [音频] codec=<四字符码> 时基=<num/den> 时长=<x.xxx>s (<tick> tick) 样例数=<n> 声道=<c> 采样率=<hz>Hz
-流 #<i> [其他] codec=<四字符码> 时基=<num/den> 时长=<x.xxx>s (<tick> tick) 样例数=<n>
+<路径>: mp4, <n> 路流
+流 #<i> [视频] codec=<id> 时基=<num/den> 时长=<x.xxx>s (<t> tick) 样例数=<n> 帧率≈<f>（样例数÷时长近似，VFR 文件有偏差） 尺寸=<w>x<h> 码率=<bps>bps
+流 #<i> [音频] codec=<id> 时基=<num/den> 时长=<x.xxx>s (<t> tick) 样例数=<n> 声道=<c> 采样率=<hz>Hz 码率=<bps>bps
+流 #<i> [字幕] codec=<id> 时基=<num/den> 时长=<x.xxx>s (<t> tick) 样例数=<n> 码率=<bps>bps
 ```
 
-- `时基` 是 `mdhd:timescale` 的倒数（`1/1000` 形式）；`时长` 秒数为显示值
-  （三位小数），精确值以 `tick` 数为准（tick 基数 7,056,000）。
-- 逻辑在 `ye_cli` lib（`parse_args`/`probe`），`main.rs` 只做分发与输出，
-  集成测试直接调 lib 并以 `CARGO_BIN_EXE_ye` 走真二进制端到端。
+- `codec` 为 `CodecId` 的 Debug 形式转小写（`h264`/`aac`，对齐 ffprobe
+  命名；m1 期的 stsd 四字符码显示废止——原始 fourcc 经
+  `Mp4Reader::track_info` 可查）。非 vide/soun 轨标签为 `[字幕]`
+  （公开面映射 `MediaType::Subtitle` + `CodecId::Unknown`，移植裁决
+  第 5 条）。
+- `时长` 的 `tick` 为**流时基原生单位数**（精确值以它为准，秒数为
+  三位小数显示值；m1 期的全局 tick 基数 7,056,000 废止）。
+- 帧率/码率两列的口径与取舍见「锻的最小 API 面」。
 
-### `ye remux`（M1 收尾新增）
+`remux` 的行为契约上提到门面 `ye::container::remux` 文档（接线裁决
+第 6 条），CLI 层是薄包装：输出布局 progressive、流序一一对应、
+每轨整体平移到首包 dts = 0、包数据/关键帧/时长与 pts−dts 偏移原样
+透传（H.264 保持 AVCC，不转 Annex B），成功输出单行
+`<IN> → <OUT>: MP4, <n> 路流, <m> 样例直通（不转码）`。回归：
+`ye-cli/tests/remux_e2e.rs`——PATH 上 ffmpeg 造双轨源 → 真二进制
+`ye remux` → ffprobe 可读且流参数一致 → ye 两次解封装逐包对拍；
+PATH 无 ffmpeg/ffprobe 即整组跳过，临时文件全落
+`CARGO_TARGET_TMPDIR`（target/ 下，不入库）。
 
-MP4 解封装 → 封装直通（对标 `ffmpeg -c copy`，不转码）：
+`convert` 为占位桩（真转码 M3 落地）：调用即失败（退出码 1）、
+不产出输出文件——参数形态与进度/取消契约见下节。
 
-- 输出布局 progressive（`ftyp → mdat → moov`）；包数据、关键帧、
-  duration 与 pts−dts 偏移原样透传（H.264 保持 AVCC，不转 Annex B）。
-- 流映射：按 reader 流序 `add_stream(TrackConfig::from_stream)`，流索引
-  一一对应；kind 非 Video/Audio 或 codec 非 avc1/mp4a 的轨 → 运行失败
-  （退出码 1，沿用 writer 的 `Unsupported`/`Misuse` 文案）。
-- 交错：各轨按样例序游标推进，全局按 `(dts tick, 流号)` 归并写入
-  （轨内序保持；同轨连续样例合 chunk 由 writer 处理）。
-- 时戳：progressive 的 stts 从 0 起算（无 elst），每轨时间线整体平移到
-  首包 dts=0（平移量 = 该轨首包 dts；常见文件为 0 即 no-op）。轨内相对
-  时序与时长不变；跨轨起始差不保真（progressive 无法表达）。
-- 成功输出（stdout，单行）：`<IN> → <OUT>: MP4, <n> 路流, <m> 样例直通（不转码）`。
-- 回归：`ye-cli/tests/remux_e2e.rs`——PATH 上 ffmpeg 造双轨源 →
-  真二进制 `ye remux` → ffprobe 可读且流参数与源一致 → ye 两次解封装
-  逐包对拍（数据字节严格一致、时戳单位域严格相等）；PATH 无
-  ffmpeg/ffprobe 即整组跳过。临时文件全落 `CARGO_TARGET_TMPDIR`
-  （target/ 下，不入库）。
+## 锻的最小 API 面（M3 接入契约，2026-10-24 定形）
 
-## 测试基线（本轮合入时）
+锻（duan）以 Tauri 后端 cargo 依赖接入，最小面 = `probe`（M1 已
+可用）/ `remux`（M1 已可用）/ `convert`（占位，M3 真转码）。调用
+形态两层：库层的 probe/convert 在 `ye_cli` lib（`ye-cli/src/lib.rs`），
+remux 在门面 `ye::container::remux`；CLI 子命令即同一契约的命令行
+形态（`main.rs` 为接入示范）。
+
+```rust
+// ye_cli lib（ye-cli/src/lib.rs）
+pub fn probe(path: &Path) -> Result<String, String>;    // 报告文本（含末尾换行）
+pub fn convert(input: &Path, output: &Path,
+               progress: ConvertProgress<'_>, cancel: &AtomicBool)
+    -> Result<String, String>;                          // 桩：调用即 Err
+pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);    // (processed_us, total_us)
+
+// 门面（crates/ye/src/container/remux.rs）
+pub fn remux(registry: &ContainerRegistry, input: Box<dyn ReadSeek>,
+             output_format: &str, output: Box<dyn WriteSeek>)
+    -> Result<RemuxStats, ContainerError>;              // RemuxStats { streams, packets }
+```
+
+**进度约定**：`(processed_us, total_us)` —— 已处理/总时长，**微秒**；
+与锻现有 `transcode-progress` 事件负载 `{jobId, timeUs, totalUs}` 同源
+（`timeUs`/`totalUs` 直传回调值）。jobId 路由与 ≥100ms 节流归锻侧
+（Tauri 事件层），ye 只提供进程内的每任务回调；M3 的转码循环逐包/
+逐帧上报。CLI 形态即示范：回调打 stderr，命令行无交互取消入口时
+旗标恒 false。
+
+**取消约定**：`cancel: &AtomicBool` 进程内取消旗标——锻侧置位即请求
+取消，M3 的转码循环逐包检查、及时退出并清理半成品；进程内等价于
+旧方案的 kill 子进程。
+
+**convert 桩行为**（现行）：调用即返回 `CONVERT_STUB_ERROR`（固定
+文案，含「convert 真转码在 M3 落地」与参数形态摘要），**不触碰输入
+输出文件**——二进制测试断言不产出文件、不触发进度回调
+（`ye-cli/tests/probe.rs`）。
+
+**probe 的帧率口径**（仅视频轨）：`样例数 ÷ 时长（秒）` 近似——
+恒帧率（CFR）文件准确，可变帧率（VFR）文件有偏差（逐帧时长不均时
+平均帧率 ≠ 瞬时帧率），输出列自带注明「（样例数÷时长近似，VFR 文件
+有偏差）」。仅显示用（f64）；标称帧率语义（`VideoParams::frame_rate`）
+归容器/码流参数，不经此列。
+
+**probe 的码率口径**：该流**样例字节总和 × 8 ÷ 时长（秒）**，四舍五入
+到整数 bps（m1 期无此列）；一律由样例字节计算，不依赖容器声明字段。
+为拿精确样例字节数，probe 会把解封装**排空一遍**（读全文件一次）——
+「取精确值优先于快」的取舍已在 ye-cli lib 文档注明，M2 若证明太慢
+再议增量口径。
+
+## M2+ 接口桩契约（2026-10-24）
+
+M2+ 才交付的能力（解码/编码/处理图）先以**接口桩**占位：契约层
+（trait、类型、注册表）现已定形并编译，实现缺席。桩让消费方现在就
+能对接线与调用面做集成试验，真实现落地时只换注册的工厂、不动
+调用方。
+
+**三条语义边界**（ye-codec 与 ye-filter 一致，模块文档同源）：
+
+1. **可构造**：工厂/构造一律成功、不校验参数（尚无真实的初始化
+   语义可校验）；构造出的对象自身属性可查（`codec_id()` 等）。
+2. **可查询**：注册后注册表可查——`supports_decoder`/
+   `supports_encoder`/`decoder_ids`/`encoder_ids`；图结构
+   （`node_count`/`edge_count`/`filter`/`edges`）可完整读回。
+3. **调用即 Unsupported**：能力调用立即失败——`feed`/`pull` →
+   `CodecError::UnsupportedStub(&'static str)`、
+   `topological_order` → `FilterError::Unsupported`，文案**含交付
+   里程碑标注**（如「桩：M2 交付」），供调用方与测试识别；`flush`
+   无操作（实现交付前状态机无意义）。
+
+**覆盖清单**：
+
+- `ye-codec` 桩（`stubs` 模块，根级 re-export `register_stubs` 与
+  H.264/AAC × 解码/编码四工厂）：解码文案「桩：M2 交付」、编码文案
+  「桩：M4 交付」（与现行排期的出入见接线裁决第 10 条）。同 codec
+  重复注册按注册表替换语义覆盖。
+- `ye-filter` 最小契约：`FilterDescriptor`/`PadDescriptor` 纯数据；
+  `FilterGraph` 的 `add_filter`/`connect` 真实生效（节点/垫索引校验，
+  不去重不成环检测——随拓扑排序实现交付），`topological_order`
+  调用即 `Unsupported`（文案「桩：M4 交付」，同前出入）。
+
+**门面 feature**：`ye` 的 `codec-stubs` / `filter-stubs`（默认关闭）
+开启 `ye::stubs::codec` / `ye::stubs::filter` 聚合入口。桩本体随
+`ye-codec`/`ye-filter` 无条件编译（尚无独立实现 crate 可作 optional
+依赖裁剪），feature 的作用是把「本构建依赖桩」显式记进依赖声明——
+防桩悄悄进产品路径，桩换真实现时移除 feature 即得全仓检索点。
+回归 `crates/ye/tests/stubs.rs`（`cargo test -p ye --features
+codec-stubs,filter-stubs`，2 项；默认 feature 集不含，不进 workspace
+门槛）。
+
+**替换路径**：真实实现按 crate 约定以独立 crate（`ye-codec-h264`、
+`ye-codec-aac`）落地并接入 feature 后——`ye-codec` 的 `stubs` 模块
+整体删除、由真实工厂替换注册（`register_stubs` 调用面随之消失，
+调用方改注册真实现）；`ye-filter` 补全拓扑排序与调度，
+`Unsupported` 路径消失。门面届时以 `h264`/`aac` 等实现 feature
+取代桩 feature（`ye::stubs` 模块删除）。
+
+## 测试基线（接线与桩阶段后，2026-10-24）
+
+`cargo test --workspace`（默认 feature 集）实跑全绿，共 **238** 项：
 
 | crate | 测试 | 说明 |
 | --- | --- | --- |
-| ye-time | 23 | 整除性/往返/舍入/溢出/`i64::MIN` 边界 |
-| ye-pixfmt | 14 | 元数据表/布局公式/紧密切片/错误 |
-| ye-container-mp4 | 78 | 读取端黄金/变体/错误/回归（手工字节）；fMP4 读全矩阵；Mp4Writer progressive/fMP4 单元层；ffmpeg/ffprobe oracle 对拍（解封装/封装/fMP4） |
-| ye-cli | 10 | probe 报告/参数解析/二进制端到端；remux e2e（ffmpeg 造源→真二进制→ffprobe+逐包对拍）/参数解析 |
+| ye-time | 27 | 整除性/往返/舍入/溢出/`i64::MIN` 边界 |
+| ye-pixfmt | 28 | 元数据表/布局公式/紧密切片/错误 |
+| ye-codec | 41 | trait/注册表/参数/包/帧 + 桩 7 项（语义边界与里程碑文案） |
+| ye-container | 24 | 契约 trait/注册表/探测 |
+| ye-container-mp4 | 94 | 读取端黄金/变体/错误/回归 + fMP4 读全矩阵 + Mp4Writer progressive/fMP4 + adapter trait 接线 10 项 + ffmpeg/ffprobe oracle 对拍 8 项（本机实跑） |
+| ye-filter | 8 | 描述符/图组装/桩边界 |
+| ye（门面） | 3 | remux 回归（fMP4 非零 tfdt → progressive 平移） |
+| ye-cli | 13 | probe 报告/参数解析/二进制端到端 9 + remux e2e 4 |
 
-单元层全为手工构造字节；oracle 组（容器 crate 9 项 + remux e2e 1 项）
-用 PATH 上的 ffmpeg/ffprobe 造源对拍，找不到工具即打印跳过信息返回
-（不 fail），临时文件全落 `CARGO_TARGET_TMPDIR`（target/ 下，不入库），
-零网络。
+另有 2 项桩 feature 测试不在默认集：`cargo test -p ye --features
+codec-stubs,filter-stubs`（见「M2+ 接口桩契约」）。单元层全为手工
+构造字节；oracle 组用 PATH 上的 ffmpeg/ffprobe 造源对拍，找不到工具
+即打印跳过信息返回（不 fail），临时文件全落 `CARGO_TARGET_TMPDIR`
+（target/ 下，不入库），零网络、零第三方依赖（`cargo tree --workspace`
+仅 9 个 workspace path crate）。
 
 ## ye-container-mp4 Mp4Writer（封装，模块二 + 模块三 fMP4）
+
+> **时戳域已被移植裁决第 2 条取代**：写入契约的时戳换算（全局 tick →
+> `Timestamp::to_units`）现为自描述包 `Timestamp::rescale`（默认
+> `Rounding::NearInf`，对齐 `av_rescale_q`）；mvhd/tkhd 换算同
+> NearInf，`fragment_duration` 阈值走 `Timestamp::compare`。其余写入
+> 契约（布局/样例表/校验链/fMP4 语义）存活有效，签名块以源码为准。
 
 对标 libavformat mov muxer 的 progressive 子集；模块三在其上落地
 `Layout::Fragmented`（fMP4 写入，语义见本节末尾）。

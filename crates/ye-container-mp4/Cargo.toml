@@ -1,9 +1,12 @@
 [package]
 name = "ye-container-mp4"
-description = "百工·冶：MP4 解封装（只读）——box 树、trak 元数据与样例随机访问"
+description = "百工·冶：MP4 容器读写——box 树、trak 元数据、样例随机访问与 progressive/fMP4 封装"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 ye-time = { path = "../ye-time" }
+ye-pixfmt = { path = "../ye-pixfmt" }
+ye-codec = { path = "../ye-codec" }
+ye-container = { path = "../ye-container" }

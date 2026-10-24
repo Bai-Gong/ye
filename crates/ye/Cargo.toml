@@ -10,14 +10,22 @@ ye-time = { path = "../ye-time" }
 ye-pixfmt = { path = "../ye-pixfmt" }
 ye-codec = { path = "../ye-codec" }
 ye-container = { path = "../ye-container" }
+ye-container-mp4 = { path = "../ye-container-mp4", optional = true }
 ye-filter = { path = "../ye-filter" }
 ye-device = { path = "../ye-device" }
 
 [features]
 default = ["mp4"]
-# 容器：MP4 解封装与封装（ye-container-mp4）。
-# 2026-10-24 合流（B 案）：契约层（ye-container develop 版）暂无 mp4 feature，
-# 此处先做空桩保持 feature 名与 ye-cli（m1 版为底）的 `features = ["mp4"]`
-# 可解析；ye-container-mp4 按新 trait 重写、恢复 `ye-container/mp4` 转发后
-# 再改回 `mp4 = ["ye-container/mp4"]`。
-mp4 = []
+# 容器：MP4 解封装与封装（ye-container-mp4，含 Demuxer/Muxer trait 接线）。
+# 2026-10-24 合流（B 案）后 ye-container-mp4 依赖 ye-container（契约类型），
+# 抽象层反向转发会成环——feature 汇总上提到本门面，re-export 在
+# src/container.rs 的 mp4 子模块（取代 m1 设想的 ye-container/mp4 链）。
+mp4 = ["dep:ye-container-mp4"]
+# M2+ 接口桩的门面聚合入口（src/stubs.rs）：桩本体在 ye-codec/ye-filter
+# 无条件编译（尚无独立实现 crate 可作 optional 依赖裁剪），这两个
+# feature 控制 ye::stubs 聚合入口——默认关闭，消费方显式开启即把
+# 「本构建依赖桩」记进依赖声明（防桩悄悄进产品路径）；真实现 crate
+# （ye-codec-h264 等）落地后由其 feature 取代。语义边界见
+# docs/contracts.md「M2+ 接口桩契约」。
+codec-stubs = []
+filter-stubs = []
