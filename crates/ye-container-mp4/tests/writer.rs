@@ -1011,3 +1011,247 @@ fn free_size_overflow_rejected_as_misuse() {
         other => panic!("应为 Misuse，实为 {other:?}"),
     }
 }
+
+// —— 2026-10-24 评审回归组 ——
+
+/// tkhd 时长按 movie 时基（1/1000）表达、mdhd 按轨道时基表达
+/// （回归：此前两域同值直写轨道单位——timescale≠1000 的轨错报时长，
+/// 48kHz 音频 1 秒写成 48000 即 480 秒；fMP4 回填路径一直是对的，
+/// 两布局行为不一致；现有 golden 全用 1/1000，两域恰好同值测不出）。
+#[test]
+fn progressive_tkhd_duration_in_movie_timescale() {
+    // 音频轨 timescale=48000，写满 1 秒（48000 单位）。
+    let bytes = mux(
+        Mp4WriterOptions {
+            layout: Layout::Progressive,
+            ..Default::default()
+        },
+        vec![audio_cfg(48_000)],
+        vec![
+            pkt_tb(0, 0, 24_000, true, &[0xA0, 0xA1], 48_000),
+            pkt_tb(0, 24_000, 24_000, true, &[0xA2, 0xA3], 48_000),
+        ],
+    )
+    .unwrap();
+    let r = Mp4Reader::from_vec(bytes.clone()).unwrap();
+    let moov = find(r.box_tree(), "moov").unwrap();
+    let trak = find(&moov.children, "trak").unwrap();
+    let tkhd = find(&trak.children, "tkhd").unwrap();
+    let mdhd = find(&find(&trak.children, "mdia").unwrap().children, "mdhd").unwrap();
+    // tkhd v0：vf(4)+creation(4)+modification(4)+track_id(4)+reserved(4)
+    // +duration(4) ⇒ duration 在载荷 +20。
+    let tkhd_p = payload(&bytes, tkhd);
+    assert_eq!(u32b(tkhd_p, 0) >> 24, 0, "1 秒装得进 v0");
+    assert_eq!(u32b(tkhd_p, 20), 1000, "tkhd 时长应为 movie 单位 1000");
+    // mdhd v0：vf(4)+creation(4)+modification(4)+timescale(4)+duration(4)
+    // ⇒ timescale +12、duration +16。
+    let mdhd_p = payload(&bytes, mdhd);
+    assert_eq!(u32b(mdhd_p, 12), 48_000, "mdhd timescale 应为轨道时基");
+    assert_eq!(u32b(mdhd_p, 16), 48_000, "mdhd 时长应为轨道单位 48000");
+    // mvhd 同为 movie 时基：各轨 1 秒 ⇒ 1000。
+    let mvhd = find(&moov.children, "mvhd").unwrap();
+    let mvhd_p = payload(&bytes, mvhd);
+    assert_eq!(u32b(mvhd_p, 12), 1000);
+    assert_eq!(u32b(mvhd_p, 16), 1000);
+}
+
+/// 首个 I/O 错误后封装器封闭（poisoned）：后续 write_packet/
+/// flush_fragment/finalize 一律返回该错误，不再落任何字节（回归：
+/// 2026-10-24 评审——写一半失败后复用会静默产出损坏文件：重试把
+/// ftyp 再写一遍 / 从文件中段再写一份完整 moof+mdat）。
+#[test]
+fn writer_is_poisoned_after_first_io_error() {
+    /// 预算写：总写入量超 budget 即失败（模拟底层 I/O 半途故障）。
+    struct BudgetW {
+        buf: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        pos: usize,
+        budget: usize,
+        failed: std::cell::Cell<bool>,
+    }
+    impl std::io::Write for BudgetW {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.failed.get() || self.pos + b.len() > self.budget {
+                self.failed.set(true);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "budget exhausted",
+                ));
+            }
+            let mut buf = self.buf.borrow_mut();
+            if self.pos + b.len() > buf.len() {
+                buf.resize(self.pos + b.len(), 0);
+            }
+            buf[self.pos..self.pos + b.len()].copy_from_slice(b);
+            self.pos += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl std::io::Seek for BudgetW {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            let len = self.buf.borrow().len() as i64;
+            let new = match pos {
+                std::io::SeekFrom::Start(s) => s as i64,
+                std::io::SeekFrom::End(e) => len + e,
+                std::io::SeekFrom::Current(c) => self.pos as i64 + c,
+            };
+            self.pos = new as usize;
+            Ok(new as u64)
+        }
+    }
+
+    // Fragmented：前置 moov（ftyp 32 + moov ~1KB）超出预算 ⇒ 首个
+    // flush_fragment 写 moov 时失败。
+    let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mk_w = || BudgetW {
+        buf: buf.clone(),
+        pos: 0,
+        budget: 64,
+        failed: std::cell::Cell::new(false),
+    };
+    let mut w = Mp4Writer::new(
+        mk_w(),
+        Mp4WriterOptions {
+            layout: Layout::Fragmented,
+            ..Default::default()
+        },
+    );
+    w.add_stream(audio_cfg(1000)).unwrap();
+    for i in 0..4i64 {
+        w.write_packet(&pkt(0, i * 10, 10, true, &[0xA0, 0xA1])).unwrap();
+    }
+    // 首次失败：I/O 错误。
+    match w.flush_fragment() {
+        Err(WriterError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::WriteZero),
+        other => panic!("应为 Io，实为 {other:?}"),
+    }
+    let len_at_failure = buf.borrow().len();
+    // 复用一律返回 Io（不再写、不再推进状态）。
+    for _ in 0..2 {
+        match w.flush_fragment() {
+            Err(WriterError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::WriteZero),
+            other => panic!("复用应返回锁存的 Io，实为 {other:?}"),
+        }
+    }
+    assert!(
+        w.write_packet(&pkt(0, 40, 10, true, &[0xA2])).is_err(),
+        "poisoned 后写包应拒"
+    );
+    assert!(w.finalize().is_err(), "poisoned 后收尾应拒");
+    assert_eq!(buf.borrow().len(), len_at_failure, "失败后不得再落字节");
+
+    // Progressive 同语义：mdat 数据写失败后复用立即拒、零字节增长。
+    let buf2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mk_w2 = || BudgetW {
+        buf: buf2.clone(),
+        pos: 0,
+        budget: 48, // ftyp(32)+mdat 头(16) 刚好放行，包数据必失败
+        failed: std::cell::Cell::new(false),
+    };
+    let mut w2 = Mp4Writer::new(
+        mk_w2(),
+        Mp4WriterOptions {
+            layout: Layout::Progressive,
+            ..Default::default()
+        },
+    );
+    w2.add_stream(audio_cfg(1000)).unwrap();
+    assert!(w2.write_packet(&pkt(0, 0, 10, true, &[0xB0])).is_err());
+    let len2 = buf2.borrow().len();
+    assert!(w2.write_packet(&pkt(0, 10, 10, true, &[0xB1])).is_err());
+    assert!(w2.finalize().is_err());
+    assert_eq!(buf2.borrow().len(), len2, "失败后不得再落字节");
+}
+
+/// Fragmented 的字段宽度校验先于 fragment_duration 自动切：注定被拒
+/// 的包（dur_units 超 u32）不得先触发 flush 改变写入器状态（回归：
+/// 2026-10-24 评审——此前被拒包若恰是到达阈值的关键帧，会先把攒的
+/// 样例切成 fragment 落盘再返回 Misuse）。
+#[test]
+fn fragmented_width_validation_precedes_auto_flush() {
+    let bytes = {
+        let mut w = Mp4Writer::new(
+            Cursor::new(Vec::new()),
+            Mp4WriterOptions {
+                layout: Layout::Fragmented,
+                fragment_duration: Some(t(30)),
+                ..Default::default()
+            },
+        );
+        w.add_stream(audio_cfg(1000)).unwrap();
+        // 攒出 ≥30 单位的待切跨度（30 单位后到达的关键帧会触发自动切）。
+        w.write_packet(&pkt(0, 0, 100, true, &[0xA0])).unwrap();
+        w.write_packet(&pkt(0, 100, 100, false, &[0xA1])).unwrap();
+        // 坏包：关键帧 + 时长超 u32（trun duration 宽度）⇒ Misuse。
+        let bad = pkt(0, 200, u32::MAX as i64 + 1, true, &[0xA2]);
+        match w.write_packet(&bad) {
+            Err(WriterError::Misuse(msg)) => {
+                assert!(msg.contains("时长超出 u32"), "msg={msg}");
+            }
+            other => panic!("应为 Misuse，实为 {other:?}"),
+        }
+        // 坏包不得触发自动切：后续包用非关键帧（不再触发正常自动切），
+        // 与之前的待切样例合成同一 fragment 由 finalize 冲出——若坏包
+        // 先切了（旧行为），后续样例会切成第二个 fragment。
+        w.write_packet(&pkt(0, 200, 100, false, &[0xA3])).unwrap();
+        w.write_packet(&pkt(0, 300, 100, false, &[0xA4])).unwrap();
+        let cur = w.finalize().unwrap();
+        cur.into_inner()
+    };
+    // 整个文件只应有一个 moof（4 样例同一 fragment）。
+    let mut r = Mp4Reader::from_vec(bytes).unwrap();
+    let moofs: Vec<_> = r
+        .box_tree()
+        .iter()
+        .filter(|n| n.info.kind.as_str() == "moof")
+        .collect();
+    assert_eq!(moofs.len(), 1, "坏包不得制造额外 fragment 边界");
+    assert_eq!(r.sample_count(0).unwrap(), 4);
+    // 末包数据可读回（0xA4）。
+    let p = r.read_packet(0, 3).unwrap();
+    assert_eq!(&*p.data, &[0xA4]);
+}
+
+/// 数据驱动的时戳重标度溢出 ⇒ WriterError::Time（非 Misuse；Muxer
+/// trait 契约「重标度失败以 Err(ContainerError::Time(..)) 透出」的具体
+/// 实现侧断言，回归：2026-10-24 评审——此前误归 Misuse）。
+#[test]
+fn rescale_overflow_is_time_error() {
+    let mut w = Mp4Writer::new(
+        Cursor::new(Vec::new()),
+        Mp4WriterOptions {
+            layout: Layout::Progressive,
+            ..Default::default()
+        },
+    );
+    w.add_stream(audio_cfg(1000)).unwrap();
+    // 包时基 1/1、dts=i64::MAX：重标度到 1/1000 需 ×1000 ⇒ 溢出。
+    let mut p = Packet::empty(0);
+    p.dts = Some(Timestamp::new(i64::MAX, Rational::ONE));
+    p.duration = Some(Timestamp::new(1, Rational::ONE));
+    match w.write_packet(&p) {
+        Err(WriterError::Time(msg)) => assert!(msg.contains("重标度"), "msg={msg}"),
+        other => panic!("应为 Time，实为 {other:?}"),
+    }
+    // pts−dts 偏移的算术溢出仍是 Misuse（非重标度失败）：包时基与
+    // 轨道时基一致（重标度恒等），pts=i64::MIN − dts=1000 落不回 i64。
+    let mut w2 = Mp4Writer::new(
+        Cursor::new(Vec::new()),
+        Mp4WriterOptions {
+            layout: Layout::Progressive,
+            ..Default::default()
+        },
+    );
+    w2.add_stream(audio_cfg(1000)).unwrap();
+    let mut q = Packet::empty(0);
+    let tb1k = Rational::new(1, 1000);
+    q.dts = Some(Timestamp::new(1000, tb1k));
+    q.pts = Some(Timestamp::new(i64::MIN, tb1k));
+    q.duration = Some(Timestamp::new(1, tb1k));
+    assert!(matches!(
+        w2.write_packet(&q),
+        Err(WriterError::Misuse(_))
+    ));
+}

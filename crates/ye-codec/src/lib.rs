@@ -31,10 +31,10 @@
 //! - 时戳自描述（[`ye_time::Timestamp`] 内含时基），缺时戳一律
 //!   `Option::None`，无 `AV_NOPTS_VALUE` 等价物；
 //! - 注册表是显式构造、显式传递的对象，无全局单例；
-//! - **桩的语义边界**（`stubs` 模块，M2/M4 交付前）：可注册——注册项
+//! - **桩的语义边界**（`stubs` 模块，M2/M3 交付前）：可注册——注册项
 //!   经 `supports_*`/`*_ids` 可查；可构造——`create_*`/工厂一律成功；
 //!   不可用——`feed`/`pull` 调用即返回 [`CodecError::UnsupportedStub`]，
-//!   文案注明交付里程碑（解码 → M2、编码 → M4），`flush` 无操作；
+//!   文案注明交付里程碑（解码 → M2、编码 → M3），`flush` 无操作；
 //! - 本 crate 零第三方依赖（仅 std + ye-time + ye-pixfmt）、不含 unsafe；
 //!   panic 仅一处文档写明的编程错误：[`VideoFrame::plane`] 的平面索引
 //!   越界（全库五处中的第⑤处），数据驱动失败一律 `Result`。

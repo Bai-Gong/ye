@@ -6,7 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ye = { path = "../ye", features = ["mp4"] }
+# default-features = false + 显式 mp4：与 contracts.md「门面与 feature
+# 接线」第 3 条的声明一致——不被动继承门面未来新增的 default feature
+# （当前 default 恰为 ["mp4"]，行为与此前等效）。
+ye = { path = "../ye", default-features = false, features = ["mp4"] }
 
 [lib]
 name = "ye_cli"

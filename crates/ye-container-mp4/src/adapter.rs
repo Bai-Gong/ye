@@ -59,6 +59,10 @@ fn map_write_err(e: WriterError) -> ContainerError {
     match e {
         WriterError::Io(io) => ContainerError::Io(io),
         WriterError::Misuse(what) => ContainerError::InvalidState(what),
+        // 数据驱动的时戳重标度失败 → Time（Muxer trait 契约：「重标度
+        // 失败以 Err(ContainerError::Time(..)) 透出」；2026-10-24 评审
+        // 统一——此前误归 Misuse → InvalidState，与 mock 实现分叉）。
+        WriterError::Time(_) => ContainerError::Time(ye_time::TimeError::Overflow),
         WriterError::InvalidStreamIndex { index, .. } => {
             ContainerError::StreamNotFound(u32::try_from(index).unwrap_or(u32::MAX))
         }
@@ -72,17 +76,25 @@ fn map_write_err(e: WriterError) -> ContainerError {
 
 /// ftyp/styp major brand 常见集（对齐 FFmpeg mov probe 的 brand 表的
 /// 常用子集；命中即视作魔数完全命中。注意 `m4a `/`m4v `/`qt  ` 含空格）。
-const KNOWN_BRANDS: [[u8; 4]; 14] = [
+/// 不含 `heic` 等 HEIF 静态图片 brand（2026-10-24 评审：HEIC 是 ISOBMFF
+/// 家族但无 moov/trak，命中 MAXIMUM 会让照片被当 MP4 假阳性录取——
+/// 现在 heic 走未知 brand 路径（EXTENSION 半命中），再被读取端
+/// 「至少一条 trak」校验在 open 阶段拒绝）。
+const KNOWN_BRANDS: [[u8; 4]; 13] = [
     *b"isom", *b"iso2", *b"mp41", *b"mp42", *b"mp71", *b"avc1", *b"avc3", *b"mp4a", *b"m4v ",
-    *b"dash", *b"msdh", *b"mse6", *b"heic", *b"qt  ",
+    *b"dash", *b"msdh", *b"mse6", *b"qt  ",
 ];
 
 /// ftyp/box 嗅探（[`DemuxerFactory::probe`] 的实现）。
 ///
 /// 规则：≥8 字节、首 box size ≥ 8 且类型为 `ftyp`/`styp` 才继续；
 /// major brand（box 载荷前 4 字节）在 [`KNOWN_BRANDS`] → MAXIMUM，
-/// 可打印但不在集内 → EXTENSION，不可打印 → NONE（乱数据）。
-/// 窗口不足 12 字节（brand 读不到）按 EXTENSION 给分（box 头已可信）。
+/// 可打印但不在集内 → EXTENSION（**部分魔数命中**：box 头可信但
+/// brand 未知，如 heic 照片或罕见 brand 的真 MP4——探查管线无文件名
+/// 输入，该档语义见 [`ProbeScore::EXTENSION`]；录取后的硬保证由读取端
+/// 「至少一条 trak」校验兜底，非 MP4 结构的文件 open 即 InvalidData），
+/// 不可打印 → NONE（乱数据）。窗口不足 12 字节（brand 读不到）按
+/// EXTENSION 给分（box 头已可信；后续 open 同样受最少轨道校验约束）。
 fn probe_mp4(head: &[u8]) -> ProbeScore {
     if head.len() < 8 {
         return ProbeScore::NONE;
@@ -598,6 +610,73 @@ mod tests {
     }
 
     // ---- 注册 + auto-probe ----
+
+    /// heic 不再命中 MAXIMUM（HEIF 静态图片 major brand，2026-10-24
+    /// 评审移出常见集）：降为未知 brand 的 EXTENSION 半命中。
+    #[test]
+    fn probe_heic_brand_is_not_maximum() {
+        let f = Mp4DemuxerFactory;
+        assert_eq!(f.probe(&ftyp_bytes(b"heic")), ProbeScore::EXTENSION);
+    }
+
+    /// 无 moov/trak 的文件（HEIC 照片形态：ftyp heic + free/mdat）经
+    /// 注册表打开 ⇒ Err(InvalidData)，不得返回 0 路流的假成功
+    /// （回归：此前 open_demuxer 返回 Ok(("mp4", 0 流))，ye-cli probe
+    /// 输出「photo.heic: mp4, 0 路流」）。
+    #[test]
+    fn moovless_file_fails_at_open_not_fake_success() {
+        let reg = registry();
+        let mut data = ftyp_bytes(b"heic");
+        // ftyp_bytes 声明 24 字节但只给 20：补齐（walk 须走到最少轨道
+        // 校验，而不是先被 box 越界拦下）。
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
+        data.extend_from_slice(&[0, 0, 0, 16, b'm', b'd', b'a', b't']);
+        data.extend_from_slice(&[0u8; 8]);
+        match reg.open_demuxer(open_vec(data)) {
+            Err(ContainerError::InvalidData(msg)) => {
+                assert!(msg.contains("无 trak 轨道"), "msg={msg}");
+            }
+            Err(_) => panic!("应为 InvalidData"),
+            Ok(_) => panic!("moovless 文件不得打开成功"),
+        }
+    }
+
+    /// 8~11 字节的短 ftyp 头「文件」：probe 可给 EXTENSION（box 头可信
+    /// 的半命中），但 open 必须失败（回归：此前 0 轨返回 Ok）。
+    #[test]
+    fn short_ftyp_head_admitted_but_open_fails() {
+        let reg = registry();
+        match reg.open_demuxer(open_vec(vec![
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'i', b's', b'o',
+        ])) {
+            Err(e) => assert!(
+                matches!(e, ContainerError::InvalidData(_)),
+                "应为 InvalidData，实为 {e:?}"
+            ),
+            Ok(_) => panic!("11 字节残件不得打开成功"),
+        }
+    }
+
+    /// trait 面：数据驱动的时戳重标度溢出 ⇒ ContainerError::Time
+    /// （Muxer 契约「重标度失败以 Time 透出」在真实实现侧的固化；
+    /// mock 实现同语义。回归：2026-10-24 评审——此前 mp4 映射为
+    /// InvalidState，与 mock 分叉）。
+    #[test]
+    fn muxer_rescale_overflow_surfaces_as_time_variant() {
+        let reg = registry();
+        let mut muxer = reg
+            .create_muxer("mp4", Box::new(Cursor::new(Vec::<u8>::new())))
+            .unwrap();
+        let mut t = template();
+        t.time_base = Rational::new(1, 1000);
+        muxer.write_header(&[t]).unwrap();
+        let mut p = Packet::empty(0);
+        p.dts = Some(Timestamp::new(i64::MAX, Rational::ONE));
+        p.duration = Some(Timestamp::new(1, Rational::ONE));
+        let err = muxer.write_packet(&p).unwrap_err();
+        assert!(matches!(err, ContainerError::Time(_)), "实为 {err:?}");
+    }
 
     #[test]
     fn registry_registers_and_auto_probes() {

@@ -64,6 +64,11 @@ pub enum WriterError {
     InvalidStreamIndex { index: usize, count: usize },
     /// 调用方违反写入契约（时基/时戳/调用顺序，见 contracts.md）。
     Misuse(&'static str),
+    /// 时戳/时基换算失败（数据驱动的溢出，如包时基重标度到轨道时基
+    /// 落不回 i64——区别于调用顺序违约的 [`WriterError::Misuse`]；
+    /// trait 面按 [`ye_container::muxer`] 契约映射
+    /// `ContainerError::Time`，2026-10-24 评审统一）。
+    Time(&'static str),
 }
 
 impl std::fmt::Display for WriterError {
@@ -75,6 +80,7 @@ impl std::fmt::Display for WriterError {
                 write!(f, "流索引越界：{index}（共 {count} 路）")
             }
             WriterError::Misuse(what) => write!(f, "写入契约违规：{what}"),
+            WriterError::Time(what) => write!(f, "时戳换算失败：{what}"),
         }
     }
 }
@@ -407,16 +413,18 @@ pub(crate) fn build_mvhd(movie_timescale: u32, duration_units: u64, next_track_i
 
 /// trak 骨架：tkhd + mdia(mdhd/hdlr/minf(stbl(stsd+给定样例表)))。
 ///
-/// `duration_units` 写进 mdhd（轨道时基域）；tkhd 时长（movie 时基域）
-/// 取同值——固定单参数签名下不区分两域，时长语义的读取端（自有
-/// reader 与 ffmpeg demuxer）一律取 mdhd/stts，tkhd 时长仅为兼容字段。
-/// fMP4 复用本骨架：传空样例表 + 占位 duration（>u32::MAX 强制 v1 定宽，
-/// finalize 回填真实时长）。
+/// `duration_units` 写 mdhd（轨道时基域）；`tkhd_duration_units` 写
+/// tkhd（movie 时基域，ISO 14496-12 §8.3.2——tkhd duration 以 mvhd
+/// timescale=1000 表达，ffmpeg movenc 同此）——两参数分开（2026-10-24
+/// 评审：此前同值直写轨道单位，timescale≠1000 的轨会错报时长，如
+/// 48kHz 音频 1 秒写成 48000 即 480 秒）。fMP4 复用本骨架：传空样例表
+/// + 占位 duration（>u32::MAX 强制 v1 定宽，finalize 回填真实时长）。
 pub(crate) fn build_trak_skeleton(
     track_id: u32,
     cfg: &TrackConfig,
     timescale: u32,
     duration_units: u64,
+    tkhd_duration_units: u64,
     stbl_children: Vec<Vec<u8>>,
 ) -> Vec<u8> {
     let is_video = is_video_cfg(cfg);
@@ -426,7 +434,7 @@ pub(crate) fn build_trak_skeleton(
     });
 
     let mut t = BoxBuf::new();
-    match u32::try_from(duration_units) {
+    match u32::try_from(tkhd_duration_units) {
         Ok(d) => {
             t.u32(0x0000_0003) // version 0 + flags=3（enabled|in_movie）
                 .u32(0)
@@ -441,7 +449,7 @@ pub(crate) fn build_trak_skeleton(
                 .u64(0)
                 .u32(track_id)
                 .u32(0)
-                .u64(duration_units);
+                .u64(tkhd_duration_units);
         }
     }
     t.u32(0)
@@ -722,7 +730,10 @@ const FRAG_DURATION_PLACEHOLDER: u64 = u64::MAX;
 /// 用法：`create/new → add_stream* → write_packet* →（Fragmented 可
 /// flush_fragment*）→ finalize`。`W` 从当前写位置起独占输出（请传全新
 /// writer，偏移按 0 起算）；finalize 返回底层 `W`（已 flush、定位在文件
-/// 末尾）。中途 drop = 丢弃半成品。
+/// 末尾）。中途 drop = 丢弃半成品。**首个 I/O 错误后封装器封闭
+/// （poisoned）**：write_packet/flush_fragment/finalize 此后一律返回该
+/// 错误——错误后复用（重试）会静默产出损坏文件（重复 ftyp、中段重写
+/// moof、stco 偏移错位），一律拒绝（2026-10-24 评审）。
 ///
 /// 两布局差异：progressive 的 mdat 头随首包惰性写出、finalize 后置 moov
 /// 并回填 mdat largesize；fragmented 的样例数据攒在内存，`flush_fragment`
@@ -747,6 +758,12 @@ pub struct Mp4Writer<W> {
     /// fragmented：前置 moov 内 duration 字段（u64，v1 定宽）的绝对
     /// 偏移，顺序 [mvhd, (tkhd, mdhd)×轨]，finalize 逐个回填。
     frag_dur_offsets: Vec<usize>,
+    /// 首个底层 I/O 错误的锁存（poisoned 封闭，2026-10-24 评审）：
+    /// 写一半失败后继续使用会静默产出损坏文件（重试重写 ftyp、
+    /// 中段再写一份 moof、stco 偏移与 mdat 内容错位），而
+    /// `flush_fragment(&mut self) -> Result` 的形状天然邀请重试。
+    /// 锁存后 write_packet/flush_fragment/finalize 一律返回首个错误。
+    poisoned: Option<WriterError>,
 }
 
 impl Mp4Writer<std::io::BufWriter<std::fs::File>> {
@@ -787,7 +804,58 @@ impl<W: Write + Seek> Mp4Writer<W> {
             pos,
             frag_seq: 0,
             frag_dur_offsets: Vec::new(),
+            poisoned: None,
         }
+    }
+
+    /// poisoned 状态的对外错误（保留变体与文案；`io::Error` 不可 Clone，
+    /// 以同 kind + 文案重建——Io 变体语义即「底层 I/O 失败」不因重建
+    /// 改变，调用方按 kind 分流不受影响）。
+    fn poison_err(e: &WriterError) -> WriterError {
+        match e {
+            WriterError::Io(io) => {
+                WriterError::Io(std::io::Error::new(io.kind(), io.to_string()))
+            }
+            WriterError::Unsupported(w) => WriterError::Unsupported(w),
+            WriterError::InvalidStreamIndex { index, count } => WriterError::InvalidStreamIndex {
+                index: *index,
+                count: *count,
+            },
+            WriterError::Misuse(w) => WriterError::Misuse(w),
+            WriterError::Time(w) => WriterError::Time(w),
+        }
+    }
+
+    /// poisoned 守卫：封闭后任何写路径调用一律返回锁存的错误。
+    fn check_poisoned(&self) -> Result<(), WriterError> {
+        match &self.poisoned {
+            Some(e) => Err(Self::poison_err(e)),
+            None => Ok(()),
+        }
+    }
+
+    /// 底层写 + poisoned 锁存：失败即刻封闭封装器。
+    fn io_write(&mut self, buf: &[u8]) -> Result<(), WriterError> {
+        self.check_poisoned()?;
+        io_write_poisoned(&mut self.w, &mut self.poisoned, buf)
+    }
+
+    /// 底层寻址 + poisoned 锁存（同 [`Self::io_write`]）。
+    fn io_seek(&mut self, pos: SeekFrom) -> Result<u64, WriterError> {
+        self.check_poisoned()?;
+        match self.w.seek(pos) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(lock_poison(&mut self.poisoned, WriterError::Io(e))),
+        }
+    }
+
+    /// 底层 flush + poisoned 锁存（同 [`Self::io_write`]）。
+    fn io_flush(&mut self) -> Result<(), WriterError> {
+        self.check_poisoned()?;
+        if let Err(e) = self.w.flush() {
+            return Err(lock_poison(&mut self.poisoned, WriterError::Io(e)));
+        }
+        Ok(())
     }
 
     /// 添加一路轨，返回 stream_index（0 起，按添加顺序）。
@@ -844,6 +912,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
     /// 时戳契约：包时基任意（自描述）；入轨前按 NearInf 重标度到轨道
     /// 时基单位域，校验与入表均在单位域进行。
     pub fn write_packet(&mut self, pkt: &Packet) -> Result<(), WriterError> {
+        self.check_poisoned()?;
         let si = usize::try_from(pkt.stream_index).unwrap_or(usize::MAX);
         if si >= self.tracks.len() {
             return Err(WriterError::InvalidStreamIndex {
@@ -868,10 +937,13 @@ impl<W: Write + Seek> Mp4Writer<W> {
         }
         let tb = self.tracks[si].cfg.timebase;
         // 包时基 → 轨道时基单位域（NearInf；dts/dur 非负 ⇒ 单位域非负）。
+        // 重标度溢出是数据驱动的换算失败（非调用顺序违约）——按
+        // Muxer trait 契约以 Time 变体透出（2026-10-24 评审统一，
+        // 此前误归 Misuse → trait 面 InvalidState）。
         let rescale = |t: Timestamp| -> Result<i64, WriterError> {
             t.rescale(tb)
                 .map(|v| v.ticks())
-                .map_err(|_| WriterError::Misuse("时戳重标度到轨道时基溢出"))
+                .map_err(|_| WriterError::Time("时戳重标度到轨道时基溢出"))
         };
         let dts_units = rescale(dts)?;
         let dur_units = rescale(dur)?;
@@ -915,7 +987,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
             Layout::Progressive => {
                 self.ensure_prologue()?;
                 let offset = self.pos;
-                self.w.write_all(&pkt.data)?;
+                self.io_write(&pkt.data)?;
                 self.pos += pkt.data.len() as u64;
                 self.tracks[si].samples.push(SampleRec {
                     dts_units: dts_units as u64,
@@ -927,6 +999,19 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 });
             }
             Layout::Fragmented => {
+                // 字段宽度前置校验（trun duration u32 / cts i32）——先于
+                // fragment_duration 自动切（2026-10-24 评审：此前一个注定
+                // 被拒的包若恰是到达阈值的关键帧，会先把攒的样例切成
+                // fragment 落盘再返回 Misuse，被拒包改变了写入器状态），
+                // 保证「校验失败即拒」的完全无副作用语义。
+                if dur_units > u32::MAX as i64 {
+                    return Err(WriterError::Misuse(
+                        "样例时长超出 u32（trun duration 字段宽度）",
+                    ));
+                }
+                i32::try_from(cts_offset).map_err(|_| {
+                    WriterError::Misuse("pts−dts 偏移超出 i32（trun v1 cts 字段宽度）")
+                })?;
                 // fragment_duration 自动切：新到的关键帧 + 本轨待切跨度
                 // 已达阈值 ⇒ 先切再攒（片段起点落在关键帧上）。阈值比较
                 // 走 Timestamp::compare 精确交叉相乘，无舍入。
@@ -938,15 +1023,6 @@ impl<W: Write + Seek> Mp4Writer<W> {
                         self.flush_fragment()?;
                     }
                 }
-                // 字段宽度前置校验（trun duration u32 / cts i32）。
-                if dur_units > u32::MAX as i64 {
-                    return Err(WriterError::Misuse(
-                        "样例时长超出 u32（trun duration 字段宽度）",
-                    ));
-                }
-                i32::try_from(cts_offset).map_err(|_| {
-                    WriterError::Misuse("pts−dts 偏移超出 i32（trun v1 cts 字段宽度）")
-                })?;
                 let t = &mut self.tracks[si];
                 t.frag_pending_data.extend_from_slice(&pkt.data);
                 t.frag_pending.push(PendingSample {
@@ -1005,18 +1081,18 @@ impl<W: Write + Seek> Mp4Writer<W> {
         } else {
             None
         };
-        self.w.write_all(&build_ftyp())?;
+        self.io_write(&build_ftyp())?;
         if let Some(total) = free_total {
             match u32::try_from(total) {
                 Ok(sz) => {
-                    self.w.write_all(&sz.to_be_bytes())?;
-                    self.w.write_all(b"free")?;
+                    self.io_write(&sz.to_be_bytes())?;
+                    self.io_write(b"free")?;
                 }
                 Err(_) => {
                     // 总长装不进 u32：size==1 + largesize 头。
-                    self.w.write_all(&1u32.to_be_bytes())?;
-                    self.w.write_all(b"free")?;
-                    self.w.write_all(&total.to_be_bytes())?;
+                    self.io_write(&1u32.to_be_bytes())?;
+                    self.io_write(b"free")?;
+                    self.io_write(&total.to_be_bytes())?;
                 }
             }
             // 零载荷分块写，避免巨型 free 一次性分配。
@@ -1024,13 +1100,13 @@ impl<W: Write + Seek> Mp4Writer<W> {
             let mut left = self.options.free_size;
             while left > 0 {
                 let n = (left as usize).min(zeros.len());
-                self.w.write_all(&zeros[..n])?;
+                self.io_write(&zeros[..n])?;
                 left -= n as u64;
             }
         }
         // mdat 占位头（size==1 + largesize=16）：finalize 回填真实总长。
         let mdat = BoxBuf::new();
-        self.w.write_all(&mdat.into_box64(b"mdat"))?;
+        self.io_write(&mdat.into_box64(b"mdat"))?;
         self.prologue_done = true;
         Ok(())
     }
@@ -1039,6 +1115,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
     /// 冲尾 fragment、回填前置 moov 的时长字段。返回底层 W
     /// （已 flush、定位在文件末尾）。0 流 → Misuse；0 包轨合法。
     pub fn finalize(mut self) -> Result<W, WriterError> {
+        self.check_poisoned()?;
         if self.tracks.is_empty() {
             return Err(WriterError::Misuse(
                 "finalize 时无流（至少一路 trak；0 包轨合法）",
@@ -1050,8 +1127,8 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 self.flush_fragment()?;
                 self.ensure_frag_prologue()?;
                 self.backfill_frag_durations()?;
-                self.w.seek(SeekFrom::End(0))?;
-                self.w.flush()?;
+                self.io_seek(SeekFrom::End(0))?;
+                self.io_flush()?;
                 Ok(self.w)
             }
         }
@@ -1094,6 +1171,8 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 &t.cfg,
                 t.timescale,
                 duration_units,
+                // tkhd 取 movie 时基（与 backfill_frag_durations 同一换算）。
+                movie_end,
                 stbl_children,
             ));
         }
@@ -1107,15 +1186,15 @@ impl<W: Write + Seek> Mp4Writer<W> {
             moov.bytes(t);
         }
         let moov_bytes = moov.into_box(b"moov");
-        self.w.write_all(&moov_bytes)?;
+        self.io_write(&moov_bytes)?;
 
         // 回填 mdat largesize（头恒 16 字节 ⇒ 无位移）。
         let payload = self.pos - (self.mdat_pos + MDAT_HEADER);
         let total = MDAT_HEADER + payload;
-        self.w.seek(SeekFrom::Start(self.mdat_pos + 8))?;
-        self.w.write_all(&total.to_be_bytes())?;
-        self.w.seek(SeekFrom::End(0))?;
-        self.w.flush()?;
+        self.io_seek(SeekFrom::Start(self.mdat_pos + 8))?;
+        self.io_write(&total.to_be_bytes())?;
+        self.io_seek(SeekFrom::End(0))?;
+        self.io_flush()?;
         Ok(self.w)
     }
 
@@ -1126,6 +1205,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
     /// `WriterError::Misuse("flush_fragment 仅 Fragmented 布局可用")`。
     /// 无待切样例时为 no-op（不产空 moof）。
     pub fn flush_fragment(&mut self) -> Result<(), WriterError> {
+        self.check_poisoned()?;
         if self.options.layout != Layout::Fragmented {
             return Err(WriterError::Misuse("flush_fragment 仅 Fragmented 布局可用"));
         }
@@ -1159,18 +1239,19 @@ impl<W: Write + Seek> Mp4Writer<W> {
         }
         let moof_bytes = self.build_moof(seq, &offsets);
         let data_total = inner;
-        self.w.write_all(&moof_bytes)?;
+        self.io_write(&moof_bytes)?;
         // mdat 恒 16 字节 size==1 + largesize 头（总长已知，直接写实值；
         // 逐字段写——into_box64 会把 BoxBuf 载荷当 mdat 内容）。
-        self.w.write_all(&1u32.to_be_bytes())?;
-        self.w.write_all(b"mdat")?;
+        self.io_write(&1u32.to_be_bytes())?;
+        self.io_write(b"mdat")?;
         self.w
             .write_all(&(MDAT_HEADER + data_total).to_be_bytes())?;
         for t in &self.tracks {
             if t.frag_pending_data.is_empty() {
                 continue;
             }
-            self.w.write_all(&t.frag_pending_data)?;
+            // 字段级拆分借用（迭代 tracks 的同时写 w + 维护 poisoned）。
+            io_write_poisoned(&mut self.w, &mut self.poisoned, &t.frag_pending_data)?;
         }
         // 轨状态推进：跨 fragment 游标 / 首尾跨度（finalize 回填用）。
         for t in &mut self.tracks {
@@ -1219,7 +1300,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
             return Ok(());
         }
         let ftyp = build_ftyp();
-        self.w.write_all(&ftyp)?;
+        self.io_write(&ftyp)?;
         // duration 占位 >u32::MAX ⇒ build_mvhd/build_trak_skeleton 恒选
         // v1（u64 定宽）⇒ 回填不改布局。
         let mut moov = BoxBuf::new();
@@ -1235,6 +1316,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 &t.cfg,
                 t.timescale,
                 FRAG_DURATION_PLACEHOLDER,
+                FRAG_DURATION_PLACEHOLDER,
                 empty_tables.clone(),
             ));
         }
@@ -1244,7 +1326,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
             WriterError::Misuse("前置 moov 时长字段定位失败（内部不变量破坏）"),
         )?;
         self.frag_dur_offsets = offsets.into_iter().map(|o| o + ftyp.len()).collect();
-        self.w.write_all(&moov_bytes)?;
+        self.io_write(&moov_bytes)?;
         self.pos = ftyp.len() as u64 + moov_bytes.len() as u64;
         self.prologue_done = true;
         Ok(())
@@ -1280,15 +1362,40 @@ impl<W: Write + Seek> Mp4Writer<W> {
             vals.push(to_movie(units, tb)); // tkhd（movie 时基）
             vals.push(units); // mdhd（轨道时基）
         }
-        for (off, v) in self.frag_dur_offsets.iter().zip(vals) {
-            self.w.seek(SeekFrom::Start(*off as u64))?;
-            self.w.write_all(&v.to_be_bytes())?;
+        let offsets = std::mem::take(&mut self.frag_dur_offsets);
+        for (off, v) in offsets.iter().zip(vals) {
+            self.io_seek(SeekFrom::Start(*off as u64))?;
+            self.io_write(&v.to_be_bytes())?;
         }
+        self.frag_dur_offsets = offsets;
         Ok(())
     }
 }
 
 // —— fMP4 组装辅助 ——
+
+/// 锁存首个 I/O 错误（poisoned 封闭）并返回对外错误。
+fn lock_poison(poisoned: &mut Option<WriterError>, err: WriterError) -> WriterError {
+    let out = Mp4Writer::<std::io::Cursor<Vec<u8>>>::poison_err(&err);
+    *poisoned = Some(out);
+    err
+}
+
+/// 底层写 + poisoned 锁存（自由函数版：供字段级拆分借用的调用点——
+/// 迭代 `self.tracks` 的同时写 `self.w`，方法调用会借整个 `self` 冲突）。
+fn io_write_poisoned<W: Write>(
+    w: &mut W,
+    poisoned: &mut Option<WriterError>,
+    buf: &[u8],
+) -> Result<(), WriterError> {
+    if let Some(e) = poisoned {
+        return Err(Mp4Writer::<std::io::Cursor<Vec<u8>>>::poison_err(e));
+    }
+    if let Err(e) = w.write_all(buf) {
+        return Err(lock_poison(poisoned, WriterError::Io(e)));
+    }
+    Ok(())
+}
 
 /// 本轨待切批的跨度（末样例尾 − 首样例 dts，轨道时基时间戳）；
 /// 空批 → None。供 fragment_duration 阈值的精确比较。

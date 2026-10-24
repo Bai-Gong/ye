@@ -41,9 +41,9 @@ mod tests {
     #[test]
     fn display_english_short_messages() {
         assert_eq!(
-            FilterError::Unsupported("filter graph topological sort not implemented (桩：M4 交付)")
+            FilterError::Unsupported("filter graph topological sort not implemented (桩：M3 交付)")
                 .to_string(),
-            "unsupported: filter graph topological sort not implemented (桩：M4 交付)"
+            "unsupported: filter graph topological sort not implemented (桩：M3 交付)"
         );
         assert_eq!(
             FilterError::InvalidArguments("pad references unknown node").to_string(),

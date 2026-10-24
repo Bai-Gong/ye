@@ -144,10 +144,14 @@ ye-codec 34 / ye-container 24，合流时基线）经 `cargo test --workspace
    布局）：trait 状态机（未写头/写入中/已收尾）映射
    `ContainerError::InvalidState`；fMP4 布局选项走具体类型（移植裁决
    第 7 条）。错误映射：`Mp4Error`/`WriterError` → `ContainerError`
-   （Io 原样透传、流索引 → `StreamNotFound`、其余 → `InvalidData`
-   带原文案）。
+   （Io 原样透传、流索引 → `StreamNotFound`、`WriterError::Misuse` →
+   `InvalidState`、`WriterError::Time` → `Time`（2026-10-24 评审统一：
+   数据驱动的时戳重标度溢出按 Muxer 契约走 Time 变体）、其余 →
+   `InvalidData` 带原文案）。
 4. **探测评分**：`DemuxerFactory::probe` 做 ftyp/styp box 嗅探——
-   size ≥ 8 + box 类型四字符命中 + major brand 在常见集（14 项，对齐
+   size ≥ 8 + box 类型四字符命中 + major brand 在常见集（13 项，
+   2026-10-24 评审移除 heic——HEIF 静态图片无 moov/trak，读取端另有
+   「至少一条 trak」校验兜底；对齐
    FFmpeg mov probe 常用子集）→ `ProbeScore::MAXIMUM`；brand 可读但
    不在集内 → `EXTENSION`；乱数据 → `NONE`。`register_mp4` 以格式名
    `"mp4"` 注册 demuxer/muxer 双工厂，auto-probe 由
@@ -178,17 +182,6 @@ ye-codec 34 / ye-container 24，合流时基线）经 `cargo test --workspace
    检测，`topological_order` 调用即 `Unsupported`）。垫的媒体类型复用
    `ye_codec::MediaType`（path 依赖，与 lavfi 依赖 lavcodec 的方向
    对称）。
-10. **桩里程碑文案与现行排期的出入（遗留，待改常量）**：桩文案按
-    roadmap 顶部**原始**里程碑表（M2 解码 / M4 编码）标注——解码
-    「桩：M2 交付」、编码「桩：M4 交付」、处理图排序「桩：M4 交付」；
-    而 roadmap 现行「里程碑」一节（2026-10-22 重排，其顶部注释声明
-    现行排期以该节为准）把 H.264/AAC 编码与处理图**最小集**排在
-    **M3**（M4 是合成导出全集）。以现行节为准修正时，改
-    `crates/ye-codec/src/stubs.rs` 的 `H264_ENCODE_MSG`/
-    `AAC_ENCODE_MSG` 与 `crates/ye-filter/src/graph.rs` 的
-    `TOPOSORT_STUB_MSG` 各一处文案即可（本轮属地限 docs 与
-    crates/ye，未改；解码文案 M2 与两版排期一致，无出入）。
-
 ## 门面与 feature 接线
 
 依赖方向是硬规则，防止抽象层倒挂：
@@ -564,12 +557,13 @@ M2+ 才交付的能力（解码/编码/处理图）先以**接口桩**占位：�
 
 - `ye-codec` 桩（`stubs` 模块，根级 re-export `register_stubs` 与
   H.264/AAC × 解码/编码四工厂）：解码文案「桩：M2 交付」、编码文案
-  「桩：M4 交付」（与现行排期的出入见接线裁决第 10 条）。同 codec
-  重复注册按注册表替换语义覆盖。
+  「桩：M3 交付」（2026-10-24 评审按 roadmap 现行「里程碑」排期对齐，
+  原出入登记已随修正删除）。同 codec 重复注册按注册表替换语义覆盖。
 - `ye-filter` 最小契约：`FilterDescriptor`/`PadDescriptor` 纯数据；
-  `FilterGraph` 的 `add_filter`/`connect` 真实生效（节点/垫索引校验，
-  不去重不成环检测——随拓扑排序实现交付），`topological_order`
-  调用即 `Unsupported`（文案「桩：M4 交付」，同前出入）。
+  `FilterGraph` 的 `add_filter`/`connect` 真实生效（节点/垫索引与
+  两侧垫媒体类型一致性校验，不去重不成环检测——随拓扑排序实现
+  交付），`topological_order` 调用即 `Unsupported`（文案
+  「桩：M3 交付」）。
 
 **门面 feature**：`ye` 的 `codec-stubs` / `filter-stubs`（默认关闭）
 开启 `ye::stubs::codec` / `ye::stubs::filter` 聚合入口。桩本体随
@@ -681,25 +675,26 @@ impl<W: Write + Seek> Mp4Writer<W> {
      Video/Audio 且须带对应 video/audio 信息（缺/错配 → Misuse）；
      codec 仅 avc1（Video）/mp4a（Audio），其余 → `Unsupported`；
   8. finalize 时 0 流 → Misuse（0 包轨合法，产出空表兼容文件）。
-- hdlr 与 AudioSampleEntry 兼容性注记（writer 已按规范写，集成时对齐
-  读取端）：①hdlr 的 handler 四字符双写在 pre_defined 与 handler_type
-  两个槽位——ISO 14496-12 的 handler_type 在 4 字节 pre_defined 之后，
-  而读取端 `parse_hdlr` 只跳 version/flags 未跳 pre_defined（缺陷）；
-  双写保证两代读取端都读到正确 handler，读取端修复后此写法依旧兼容，
-  不必回改。②mp4a entry 按 ISO 写 28 字节固定字段（SampleEntry 基座 8
-  + reserved u32[2] 8 + 声道/样宽/pre_defined/reserved 8 + 采样率 16.16
-  在 +24）；读取端 `extract_entry_fields` 现按 20 字节旧布局解析（声道
-  在 +8、采样率在 +16），而真实文件（ffmpeg 产物）为 28 字节布局——
-  读取端须改为 skip 16 / need 28 / extra 从 +28 取，修复前 mp4a 轨的
-  声道/采样率/extra_data 读回失真（tests/writer.rs 的 mp4a 用例与
-  oracle_mux 即其回归验证）。
+- hdlr 与 AudioSampleEntry 兼容性注记（2026-10-24 评审更新：读取端
+  已按硬契约 13 双布局兼容，下述「缺陷/失真」为历史状态，现为兼容
+  保留）：①hdlr 的 handler 四字符双写在 pre_defined 与 handler_type
+  两个槽位——读取端 `parse_hdlr` 现已跳过 version/flags 与
+  pre_defined（reader.rs 双布局兼容），规范槽位直接命中；双写仅作
+  历史兼容保留，读取端两代布局都读到正确 handler。②mp4a entry 按
+  ISO 写 28 字节固定字段（SampleEntry 基座 8 + reserved u32[2] 8 +
+  声道/样宽/pre_defined/reserved 8 + 采样率 16.16 在 +24）；读取端
+  `extract_entry_fields` 现按 20/28 字节双布局判别（本文件 box 硬契约
+  13，ffmpeg 28 字节产物实测可读），声道/采样率/extra_data 读回无
+  失真（tests/writer.rs 的 mp4a 用例与 oracle_mux 即其回归验证）。
 - pub(crate) 组装件（模块三 fMP4 组装的编译契约，签名不得偏离）：
   `BoxBuf`（大端追加 + `into_box`/`into_box64`；注意两者取 `self`
   按值，不能接在返回 `&mut Self` 的追加链尾）、`build_ftyp`、
   `validate_timebase`、`build_stsd_entry`、`build_mvhd`、
-  `build_trak_skeleton`（duration_units 写 mdhd 轨道时基域，tkhd 同值；
-  模块三传空样例表 + >u32::MAX 占位 duration 复用（强制 v1 定宽，见
-  Layout::Fragmented 节）。
+  `build_trak_skeleton`（duration_units 写 mdhd 轨道时基域，
+  tkhd_duration_units 写 tkhd movie 时基域（1/1000，ISO 14496-12 §8.3.2，
+  2026-10-24 评审拆分两参数——此前同值直写轨道单位，timescale≠1000
+  的轨错报时长）；模块三传空样例表 + >u32::MAX 占位 duration 复用
+  （两参数同传占位值，强制 v1 定宽，见 Layout::Fragmented 节）。
 - 测试：`tests/writer.rs`（自包含单元层：布局黄金/extra_data 回写/
   交错分 chunk/ctts/stss/co64/Misuse 全清单/0 包轨/时基换算）；
   `tests/oracle_mux.rs`（ffmpeg lavfi 造 avc1+mp4a 源 → reader 读 →

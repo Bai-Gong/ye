@@ -11,14 +11,14 @@
 //!   （`graph` 模块）；
 //! - [`FilterError`]：本 crate 错误枚举（`error` 模块）。
 //!
-//! ## 桩的语义边界（M4 交付前）
+//! ## 桩的语义边界（M3 交付前）
 //!
 //! 本 crate 当前只落地处理图最小契约 + 桩：
 //! - **可构造**：描述符是纯数据；`FilterGraph::add_filter`/`connect`
 //!   真实生效（`connect` 仅做节点/垫索引校验，不做去重与成环检测）；
 //! - **可查询**：图结构（节点数/边数/描述符/连线）可完整读回；
 //! - **不可用**：`FilterGraph::topological_order` 调用即返回
-//!   [`FilterError::Unsupported`]，文案注明交付里程碑（M4）——真实的
+//!   [`FilterError::Unsupported`]，文案注明交付里程碑（M3）——真实的
 //!   排序、调度与帧处理随实现交付。
 //!
 //! ## 设计要点

@@ -75,7 +75,7 @@ mod filter_stubs {
         // 不可用：topological_order 调用即 Unsupported，文案含里程碑标注
         match g.topological_order() {
             Err(FilterError::Unsupported(msg)) => {
-                assert!(msg.contains("桩：M4 交付"), "msg: {msg}");
+                assert!(msg.contains("桩：M3 交付"), "msg: {msg}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

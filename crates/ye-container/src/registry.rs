@@ -88,21 +88,44 @@ impl ContainerRegistry {
         mut input: Box<dyn ReadSeek>,
     ) -> Result<(String, Box<dyn Demuxer>), ContainerError> {
         let head = self.probe_window(&mut *input)?;
-        let mut best: Option<(usize, ProbeScore)> = None;
-        for (i, factory) in self.demuxers.iter().enumerate() {
-            let score = factory.probe(&head);
-            // 严格大于才替换：同分取先注册者（FFmpeg 先到先得语义）
-            if best.is_none_or(|(_, s)| score > s) {
-                best = Some((i, score));
-            }
-        }
-        let (index, score) = best.ok_or(ContainerError::UnknownFormat)?;
+        let (index, score) = self.best_demuxer(&head)?;
         if score < ProbeScore::MINIMUM {
             return Err(ContainerError::UnknownFormat);
         }
         let factory = &self.demuxers[index];
         let demuxer = factory.open(input)?;
         Ok((factory.name().to_string(), demuxer))
+    }
+
+    /// 只打分、不打开（2026-10-24 评审补）：读窗口 → 回卷 → 逐工厂打分
+    /// 取最高，返回（胜出工厂名, 得分）。与 [`ContainerRegistry::open_demuxer`]
+    /// 同一套打分，但**不消费输入**（读后即回卷，也不构造 demuxer）——
+    /// 消费方的路由决策应复用本查询，而不是各自手抄一份魔数规则
+    /// （两处规则只能人工保持同步）。最高分 <
+    /// [`ProbeScore::MINIMUM`] → `Err(UnknownFormat)`。
+    pub fn detect(
+        &self,
+        input: &mut dyn ReadSeek,
+    ) -> Result<(String, ProbeScore), ContainerError> {
+        let head = self.probe_window(input)?;
+        let (index, score) = self.best_demuxer(&head)?;
+        if score < ProbeScore::MINIMUM {
+            return Err(ContainerError::UnknownFormat);
+        }
+        Ok((self.demuxers[index].name().to_string(), score))
+    }
+
+    /// 逐工厂打分取最高（同分取先注册者）；无注册工厂 → UnknownFormat。
+    fn best_demuxer(&self, head: &[u8]) -> Result<(usize, ProbeScore), ContainerError> {
+        let mut best: Option<(usize, ProbeScore)> = None;
+        for (i, factory) in self.demuxers.iter().enumerate() {
+            let score = factory.probe(head);
+            // 严格大于才替换：同分取先注册者（FFmpeg 先到先得语义）
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some((i, score));
+            }
+        }
+        best.ok_or(ContainerError::UnknownFormat)
     }
 
     /// 点名打开：`name` 未注册 → `Err(UnknownFormat)`。
@@ -290,6 +313,46 @@ mod tests {
         assert_eq!(name, "mock");
     }
 
+    // ---- testPlan：detect（只打分、不打开）----
+
+    /// detect：返回胜出工厂名与得分；不构造 demuxer；输入读后回卷
+    /// （事件末尾 seek(0)），同一输入随后仍可 open_demuxer——消费方
+    /// 路由复用注册表打分而不必各抄一份魔数规则（2026-10-24 评审补）。
+    #[test]
+    fn detect_scores_rewinds_and_does_not_open() {
+        let mut reg = ContainerRegistry::new();
+        reg.register_demuxer(Box::new(MockDemuxerFactory::new_named(
+            ProbeScore::EXTENSION,
+            "ext-heuristic",
+        )));
+        let hi = MockDemuxerFactory::new_named(ProbeScore::MAXIMUM, "magic-bytes");
+        let open_positions = hi.open_positions_handle();
+        reg.register_demuxer(Box::new(hi));
+
+        let (mut input, events) = tracked(vec![0xAB; 32]);
+        let (name, score) = reg.detect(&mut *input).expect("detect");
+        assert_eq!(name, "magic-bytes");
+        assert_eq!(score, ProbeScore::MAXIMUM);
+        // 只打分、不打开：工厂的 open 从未被调用。
+        assert!(open_positions.lock().unwrap().is_empty(), "detect 不得 open");
+        // 输入已回卷（事件末尾 seek(0)）。
+        let events = events.lock().unwrap().clone();
+        assert_eq!(*events.last().unwrap(), IoEvent::Seek(0));
+        // 回卷后同一输入可直接打开（detect → open 的路由用法）。
+        let (name2, _) = reg.open_demuxer(input).expect("open after detect");
+        assert_eq!(name2, "magic-bytes");
+
+        // 全低分（< 25）→ Err(UnknownFormat)，与 open_demuxer 同阈值。
+        let mut reg2 = ContainerRegistry::new();
+        reg2.register_demuxer(Box::new(MockDemuxerFactory::new_named(
+            ProbeScore::new(10).unwrap(),
+            "weak",
+        )));
+        let (mut input2, _) = tracked(vec![0x01; 64]);
+        let err = err_of(reg2.detect(&mut *input2));
+        assert!(matches!(err, ContainerError::UnknownFormat));
+    }
+
     // ---- testPlan：同名注册替换 ----
 
     #[test]
@@ -459,6 +522,35 @@ mod tests {
         assert_eq!(written[0].time_base, tb_1000);
         assert_eq!(written[1].ticks, 80); // 0.08 s → 80
         assert_eq!(written[1].time_base, tb_1000);
+    }
+
+    /// Muxer 契约固化（2026-10-24 评审）：**重标度失败必须以
+    /// `Err(ContainerError::Time(..))` 透出**（trait 文档原文），不得
+    /// 归入 InvalidState/InvalidData——mock 与 mp4 两个实现此前分叉
+    /// （mock→Time、mp4→InvalidState），本断言锁住契约语义；真实实现
+    /// 侧的对应断言见 ye-container-mp4 adapter 测试
+    /// `muxer_rescale_overflow_surfaces_as_time_variant`。
+    #[test]
+    fn muxer_rescale_failure_must_surface_as_time_variant() {
+        let factory = crate::mock::MockMuxerFactory::new();
+        let mut reg = ContainerRegistry::new();
+        reg.register_muxer(Box::new(factory));
+        let mut muxer = reg
+            .create_muxer("mock", Box::new(Cursor::new(Vec::new())))
+            .expect("create");
+
+        let tb_1000 = Rational::new(1, 1000);
+        muxer
+            .write_header(&[video_template(tb_1000)])
+            .expect("header");
+        // pts=i64::MAX @1/1 → 重标度到 1/1000 溢出 ⇒ Time。
+        let mut p = ye_codec::Packet::empty(0);
+        p.pts = Some(Timestamp::new(i64::MAX, Rational::ONE));
+        let err = err_of(muxer.write_packet(&p));
+        assert!(
+            matches!(err, ContainerError::Time(_)),
+            "重标度失败必须以 Time 透出，实为 {err:?}"
+        );
     }
 
     // ---- 线程安全（全库约定）----

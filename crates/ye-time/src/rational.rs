@@ -149,8 +149,13 @@ impl Rational {
     pub const ZERO: Rational = Rational::new(0, 1);
     /// 1/1。
     pub const ONE: Rational = Rational::new(1, 1);
-    /// 23.976…（24 ÷ 1.001），千分位写法 23976/1000（归一化为 2997/125）。
+    /// 23.976（**千分位近似**，23976/1000 归一为 2997/125 = 精确
+    /// 23.976；≠ 24÷1.001 = 23.97602…，两者相差 ~1ppm——NTSC 精确形
+    /// 用 [`Rational::RATE_24000_DIV_1001`]，帧号/时戳换算勿取本常量）。
     pub const RATE_23_976: Rational = Rational::new(23_976, 1_000);
+    /// 23.976…（NTSC-FHD 精确形，24 ÷ 1.001 = 24000/1001）。真实 NTSC
+    /// 流的时基为 1001/24000，帧号/时戳换算与本常量精确对齐。
+    pub const RATE_24000_DIV_1001: Rational = Rational::new(24_000, 1_001);
     /// 24 fps。
     pub const RATE_24: Rational = Rational::new(24, 1);
     /// 25 fps。
@@ -598,6 +603,22 @@ mod tests {
         assert_eq!(parts(Rational::RATE_120), (120, 1));
         assert_eq!(parts(Rational::RATE_44100), (44100, 1));
         assert_eq!(parts(Rational::RATE_48000), (48000, 1));
+    }
+
+    /// NTSC-FHD 精确形常量（2026-10-24 评审补）：24000/1001 不可再约，
+    /// 且与千分位近似 23976/1000 相差 ~1ppm——两者不得混用。
+    #[test]
+    fn ntsc_fhd_exact_rate_constant() {
+        assert_eq!(parts(Rational::RATE_24000_DIV_1001), (24000, 1001));
+        // 与千分位近似的差：24000/1001 = 23.97602…，2997/125 = 23.976。
+        let exact = Rational::RATE_24000_DIV_1001.to_f64();
+        let approx = Rational::RATE_23_976.to_f64();
+        let ppm = (exact - approx).abs() / exact * 1e6;
+        assert!(ppm > 0.5 && ppm < 5.0, "应相差 ~1ppm，实测 {ppm}ppm");
+        // 同族 NTSC 常量均为 /1001 精确形。
+        assert_eq!(Rational::RATE_24000_DIV_1001.den(), 1001);
+        assert_eq!(Rational::RATE_29_97.den(), 1001);
+        assert_eq!(Rational::RATE_59_94.den(), 1001);
     }
 
     #[test]

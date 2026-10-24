@@ -67,7 +67,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ye_codec::{AudioParams, CodecParameters, MediaType, Packet, PacketFlags, VideoParams};
 use ye_container::{Metadata, Stream};
@@ -128,6 +128,18 @@ struct StszData {
     fixed: Option<u64>,
     sizes: Vec<u64>,
     count: u64,
+}
+
+/// 变长 stsz 定位的 chunk 内前缀和缓存（单项，最近访问的 chunk）：
+/// `prefix[i]` = 该 chunk 内前 i 个样例的 size 之和（`prefix[0] = 0`，
+/// 前缀和覆盖该 chunk 首样例到 stsz 表末）。首次访问该 chunk 时
+/// O(该 chunk 样例数) 一次性累积，此后 O(1) 定位——替代此前每次
+/// locate 都对 chunk 内前序样例线性重求和的实现（单 chunk 大样例数
+/// 文件的全量顺序读是 O(样例数²)，2026-10-24 评审实测 60k 样例 2.1s、
+/// 呈平方增长）。
+struct VarChunkCache {
+    chunk: u64,
+    prefix: Vec<u64>,
 }
 
 // —— fragment（fMP4）数据 ——
@@ -211,6 +223,11 @@ struct TrackTables {
     frags: Vec<FragSample>,
     /// 最近一条 trun 的 box 路径（fragment 样例错误定位）。
     frag_path: String,
+    /// 变长 stsz 的 chunk 内前缀和缓存（[`VarChunkCache`]）。
+    /// `Mutex` 而非 `RefCell`：`Mp4Reader` 须 `Send + Sync`（全库线程
+    /// 安全约定，adapter 的 Send/Sync 测试断言）；常规单线程用法下
+    /// 无争用，锁开销远小于被替代的线性求和。
+    var_chunk_cache: Mutex<Option<VarChunkCache>>,
 }
 
 impl TrackTables {
@@ -287,9 +304,11 @@ impl TrackTables {
 
     /// 样例绝对文件偏移与大小：
     /// chunk_offset + chunk 内前序样例 size 之和。
-    /// `file_len` 用于求和前的整体界校验（定长 size 场景 O(1)）：
-    /// stsz 定长 count 与 stsc 的 samples_per_chunk 都是纯声明、与文件
-    /// 字节无关，逐样例求和的代价会随攻击者声明的样例序号线性增长。
+    /// `file_len` 用于定长 size 场景的 O(1) 整体界校验；变长表走
+    /// [`VarChunkCache`] 前缀和缓存（首次访问该 chunk O(该 chunk 样例数)，
+    /// 之后 O(1)），全量顺序读整体 O(样例总数)——stsz 定长 count 与
+    /// stsc 的 samples_per_chunk 都是纯声明、与文件字节无关，界校验
+    /// 防攻击者声明的样例序号触发无界求和。
     fn locate(&self, sample: u64, file_len: u64) -> Res<(u64, u64)> {
         let stsc_path = format!("{}.mdia.minf.stbl.stsc", self.path);
         let chunk_count = self.chunk_offsets.len() as u64;
@@ -332,8 +351,8 @@ impl TrackTables {
         let off = if let Some(f) = self.fixed_size {
             // 定长 size：前序样例总跨度 O(1) 可算，先按文件长度整体校验
             // （同 read_packet 分配前校验的原则：数据必须装进文件），
-            // 再算偏移——不逐样例求和。变长表的循环则受表自身字节约束
-            // （count×4 字节须在文件内），代价与文件长度成比例。
+            // 再算偏移——不逐样例求和。变长表受表自身字节约束
+            // （count×4 字节须在文件内），定位走前缀和缓存。
             let precede = in_chunk
                 .checked_mul(f)
                 .ok_or_else(|| malformed(&stsc_path, "样例偏移累计溢出"))?;
@@ -350,13 +369,42 @@ impl TrackTables {
             }
             end
         } else {
-            let mut off = chunk_off;
-            for s in (sample - in_chunk)..sample {
-                off = off
-                    .checked_add(self.size_of(s)?)
-                    .ok_or_else(|| malformed(&stsc_path, "样例偏移累计溢出"))?;
+            // 变长表：chunk 内前缀和缓存（首次访问该 chunk 一次性累积，
+            // 之后 O(1)）。此前实现每次都对 chunk 内前序样例线性重求和，
+            // 单 chunk 大 samples_per_chunk 文件的全量顺序读是平方级。
+            let first = sample - in_chunk;
+            let mut cache = self
+                .var_chunk_cache
+                .lock()
+                .expect("locate 前缀和缓存锁中毒（无并发 panic 路径）");
+            if cache.as_ref().is_none_or(|c| c.chunk != chunk_idx) {
+                // 该 chunk 首样例到 stsz 表末全部入前缀和（同一 stsc 段内
+                // chunk 的首样例序号恒定，键 chunk_idx 即可判失效）。
+                let avail = self.sizes.len().saturating_sub(first as usize);
+                let mut prefix = Vec::with_capacity(avail + 1);
+                prefix.push(0u64);
+                let mut acc = 0u64;
+                for s in first..first + avail as u64 {
+                    acc = acc
+                        .checked_add(self.sizes[s as usize])
+                        .ok_or_else(|| malformed(&stsc_path, "样例偏移累计溢出"))?;
+                    prefix.push(acc);
+                }
+                *cache = Some(VarChunkCache {
+                    chunk: chunk_idx,
+                    prefix,
+                });
             }
-            off
+            let c = cache.as_ref().expect("刚写入缓存");
+            let precede = *c.prefix.get(in_chunk as usize).ok_or_else(|| {
+                malformed(
+                    &format!("{}.mdia.minf.stbl.stsz", self.path),
+                    format!("样例 {sample} 超出 stsz 表"),
+                )
+            })?;
+            chunk_off
+                .checked_add(precede)
+                .ok_or_else(|| malformed(&stsc_path, "样例偏移累计溢出"))?
         };
         let size = self.size_of(sample)?;
         Ok((off, size))
@@ -453,6 +501,17 @@ impl<R: Read + Seek> Mp4Reader<R> {
             ..Default::default()
         };
         let boxes = walk(&mut reader, 0, len, Scope::Top, "", &mut ctx, 0)?;
+        // 最少轨道校验（2026-10-24 评审）：无 moov/trak 的文件（ftyp 头
+        // 合法的 HEIC 照片、截断文件、纯 mdat 等）此前返回 Ok(0 路流)，
+        // 注册表 auto-probe 表现为「打开成功但 0 流」的假成功——
+        // ye-cli probe 会输出「photo.heic: mp4, 0 路流」而非报错。
+        // 改为 Malformed，让 open 失败（注册表层面 InvalidData）。
+        if ctx.builders.is_empty() {
+            return Err(malformed(
+                "moov",
+                "无 trak 轨道（纯 ftyp/moof/mdat 不是可解封装的 MP4）",
+            ));
+        }
         // fragment 样例按 track_id 并入对应 trak：解析期只按 track_id 累积
         // （moof 可能出现在 moov 之前），此处统一关联。
         for ft in std::mem::take(&mut ctx.frag_tracks) {
@@ -571,8 +630,9 @@ impl<R: Read + Seek> Mp4Reader<R> {
                 return Ok(i as usize);
             }
         }
-        // 到不了这里：0 号样例要么在 stss 表（1-based 样号 1 必要时含 0
-        // 之前无样例），要么无表恒关键帧。防御性返回 0。
+        // 解析期已校验非音频轨的 stss 非空且含样号 1（finish_track），
+        // 无表/音频轨恒关键帧——0 号样例必为关键帧，本分支不可达。
+        // 防御性返回 0。
         Ok(0)
     }
 
@@ -699,6 +759,12 @@ impl<R: Read + Seek> Mp4Reader<R> {
 /// 容器递归深度上限。合法 MP4 深度 ≤ 5（moov/trak/mdia/minf/stbl），
 /// 远超即恶意构造：超限返回 Malformed，防递归栈溢出。
 const MAX_BOX_DEPTH: u32 = 64;
+
+/// 单轨 fragment 样例总数上限（逐样例物化的内存界）：每个 FragSample
+/// 约 56 字节，无逐样例字段的 trun 声明数量失去字节约束后，内存放大
+/// ≈56× 文件长度。2^26 ≈ 6.7e7 样例把最坏物化钳在 ≈3.5GB 量级内
+/// （且须 ≥67MB 文件才可能声明到），超限 Malformed 而非分配 abort。
+const MAX_FRAG_SAMPLES_PER_TRACK: u64 = 1 << 26;
 
 /// 递归范围：决定叶子 box 归属哪路 trak / 哪个 fragment 结构。
 #[derive(Clone, Copy)]
@@ -973,6 +1039,8 @@ fn parse_leaf<R: Read + Seek>(
     let mut dispatch = |b: &mut TrackBuilder| -> Res<()> {
         if b.stsd_codec.is_some() && kind == *b"stsd"
             || b.stts.is_some() && kind == *b"stts"
+            || b.ctts.is_some() && kind == *b"ctts"
+            || b.stss.is_some() && kind == *b"stss"
             || b.stsc.is_some() && kind == *b"stsc"
             || b.stsz.is_some() && kind == *b"stsz"
             || b.chunk_offsets.is_some() && (kind == *b"stco" || kind == *b"co64")
@@ -1372,7 +1440,12 @@ fn parse_trex(d: &[u8], path: &str, ctx: &mut ParseCtx) -> Res<()> {
 }
 
 /// tfhd：确定本 traf 的基值与 tfhd 级缺省，填充 traf 瞬态状态。
+/// traf 内重复出现 ⇒ Malformed（与 stbl 样例表 box 的重复即拒策略
+/// 对齐，2026-10-24 评审补——此前静默 last-wins）。
 fn parse_tfhd(d: &[u8], path: &str, moof_start: u64, ctx: &mut ParseCtx) -> Res<()> {
+    if ctx.cur_traf.is_some() {
+        return Err(malformed(path, "tfhd 重复出现（traf 内只允许一个）"));
+    }
     let mut c = Cur::new(d);
     let vf = c.u32(path, "version/flags")?;
     let flags = vf & 0x00FF_FFFF;
@@ -1528,7 +1601,39 @@ fn parse_trun(d: &[u8], path: &str, ctx: &mut ParseCtx) -> Res<()> {
             ));
         }
     }
+    // 物化上限（2026-10-24 评审）：每个样例物化为约 56 字节的
+    // FragSample，上述字节界按文件长度计、不按内存计——声明大 sample_count
+    // 的内存放大 ≈56× 文件长度，300MB~1GB 的构造文件仍可触发数十 GB
+    // 分配使 Vec::push 走 handle_alloc_error 直接 abort。按样例总数设
+    // 硬上限（2^26 ≈ 6.7e7 ⇒ 最坏物化 ≈3.5GB 量级内，且须 ≥67MB 文件
+    // 才可能声明到），超限 Malformed 而非 abort。
+    let materialized = ft.samples.len() as u64 + n;
+    if materialized > MAX_FRAG_SAMPLES_PER_TRACK {
+        return Err(malformed(
+            path,
+            format!(
+                "fragment 样例总数 {materialized} 超上限 {}（逐样例物化内存界）",
+                MAX_FRAG_SAMPLES_PER_TRACK
+            ),
+        ));
+    }
     let mut dts = ft.next_dts;
+    // dts 单调性（2026-10-24 评审）：seek 的二分（sample_at_or_before/
+    // sample_at_or_after）与「≤ target 最大 dts」契约都以同轨 dts 单调
+    // 不减为前提，而 tfdt 接受任意 baseMediaDecodeTime——base 回退会令
+    // 后续 fragment 的 dts 倒退，此前只劣化 seek 落点/前向恢复丢样例而
+    // 不报错。解析期拒绝。
+    if let Some(last) = ft.samples.last()
+        && dts < last.dts
+    {
+        return Err(malformed(
+            path,
+            format!(
+                "fragment 首 dts {dts} 小于同轨前一 fragment 末样例 dts {}（tfdt 回退，dts 须单调不减）",
+                last.dts
+            ),
+        ));
+    }
     for i in 0..n {
         // duration/size：trun 显式 > tfhd 默认 > trex 默认 > 0（无表示「未知」的余地）。
         let duration = if f_dur {
@@ -1615,6 +1720,21 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         Some(h) if h.as_bytes() == *b"soun" => TrackKind::Audio,
         _ => TrackKind::Other,
     };
+    // stss 契约校验（2026-10-24 评审）：非音频轨的关键帧回溯
+    // （keyframe_index_before，seek 的落点依据）以「样号 1 是关键帧」为
+    // 前提——表存在却缺样号 1（或空表）时 0 号样例非关键帧，回溯会
+    // 落空；此前的防御性兜底 Ok(0) 会静默把帧间帧当关键帧返回，seek
+    // 落点从该处起花屏。改为解析期拒绝。音频轨的 stss 不参与关键帧
+    // 判定（恒关键帧），不做此约束。
+    if kind != TrackKind::Audio && let Some(stss) = &b.stss {
+        let stss_path = format!("{path}.mdia.minf.stbl.stss");
+        if stss.is_empty() {
+            return Err(malformed(&stss_path, "stss 表为空（须至少含样号 1）"));
+        }
+        if !stss.contains(&1) {
+            return Err(malformed(&stss_path, "stss 缺样号 1（首样例须为关键帧）"));
+        }
+    }
     let (video, audio, extra_data) = extract_entry_fields(kind, &b.stsd_content, &path)?;
 
     let mdhd_path = format!("{path}.mdia.mdhd");
@@ -1644,7 +1764,6 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         Some(f) => (f.samples, f.path),
         None => (Vec::new(), String::new()),
     };
-
     let media_type = kind.media_type();
     let stream = Stream {
         index: index as u32,
@@ -1694,6 +1813,7 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         chunk_box,
         frags,
         frag_path,
+        var_chunk_cache: Mutex::new(None),
     };
     Ok((stream, tables))
 }

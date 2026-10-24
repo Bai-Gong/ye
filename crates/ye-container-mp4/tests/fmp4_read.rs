@@ -1516,3 +1516,107 @@ fn fmp4_tfhd_unknown_track_id_is_malformed() {
         other => panic!("应为 Malformed，实为 {other:?}"),
     }
 }
+
+/// traf 内重复 tfhd ⇒ Malformed（回归：2026-10-24 评审——此前静默
+/// last-wins，与 stbl 样例表 box 重复即拒的策略不一致）。
+#[test]
+fn fmp4_duplicate_tfhd_in_traf_rejected() {
+    let make = |rel: i32| {
+        moof(&[
+            mfhd(1),
+            traf(&[
+                tfhd(7, 0x0002_0000, None, (None, None, None)),
+                tfhd(7, 0x0002_0000, None, (Some(777), None, None)), // 重复
+                tfdt(0, 0),
+                trun(
+                    0,
+                    &[TrunS {
+                        dur: Some(10),
+                        size: Some(4),
+                        flags: Some(0x0200_0000),
+                        cts: Some(0),
+                    }],
+                    Some(rel),
+                    None,
+                ),
+            ]),
+        ])
+    };
+    let f = layout(vec![
+        fixed(video_fmp4_moov(&[])),
+        moof_part(make),
+        fixed(mdat(&[0xA0, 0xA1, 0xA2, 0xA3])),
+    ]);
+    match Mp4Reader::from_vec(f) {
+        Err(Mp4Error::Malformed { reason, .. }) => {
+            assert!(reason.contains("tfhd 重复出现"), "reason={reason}");
+        }
+        other => panic!("应为 Malformed，实为 {other:?}"),
+    }
+}
+
+/// tfdt 回退（后一 fragment 的 base 早于同轨前一 fragment 末样例 dts）
+/// ⇒ Malformed（回归：2026-10-24 评审——dts 倒退令 seek 二分
+/// 「≤ target 最大 dts」落点错乱、其余轨前向恢复丢样例，此前不报错）。
+#[test]
+fn fmp4_tfdt_regression_rejected() {
+    fn s(d: u32) -> TrunS {
+        TrunS {
+            dur: Some(d),
+            size: Some(4),
+            flags: Some(0x0200_0000),
+            cts: Some(0),
+        }
+    }
+    // fragment 1：tfdt=0，两样例 dur=100 ⇒ 样例 dts [0, 100]。
+    let frag1 = |rel: i32| {
+        moof(&[
+            mfhd(1),
+            traf(&[
+                tfhd(7, 0x0002_0000, None, (None, None, None)),
+                tfdt(0, 0),
+                trun(0, &[s(100), s(100)], Some(rel), None),
+            ]),
+        ])
+    };
+    // fragment 2：tfdt=50 < 100 ⇒ dts 倒退。
+    let frag2 = |rel: i32| {
+        moof(&[
+            mfhd(2),
+            traf(&[
+                tfhd(7, 0x0002_0000, None, (None, None, None)),
+                tfdt(0, 50),
+                trun(0, &[s(100)], Some(rel), None),
+            ]),
+        ])
+    };
+    let f = layout(vec![
+        fixed(video_fmp4_moov(&[])),
+        moof_part(frag1),
+        fixed(mdat(&[0xA0, 0xA1, 0xA2, 0xA3])),
+        moof_part(frag2),
+        fixed(mdat(&[0xB0, 0xB1, 0xB2, 0xB3])),
+    ]);
+    match Mp4Reader::from_vec(f) {
+        Err(Mp4Error::Malformed { reason, .. }) => {
+            assert!(reason.contains("单调不减"), "reason={reason}");
+        }
+        other => panic!("应为 Malformed，实为 {other:?}"),
+    }
+}
+
+/// 无 moov/trak 的文件（合法 ftyp 头 + 纯 mdat）⇒ Malformed（回归：
+/// 2026-10-24 评审——此前返回 Ok(0 路流)，注册表 auto-probe 表现为
+/// 「打开成功但 0 流」的假成功，ye-cli probe 输出「xxx: mp4, 0 路流」）。
+#[test]
+fn fmp4_moovless_file_rejected() {
+    let mut f = Vec::new();
+    push(&mut f, &ftyp());
+    push(&mut f, &mdat(&[0xA0, 0xA1]));
+    match Mp4Reader::from_vec(f) {
+        Err(Mp4Error::Malformed { reason, .. }) => {
+            assert!(reason.contains("无 trak 轨道"), "reason={reason}");
+        }
+        other => panic!("应为 Malformed，实为 {other:?}"),
+    }
+}

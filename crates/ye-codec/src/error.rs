@@ -12,7 +12,7 @@ use crate::media::CodecId;
 /// - [`UnsupportedCodec`](Self::UnsupportedCodec)：注册表有工厂但该 codec
 ///   不被当前实现支持（如工厂按 feature 裁剪后收到禁用项）；
 /// - [`UnsupportedStub`](Self::UnsupportedStub)：接口桩调用——契约已定、
-///   实现随 M2/M4 里程碑交付（见 `stubs` 模块），文案含里程碑标注；
+///   实现随 M2/M3 里程碑交付（见 `stubs` 模块），文案含里程碑标注；
 /// - [`NotRegistered`](Self::NotRegistered)：注册表中根本没有该 codec 的工厂；
 /// - [`InvalidData`](Self::InvalidData)：码流数据不合法（来自文件/网络的输入，
 ///   一律 `Result`，绝不 panic）；
@@ -32,7 +32,7 @@ use crate::media::CodecId;
 pub enum CodecError {
     /// 该编解码器不受支持（有注册但被裁剪/拒绝）。
     UnsupportedCodec(CodecId),
-    /// 接口桩调用（实现随 M2/M4 里程碑交付），携带含里程碑标注的文案。
+    /// 接口桩调用（实现随 M2/M3 里程碑交付），携带含里程碑标注的文案。
     UnsupportedStub(&'static str),
     /// 该编解码器未在 [`crate::CodecRegistry`] 注册。
     NotRegistered(CodecId),
@@ -159,15 +159,15 @@ mod tests {
 
     #[test]
     fn display_unsupported_stub_contains_milestone() {
-        // 桩错误文案必须含里程碑标注（M2/M4 交付），供调用方与测试识别
+        // 桩错误文案必须含里程碑标注（M2/M3 交付），供调用方与测试识别
         let decode = CodecError::UnsupportedStub("h264 decode not implemented (桩：M2 交付)");
         assert_eq!(
             decode.to_string(),
             "unsupported stub: h264 decode not implemented (桩：M2 交付)"
         );
         assert!(decode.to_string().contains("桩：M2 交付"));
-        let encode = CodecError::UnsupportedStub("h264 encode not implemented (桩：M4 交付)");
-        assert!(encode.to_string().contains("桩：M4 交付"));
+        let encode = CodecError::UnsupportedStub("h264 encode not implemented (桩：M3 交付)");
+        assert!(encode.to_string().contains("桩：M3 交付"));
         // 无下层错误源
         assert!(std::error::Error::source(&decode).is_none());
     }

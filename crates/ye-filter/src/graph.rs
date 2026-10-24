@@ -3,8 +3,9 @@
 use crate::descriptor::FilterDescriptor;
 use crate::error::FilterError;
 
-/// 拓扑排序桩的失败文案（M4：处理图调度随合成导出交付）。
-const TOPOSORT_STUB_MSG: &str = "filter graph topological sort not implemented (桩：M4 交付)";
+/// 拓扑排序桩的失败文案（M3：处理图最小集随编码/转码里程碑交付，
+/// 见 roadmap.md「里程碑」现行排期）。
+const TOPOSORT_STUB_MSG: &str = "filter graph topological sort not implemented (桩：M3 交付)";
 
 /// 节点句柄（[`FilterGraph::add_filter`] 的返回值，即图内节点索引）。
 pub type NodeId = usize;
@@ -25,11 +26,12 @@ pub struct PadRef {
 
 /// 处理图（私有字段 + 访问器）：滤镜节点集合 + 垫到垫连线集合。
 ///
-/// ## 桩的语义边界（M4 交付前）
+/// ## 桩的语义边界（M3 交付前）
 ///
 /// - **可构造**：[`add_filter`](Self::add_filter) 追加节点并返回句柄，
-///   [`connect`](Self::connect) 真实记边（仅做节点/垫索引校验，不做
-///   去重与成环检测——随拓扑排序实现交付）；
+///   [`connect`](Self::connect) 真实记边（做节点/垫索引与**两侧垫媒体
+///   类型一致性**校验——均为静态契约，2026-10-24 评审补媒体类型；
+///   不做去重与成环检测——那需要拓扑排序，随其实现交付）；
 /// - **可查询**：`node_count`/`edge_count`/`filter`/`edges` 可完整读回
 ///   图结构；
 /// - **不可用**：[`topological_order`](Self::topological_order) 调用即
@@ -64,10 +66,19 @@ impl FilterGraph {
     /// 连一条垫到垫的边：`from` 为输出垫，`to` 为输入垫。
     ///
     /// # Errors
-    /// 节点句柄或垫索引越界 → [`FilterError::InvalidArguments`]。
+    /// 节点句柄或垫索引越界、或两侧垫的媒体类型不一致
+    /// （静态契约，2026-10-24 评审补——此前 video→audio 失配静默记边，
+    /// 错误推迟到拓扑排序实现才暴露）→ [`FilterError::InvalidArguments`]。
     pub fn connect(&mut self, from: PadRef, to: PadRef) -> Result<(), FilterError> {
         self.check_pad(from, PadSide::Output)?;
         self.check_pad(to, PadSide::Input)?;
+        let from_media = self.nodes[from.node].outputs[from.pad as usize].media;
+        let to_media = self.nodes[to.node].inputs[to.pad as usize].media;
+        if from_media != to_media {
+            return Err(FilterError::InvalidArguments(
+                "pad media type mismatch (output pad vs input pad)",
+            ));
+        }
         self.edges.push((from, to));
         Ok(())
     }
@@ -95,7 +106,7 @@ impl FilterGraph {
     /// 拓扑排序：返回依依赖序可执行的节点句柄序列。
     ///
     /// # Errors
-    /// **桩**：调用即 [`FilterError::Unsupported`]，文案注明 M4 交付
+    /// **桩**：调用即 [`FilterError::Unsupported`]，文案注明 M3 交付
     /// （成环报错等语义届时一并定义）。
     pub fn topological_order(&self) -> Result<Vec<NodeId>, FilterError> {
         Err(FilterError::Unsupported(TOPOSORT_STUB_MSG))
@@ -214,7 +225,7 @@ mod tests {
     // ---- 桩：拓扑排序调用即 Unsupported，文案含里程碑标注 ----
 
     #[test]
-    fn topological_order_is_stub_unsupported_with_m4_marker() {
+    fn topological_order_is_stub_unsupported_with_m3_marker() {
         let mut g = FilterGraph::new();
         let a = g.add_filter(video_filter("scale"));
         let b = g.add_filter(video_filter("format"));
@@ -223,7 +234,7 @@ mod tests {
 
         match g.topological_order() {
             Err(FilterError::Unsupported(msg)) => {
-                assert!(msg.contains("桩：M4 交付"), "msg missing milestone: {msg}");
+                assert!(msg.contains("桩：M3 交付"), "msg missing milestone: {msg}");
                 assert!(
                     msg.contains("topological sort"),
                     "msg missing capability name: {msg}"
@@ -234,7 +245,7 @@ mod tests {
         // Display 文案同样含里程碑标注
         let display = g.topological_order().unwrap_err().to_string();
         assert!(
-            display.contains("桩：M4 交付"),
+            display.contains("桩：M3 交付"),
             "display missing milestone: {display}"
         );
 
@@ -243,5 +254,49 @@ mod tests {
             FilterGraph::new().topological_order(),
             Err(FilterError::Unsupported(_))
         ));
+    }
+
+    // ---- connect 媒体类型一致性（2026-10-24 评审补）----
+
+    #[test]
+    fn connect_rejects_media_type_mismatch() {
+        let mut g = FilterGraph::new();
+        let video = g.add_filter(video_filter("scale"));
+        // 音频滤镜（单输入单输出 audio 垫）。
+        let audio = g.add_filter(FilterDescriptor {
+            name: "volume".to_string(),
+            inputs: vec![pad("default", MediaType::Audio)],
+            outputs: vec![pad("default", MediaType::Audio)],
+        });
+        // 同类相连合法。
+        g.connect(
+            PadRef { node: video, pad: 0 },
+            PadRef { node: video, pad: 0 },
+        )
+        .unwrap();
+        // video 输出 → audio 输入：媒体类型失配 ⇒ InvalidArguments，不记边。
+        let err = g.connect(
+            PadRef { node: video, pad: 0 },
+            PadRef { node: audio, pad: 0 },
+        );
+        assert_eq!(
+            err,
+            Err(FilterError::InvalidArguments(
+                "pad media type mismatch (output pad vs input pad)"
+            ))
+        );
+        // audio 输出 → video 输入同拒。
+        let err = g.connect(
+            PadRef { node: audio, pad: 0 },
+            PadRef { node: video, pad: 0 },
+        );
+        assert!(matches!(err, Err(FilterError::InvalidArguments(_))));
+        // audio→audio 合法（此时共 2 条边）。
+        g.connect(
+            PadRef { node: audio, pad: 0 },
+            PadRef { node: audio, pad: 0 },
+        )
+        .unwrap();
+        assert_eq!(g.edge_count(), 2);
     }
 }

@@ -12,8 +12,10 @@ use crate::{ContainerError, MediaHeader, ProbeScore, ReadSeek};
 /// - `read_packet` 产出的 [`Packet`] 必须已按对应 `Stream` 的 `time_base`
 ///   打戳并填好 `stream_index`（重标度语义落在 demuxer，不在调用方）；
 /// - EOF 后再读幂等返回 `Ok(None)`（不报错、不复活）；
-/// - `seek` 的 `target` 与返回值都以指定流的时基计，返回实际落到的
-///   **前一个关键帧**时刻。
+/// - `seek` 的 `target` 可为**任意时基**（实现内部精确比较，如 mp4 走
+///   `Timestamp::compare` i128 交叉相乘——调用方无需也不应先重标度到
+///   流时基，那只会平添一次可失败的换算），返回值为指定流的时基，
+///   是实际落到的**前一个关键帧**时刻。
 ///
 /// ## 线程安全
 ///
@@ -30,8 +32,8 @@ pub trait Demuxer: Send + Sync {
     /// 读下一个包；EOF 返回 `Ok(None)`（此后幂等）。
     fn read_packet(&mut self) -> Result<Option<Packet>, ContainerError>;
 
-    /// 定位到 `stream_index` 流时基下 `target` 时刻的前一个关键帧，
-    /// 返回实际落到的时刻（同流时基）。流不存在 →
+    /// 定位到 `target`（任意时基，实现内部精确比较）时刻的前一个
+    /// 关键帧，返回实际落到的时刻（指定流的时基）。流不存在 →
     /// `Err(ContainerError::StreamNotFound(..))`。
     fn seek(&mut self, stream_index: u32, target: Timestamp) -> Result<Timestamp, ContainerError>;
 }

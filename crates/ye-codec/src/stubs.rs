@@ -9,7 +9,9 @@
 //!   工厂）一律成功，返回 `codec_id()` 可查的桩对象——工厂不校验参数，
 //!   因为尚无真实的初始化语义可校验；
 //! - **不可用**：`feed`/`pull` 调用即返回 [`CodecError::UnsupportedStub`]，
-//!   文案注明交付里程碑（H.264/AAC 解码 → M2，编码 → M4）；
+//!   文案注明交付里程碑（H.264/AAC 解码 → M2，编码 → M3，现行排期见
+//!   roadmap.md「里程碑」一节；2026-10-24 评审对齐——编码原标 M4，
+//!   系按 roadmap 顶部已废弃的原始里程碑表）；
 //!   `flush` 为无操作（实现交付前状态机无意义）。
 //!
 //! 桩不持状态、不解析码流。真实实现按本 crate 约定以独立 crate
@@ -28,12 +30,14 @@ use crate::registry::CodecRegistry;
 
 /// H.264 解码桩的失败文案（M2：H.264 软件解码交付）。
 const H264_DECODE_MSG: &str = "h264 decode not implemented (桩：M2 交付)";
-/// H.264 编码桩的失败文案（M4：H.264 软件编码交付）。
-const H264_ENCODE_MSG: &str = "h264 encode not implemented (桩：M4 交付)";
+/// H.264 编码桩的失败文案（M3：H.264 软件编码交付，现行排期见
+/// roadmap.md「里程碑」一节）。
+const H264_ENCODE_MSG: &str = "h264 encode not implemented (桩：M3 交付)";
 /// AAC 解码桩的失败文案（M2：AAC-LC 解码交付）。
 const AAC_DECODE_MSG: &str = "aac decode not implemented (桩：M2 交付)";
-/// AAC 编码桩的失败文案（M4：AAC-LC 编码交付）。
-const AAC_ENCODE_MSG: &str = "aac encode not implemented (桩：M4 交付)";
+/// AAC 编码桩的失败文案（M3：AAC-LC 编码交付，现行排期见 roadmap.md
+/// 「里程碑」一节）。
+const AAC_ENCODE_MSG: &str = "aac encode not implemented (桩：M3 交付)";
 
 // ---- 桩类型（模块私有：构造只经工厂/注册表，无直接 new 的必要） ----
 
@@ -292,23 +296,23 @@ mod tests {
     // ---- 不可用：编码桩 feed/pull 一律 UnsupportedStub，文案含里程碑 ----
 
     #[test]
-    fn encoder_stubs_error_with_m4_marker() {
+    fn encoder_stubs_error_with_m3_marker() {
         let r = stub_registry();
         let frame = gray_frame();
 
         let mut h264 = r.create_encoder(&h264_encoder_config()).unwrap();
-        expect_stub_err(h264.feed(&frame), "桩：M4 交付", "h264");
-        expect_stub_err(h264.pull(), "桩：M4 交付", "h264");
+        expect_stub_err(h264.feed(&frame), "桩：M3 交付", "h264");
+        expect_stub_err(h264.pull(), "桩：M3 交付", "h264");
         let display = h264.feed(&frame).unwrap_err().to_string();
         assert!(
-            display.contains("桩：M4 交付"),
+            display.contains("桩：M3 交付"),
             "display missing milestone: {display}"
         );
 
         let mut aac = r.create_encoder(&aac_encoder_config()).unwrap();
         match aac.feed(&frame) {
             Err(CodecError::UnsupportedStub(msg)) => {
-                assert!(msg.contains("桩：M4 交付"), "msg missing milestone: {msg}");
+                assert!(msg.contains("桩：M3 交付"), "msg missing milestone: {msg}");
                 assert!(msg.contains("aac"), "msg missing codec name: {msg}");
             }
             other => panic!("expected UnsupportedStub, got {other:?}"),

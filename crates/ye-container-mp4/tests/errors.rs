@@ -170,28 +170,22 @@ fn invalid_stream_index() {
     }
 }
 
+/// 0 轨 moov（仅 mvhd）⇒ Malformed（2026-10-24 评审：此前返回 Ok +
+/// 0 路流——注册表 auto-probe 表现为「打开成功但 0 流」的假成功，
+/// ftyp 头合法的 HEIC 照片等会输出「xxx: mp4, 0 路流」而非报错）。
 #[test]
-fn empty_moov_gives_no_streams() {
+fn empty_moov_is_malformed() {
     let mut f = Vec::new();
     push(&mut f, &ftyp());
     push(&mut f, &wrap("moov", &[mvhd()]));
     push(&mut f, &r#box("mdat", &MDAT));
 
-    let mut r = Mp4Reader::from_vec(f).unwrap();
-    assert!(r.streams().is_empty());
-    assert!(r.stream(0).is_none());
-    match r.sample_count(0) {
-        Err(Mp4Error::InvalidStreamIndex { index, count }) => assert_eq!((index, count), (0, 0)),
-        other => panic!("应为 InvalidStreamIndex，实为 {other:?}"),
+    match Mp4Reader::from_vec(f) {
+        Err(Mp4Error::Malformed { reason, .. }) => {
+            assert!(reason.contains("无 trak 轨道"), "reason={reason}");
+        }
+        other => panic!("应为 Malformed，实为 {other:?}"),
     }
-    assert!(matches!(
-        r.read_packet(0, 0),
-        Err(Mp4Error::InvalidStreamIndex { .. })
-    ));
-    // 树结构照常可用。
-    assert_eq!(r.box_tree().len(), 3);
-    assert_eq!(r.box_tree()[1].info.kind.as_str(), "moov");
-    assert_eq!(r.box_tree()[1].children.len(), 1);
 }
 
 #[test]
