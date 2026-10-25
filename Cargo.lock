@@ -14,6 +14,7 @@ dependencies = [
  "ye-device",
  "ye-filter",
  "ye-pixfmt",
+ "ye-png",
  "ye-time",
 ]
 
@@ -98,6 +99,10 @@ dependencies = [
 
 [[package]]
 name = "ye-pixfmt"
+version = "0.1.0"
+
+[[package]]
+name = "ye-png"
 version = "0.1.0"
 
 [[package]]

@@ -1,0 +1,11 @@
+[package]
+name = "ye-png"
+description = "百工·冶：PNG 编码（encode-only）——自实现 deflate（stored/fixed-Huffman）+ CRC32，零第三方依赖"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 零第三方依赖（全库约定）：CRC32/Adler32/deflate/PNG 组包全部自实现，
+# 不含 unsafe。encode-only——本 crate 不提供解码（roundtrip 验证经
+# ffmpeg oracle 对拍，见 tests/oracle_png.rs）。

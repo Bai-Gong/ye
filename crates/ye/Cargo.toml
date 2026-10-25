@@ -15,6 +15,7 @@ ye-filter = { path = "../ye-filter" }
 ye-device = { path = "../ye-device" }
 ye-codec-h264 = { path = "../ye-codec-h264", optional = true }
 ye-codec-aac = { path = "../ye-codec-aac", optional = true }
+ye-png = { path = "../ye-png", optional = true }
 
 [features]
 default = ["mp4"]
@@ -37,5 +38,18 @@ h264 = ["dep:ye-codec-h264"]
 # packed f32 AudioFrame，时戳透传；含 register_aac 注册——取代
 # codec-stubs 中 AAC 解码桩的位置）。
 aac = ["dep:ye-codec-aac"]
+# 施工图④ M2：PNG 编码器（ye-png：encode-only，RGBA8 → PNG，自实现
+# deflate stored/fixed-Huffman + CRC32 + zlib 包装，零第三方依赖；
+# 行过滤 None/Sub 自适应）。剪的抽帧缩略图经此出口——re-export 在
+# src/png.rs。
+png = ["dep:ye-png"]
 codec-stubs = []
 filter-stubs = []
+
+[dev-dependencies]
+# convert 泵单测（tests/convert.rs）以 conformance 向量驱动真解码：
+# 泵本体只消费注入的 CodecRegistry（零依赖具体实现 crate），测试侧
+# 注册 h264/aac 真工厂——与 ye-codec-h264/-aac 各自的对拍测试同套路，
+# 仅存于测试编译单元，不进产品依赖面。
+ye-codec-h264 = { path = "../ye-codec-h264" }
+ye-codec-aac = { path = "../ye-codec-aac" }

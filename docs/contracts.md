@@ -487,43 +487,91 @@ PATH 无 ffmpeg/ffprobe 即整组跳过，临时文件全落
 `convert` 为占位桩（真转码 M3 落地）：调用即失败（退出码 1）、
 不产出输出文件——参数形态与进度/取消契约见下节。
 
-## 锻的最小 API 面（M3 接入契约，2026-10-24 定形）
+## 锻的最小 API 面（M3 接入契约，2026-10-24 定形；convert 2026-10-25 M2 增补）
 
 锻（duan）以 Tauri 后端 cargo 依赖接入，最小面 = `probe`（M1 已
-可用）/ `remux`（M1 已可用）/ `convert`（占位，M3 真转码）。调用
-形态两层：库层的 probe/convert 在 `ye_cli` lib（`ye-cli/src/lib.rs`），
-remux 在门面 `ye::container::remux`；CLI 子命令即同一契约的命令行
-形态（`main.rs` 为接入示范）。
+可用）/ `remux`（M1 已可用）/ `convert`（M2 骨架已落门面，M3 真转码）。
+调用形态三层：`probe` 在 `ye_cli` lib（`ye-cli/src/lib.rs`）；`remux`
+在门面 `ye::container::remux`；convert 泵在门面 `ye::convert`
+（`crates/ye/src/convert.rs`，施工图④a）——CLI 子命令即同一契约的
+命令行形态（`main.rs` 为接入示范；ye-cli 的 convert 子命令本阶段
+仍为旧桩，M3 CLI 接线时换调门面）。
 
 ```rust
 // ye_cli lib（ye-cli/src/lib.rs）
 pub fn probe(path: &Path) -> Result<String, String>;    // 报告文本（含末尾换行）
 pub fn convert(input: &Path, output: &Path,
                progress: ConvertProgress<'_>, cancel: &AtomicBool)
-    -> Result<String, String>;                          // 桩：调用即 Err
+    -> Result<String, String>;                          // 桩：调用即 Err（M3 CLI 接线换调门面）
 pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);    // (processed_us, total_us)
 
 // 门面（crates/ye/src/container/remux.rs）
 pub fn remux(registry: &ContainerRegistry, input: Box<dyn ReadSeek>,
              output_format: &str, output: Box<dyn WriteSeek>)
     -> Result<RemuxStats, ContainerError>;              // RemuxStats { streams, packets }
+
+// 门面 convert 泵（crates/ye/src/convert.rs，M2 骨架——无 feature 门：
+// 解码器经注入的 CodecRegistry 取得，泵本体不依赖具体实现 crate）
+pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);    // 同上，µs
+pub type PixelConvertFn = fn(&VideoFrame, PixelFormat) -> Result<VideoFrame, ConvertError>;
+pub type ScaleFn = fn(&VideoFrame, u32, u32) -> Result<VideoFrame, ConvertError>;
+pub struct PixelOps { pub convert: PixelConvertFn, pub scale: ScaleFn }  // 像素核槽（注入）
+pub struct VideoChain { pub format: Option<PixelFormat>, pub size: Option<(u32, u32)> }
+pub fn convert_frames(containers: &ContainerRegistry, codecs: &CodecRegistry,
+                      input: Box<dyn ReadSeek>, chain: VideoChain, pixels: PixelOps,
+                      sink: &mut dyn FnMut(Frame) -> Result<(), ConvertError>,
+                      progress: ConvertProgress<'_>, cancel: &AtomicBool)
+    -> Result<ConvertStats, ConvertError>;
+    // 帧消费模式（M2 主路径）：固定链 解码→像素转换→scale→帧回调
+pub fn convert(input: Box<dyn ReadSeek>, output: Box<dyn WriteSeek>,
+               progress: ConvertProgress<'_>, cancel: &AtomicBool)
+    -> Result<ConvertStats, ConvertError>;
+    // 编码模式（M3 真转码）：M2 编码槽 Unsupported 桩，调用即 Err、
+    // 不消费输入、不写输出、不触发回调；参数形态 M3 接编码器时定形
+pub struct ConvertStats { pub streams: usize, pub video_frames: u64,
+                          pub audio_frames: u64, pub processed_us: i64, pub total_us: i64 }
+pub enum ConvertError { Cancelled, UnsupportedStub(&'static str), Sink(String),
+                        InvalidArguments(String), Container(ContainerError),
+                        Codec(CodecError), Time(TimeError) }
 ```
+
+**固定链序（M2）**：视频帧出解码器后依次过「像素转换槽 → scale 槽」
+（目标与现状相同的环跳过、不调核），音频帧解码后直通；编码槽在链尾，
+M2 为明确 Unsupported 桩（`ENCODE_SLOT_STUB` 文案：编码器随施工图⑤⑥
+交付）。通用图调度（`FilterGraph::topological_order`）归施工图⑦，
+泵不做图编排。**对拍口径注意**：链序为 转换在前 scale 在后，与
+ffmpeg 惯用 `-vf scale=W:H,format=rgba`（scale 在前）相反——E2E
+对拍（剪抽帧）的容差须覆盖该序差异，或参考侧改用
+`-vf format=rgba,scale=W:H`（像素值序换位不同，见施工图④ verification）。
+
+**像素核槽（注入消费）**：转换/scale 的核是注入的纯函数
+（`PixelOps`），核本体在 `ye-filter/src/video/`（施工图④(b)，
+并行交付）——泵只认函数签名、不依赖核的模块路径，核落地前后泵均
+编译；接线点在门面侧（签名以核的模块文档为准）。剪（jian）的
+`extract_frame`/波形与单测（`crates/ye/tests/convert.rs`，以
+conformance 向量驱动：帧数/时戳推进/取消点/进度单调）均走
+`convert_frames`。
 
 **进度约定**：`(processed_us, total_us)` —— 已处理/总时长，**微秒**；
 与锻现有 `transcode-progress` 事件负载 `{jobId, timeUs, totalUs}` 同源
 （`timeUs`/`totalUs` 直传回调值）。jobId 路由与 ≥100ms 节流归锻侧
-（Tauri 事件层），ye 只提供进程内的每任务回调；M3 的转码循环逐包/
-逐帧上报。CLI 形态即示范：回调打 stderr，命令行无交互取消入口时
-旗标恒 false。
+（Tauri 事件层），ye 只提供进程内的每任务回调。M2 泵（2026-10-25
+增补）：**逐帧上报**（帧过完链后）；`processed_us` 单调不减（跨流
+取各流已处理时长的最大值，帧缺 pts 时该帧不推进）；`total_us` 取
+流时长（µs，缺时长 → 0）。CLI 形态即示范：回调打 stderr，命令行无
+交互取消入口时旗标恒 false。
 
 **取消约定**：`cancel: &AtomicBool` 进程内取消旗标——锻侧置位即请求
-取消，M3 的转码循环逐包检查、及时退出并清理半成品；进程内等价于
-旧方案的 kill 子进程。
+取消，M2 泵**每包检查点**（读出一包后立即检查，入口亦查），置位即
+返回 `ConvertError::Cancelled`；进程内等价于旧方案的 kill 子进程。
+M3 编码模式落地后补「清理半成品」。
 
-**convert 桩行为**（现行）：调用即返回 `CONVERT_STUB_ERROR`（固定
-文案，含「convert 真转码在 M3 落地」与参数形态摘要），**不触碰输入
-输出文件**——二进制测试断言不产出文件、不触发进度回调
-（`ye-cli/tests/probe.rs`）。
+**convert 桩行为**（现行）：门面 `ye::convert::convert` 调用即返回
+`ConvertError::UnsupportedStub(ENCODE_SLOT_STUB)`（文案含「编码器随
+施工图⑤⑥交付」），**不消费输入、不写输出、不触发进度回调**（回归
+`crates/ye/tests/convert.rs::encode_slot_is_explicit_unsupported_stub`）；
+ye-cli 子命令层维持 M1 的 `CONVERT_STUB_ERROR` 桩（不产出文件、不
+触发进度回调，`ye-cli/tests/probe.rs`），M3 CLI 接线时换调门面泵。
 
 **probe 的帧率口径**（仅视频轨）：`样例数 ÷ 时长（秒）` 近似——
 恒帧率（CFR）文件准确，可变帧率（VFR）文件有偏差（逐帧时长不均时
