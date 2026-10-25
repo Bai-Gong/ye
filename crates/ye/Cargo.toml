@@ -13,6 +13,7 @@ ye-container = { path = "../ye-container" }
 ye-container-mp4 = { path = "../ye-container-mp4", optional = true }
 ye-filter = { path = "../ye-filter" }
 ye-device = { path = "../ye-device" }
+ye-codec-h264 = { path = "../ye-codec-h264", optional = true }
 
 [features]
 default = ["mp4"]
@@ -27,5 +28,9 @@ mp4 = ["dep:ye-container-mp4"]
 # 「本构建依赖桩」记进依赖声明（防桩悄悄进产品路径）；真实现 crate
 # （ye-codec-h264 等）落地后由其 feature 取代。语义边界见
 # docs/contracts.md「M2+ 接口桩契约」。
+# 施工图②a：H.264 解码主链 I 帧闭环（ye-codec-h264：CAVLC 残差 →
+# 反量化/反变换 → 帧内预测 → yuv420p 输出）。真实现落地后取代
+# codec-stubs 里对应桩的注册位。
+h264 = ["dep:ye-codec-h264"]
 codec-stubs = []
 filter-stubs = []

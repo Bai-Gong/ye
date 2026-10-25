@@ -24,6 +24,7 @@
 
 pub mod compare;
 pub mod manifest;
+pub mod nalalign;
 pub mod report;
 pub mod sha256;
 pub mod tolerance;

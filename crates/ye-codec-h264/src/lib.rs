@@ -35,11 +35,18 @@
 #![allow(clippy::module_name_repetitions)] // Sps/Pps 与模块名同段是 H.264 术语，保留
 
 mod bitreader;
+mod cavlc;
+mod deblock;
+mod decoder;
 mod error;
+mod macroblock;
+mod mc;
 mod nal;
+mod slice;
 mod sps;
 
 pub use bitreader::BitReader;
+pub use decoder::{H264Decoder, decoder_factory};
 pub use error::H264Error;
 pub use nal::{
     AvcConfigRecord, NalCategory, NalHeader, annexb_to_avcc, avcc_to_annexb,

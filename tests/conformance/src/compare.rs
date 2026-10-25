@@ -4,6 +4,11 @@
 //! 输出逐平面的 max-abs 与 PSNR（YUV）、逐样本 max-abs（PCM），
 //! 是否放行由 [`crate::tolerance`] 的口径判定——比较器只量尺子，
 //! 不做裁决。
+//!
+//! 施工图②增补**逐帧对拍模式**（[`diff_yuv_frames`]）：首差帧/首差
+//! 宏块位置/max-abs 的定位报告（失败归档四元组的载体，归档行见
+//! [`FrameDiffReport::archive_lines`]），容差裁决在
+//! [`crate::tolerance::Tolerance::check_yuv_frames`]。
 
 /// 色度采样（决定平面尺寸）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +33,238 @@ impl ChromaSampling {
             ChromaSampling::Yuv444 => vec![width * height; 3],
         }
     }
+}
+
+/// 逐帧对拍的单个差异样本定位（失败归档用）。
+///
+/// 坐标为**所在平面**的采样网格坐标（420 色度平面即 w/2×h/2 网格）；
+/// 亮度宏块换算见 [`FrameDiffReport::first_diff_mb`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleSpot {
+    /// 帧号（0 起）。
+    pub frame: usize,
+    /// 平面（0=Y 1=Cb 2=Cr）。
+    pub plane: usize,
+    /// 平面内列。
+    pub x: usize,
+    /// 平面内行。
+    pub y: usize,
+    /// 该样本的 |Δ|。
+    pub abs_diff: u32,
+}
+
+/// 逐帧对拍报告：只量尺子（哪里差、差多少），裁决在
+/// [`crate::tolerance::Tolerance::check_yuv_frames`]。
+///
+/// 施工图②失败归档四元组「向量名/首差帧/首差宏块位置/max-abs」由
+/// 本报告 + [`FrameDiffReport::archive_lines`] 提供（向量名由 runner
+/// 前置）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameDiffReport {
+    /// 帧数（两侧较短侧的整帧数；长度不整除 → `diff_yuv_frames` Err）。
+    pub frames: usize,
+    /// 显示宽（像素）。
+    pub width: usize,
+    /// 显示高（像素）。
+    pub height: usize,
+    /// 每帧样本数（全平面合计）。
+    pub frame_samples: usize,
+    /// 首个含差异样本的帧号（`None` = 逐位一致）。
+    pub first_diff_frame: Option<usize>,
+    /// 首个差异样本（与 `first_diff_frame` 同帧）。
+    pub first_diff: Option<SampleSpot>,
+    /// 全程最大绝对差（0 = 逐位一致）。
+    pub max_abs: u32,
+    /// `max_abs` 的首个出现位置。
+    pub max_abs_at: Option<SampleSpot>,
+    /// 每帧差异样本数（Δ≠0 的样本个数，按帧索引）。
+    pub frame_diff_counts: Vec<u64>,
+}
+
+impl FrameDiffReport {
+    /// 平面名（Y/Cb/Cr；单色只有 Y）。
+    fn plane_name(plane: usize) -> &'static str {
+        match plane {
+            0 => "Y",
+            1 => "Cb",
+            2 => "Cr",
+            _ => "?",
+        }
+    }
+
+    /// 样本位置的人类可读串（含 |Δ|）。
+    pub fn spot_str(spot: &SampleSpot) -> String {
+        format!(
+            "frame={} plane={} x={} y={} |Δ|={}",
+            spot.frame,
+            Self::plane_name(spot.plane),
+            spot.x,
+            spot.y,
+            spot.abs_diff
+        )
+    }
+
+    /// 首差样本的宏块位置（16×16 亮度网格，施工图②归档字段）：色度
+    /// 平面样本按采样比换算回亮度坐标后取整除 16（420：×2；422：x×2；
+    /// 444/单色：×1）。
+    ///
+    /// # Errors
+    /// 尚无差异（`first_diff` 为 None）→ `Err`。
+    pub fn first_diff_mb(&self, chroma: ChromaSampling) -> Result<(usize, usize), String> {
+        let Some(spot) = self.first_diff else {
+            return Err("无差异样本，无宏块位置".into());
+        };
+        let (sx, sy) = plane_sample_scale(chroma, spot.plane);
+        Ok(((spot.x * sx) / 16, (spot.y * sy) / 16))
+    }
+
+    /// 失败归档行（施工图②格式：首差帧/首差宏块位置/max-abs；向量名
+    /// 与容差判据行由 runner 拼入）。
+    #[must_use]
+    pub fn archive_lines(&self, chroma: ChromaSampling) -> Vec<String> {
+        let mut lines = Vec::new();
+        match (self.first_diff_frame, self.first_diff) {
+            (Some(f), Some(spot)) => {
+                lines.push(format!(
+                    "first_diff_frame={} ({}，首差样本)",
+                    f,
+                    Self::spot_str(&spot)
+                ));
+                if let Ok((mbx, mby)) = self.first_diff_mb(chroma) {
+                    lines.push(format!("first_diff_mb=({mbx},{mby}) (16×16 亮度宏块网格)"));
+                }
+            }
+            _ => lines.push("first_diff_frame=none (逐位一致)".into()),
+        }
+        lines.push(format!(
+            "max_abs={} ({})",
+            self.max_abs,
+            self.max_abs_at
+                .as_ref()
+                .map(Self::spot_str)
+                .unwrap_or_else(|| "无差异".into())
+        ));
+        lines.push(format!(
+            "frames={} ({}x{} yuv420p 口径, 每帧 {} 样本)",
+            self.frames, self.width, self.height, self.frame_samples
+        ));
+        lines
+    }
+}
+
+/// 平面样本坐标 → 亮度坐标的倍率（平面, 采样）→ (x 倍率, y 倍率)。
+fn plane_sample_scale(chroma: ChromaSampling, plane: usize) -> (usize, usize) {
+    match (chroma, plane) {
+        (ChromaSampling::Yuv420, 1 | 2) => (2, 2),
+        (ChromaSampling::Yuv422, 1 | 2) => (2, 1),
+        _ => (1, 1),
+    }
+}
+
+/// 逐平面网格 `[(宽, 高); n]`（行紧排无 padding，与 rawvideo 一致）。
+fn plane_grids(chroma: ChromaSampling, width: usize, height: usize) -> Vec<(usize, usize)> {
+    match chroma {
+        ChromaSampling::Monochrome => vec![(width, height)],
+        ChromaSampling::Yuv420 => {
+            vec![
+                (width, height),
+                (width / 2, height / 2),
+                (width / 2, height / 2),
+            ]
+        }
+        ChromaSampling::Yuv422 => vec![(width, height), (width / 2, height), (width / 2, height)],
+        ChromaSampling::Yuv444 => vec![(width, height); 3],
+    }
+}
+
+/// 逐帧比较两份 planar YUV（长度须相等且为整帧的整数倍），产出定位
+/// 报告（不做容差裁决）。布局不符 → `Err`。
+///
+/// 与 [`compare_yuv`] 的关系：后者是整缓冲的总量统计（PSNR 等），
+/// 本函数面向**逐帧对拍模式**——首差帧/首差宏块定位是失败归档的
+/// 硬需求，整缓冲统计给不出来。
+pub fn diff_yuv_frames(
+    ours: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    chroma: ChromaSampling,
+) -> Result<FrameDiffReport, String> {
+    if width == 0 || height == 0 {
+        return Err("diff_yuv_frames: 零尺寸".into());
+    }
+    let grids = plane_grids(chroma, width, height);
+    let frame_len: usize = grids.iter().map(|&(w, h)| w * h).sum();
+    if frame_len == 0
+        || !ours.len().is_multiple_of(frame_len)
+        || !reference.len().is_multiple_of(frame_len)
+    {
+        return Err(format!(
+            "diff_yuv_frames: 缓冲长度 {}/{} 与帧长 {frame_len} 不符（显示尺寸 {width}x{height}）",
+            ours.len(),
+            reference.len()
+        ));
+    }
+    if ours.len() != reference.len() {
+        return Err(format!(
+            "diff_yuv_frames: 长度不等（我方 {} 字节 = {} 帧，参考 {} 字节 = {} 帧）",
+            ours.len(),
+            ours.len() / frame_len,
+            reference.len(),
+            reference.len() / frame_len
+        ));
+    }
+    let frames = ours.len() / frame_len;
+    let frame_samples = frame_len;
+    let mut report = FrameDiffReport {
+        frames,
+        width,
+        height,
+        frame_samples,
+        first_diff_frame: None,
+        first_diff: None,
+        max_abs: 0,
+        max_abs_at: None,
+        frame_diff_counts: vec![0; frames],
+    };
+    for f in 0..frames {
+        let base = f * frame_len;
+        let mut off = 0usize;
+        for (p, &(gw, gh)) in grids.iter().enumerate() {
+            for y in 0..gh {
+                let row = base + off + y * gw;
+                for x in 0..gw {
+                    let d = u32::from(ours[row + x].abs_diff(reference[row + x]));
+                    if d == 0 {
+                        continue;
+                    }
+                    report.frame_diff_counts[f] += 1;
+                    if report.first_diff.is_none() {
+                        report.first_diff_frame = Some(f);
+                        report.first_diff = Some(SampleSpot {
+                            frame: f,
+                            plane: p,
+                            x,
+                            y,
+                            abs_diff: d,
+                        });
+                    }
+                    if d > report.max_abs {
+                        report.max_abs = d;
+                        report.max_abs_at = Some(SampleSpot {
+                            frame: f,
+                            plane: p,
+                            x,
+                            y,
+                            abs_diff: d,
+                        });
+                    }
+                }
+            }
+            off += gw * gh;
+        }
+    }
+    Ok(report)
 }
 
 /// YUV 对拍结果（逐平面）。
@@ -242,5 +479,113 @@ mod tests {
         assert!(compare_pcm(&[0; 4], &[0; 4], 5).is_err());
         assert!(compare_pcm(&[0; 4], &[0; 5], 2).is_err());
         assert!(compare_pcm(&[0; 3], &[0; 3], 2).is_err());
+    }
+
+    // —— 逐帧对拍模式（施工图②）：定位报告与归档字段 ——
+
+    /// 4×4 420：帧长 24（Y 4×4 + Cb 2×2 + Cr 2×2），平面偏移 Y=0、
+    /// Cb=16、Cr=20。
+    #[test]
+    fn frame_diff_spots_and_archive() {
+        let frame = [50u8; 24];
+        let both: Vec<u8> = frame.iter().chain(frame.iter()).cloned().collect();
+        // 完全一致
+        let r = diff_yuv_frames(&both, &both, 4, 4, ChromaSampling::Yuv420).unwrap();
+        assert_eq!(r.frames, 2);
+        assert_eq!(r.first_diff_frame, None);
+        assert_eq!(r.max_abs, 0);
+        assert_eq!(r.frame_diff_counts, vec![0, 0]);
+        // 帧 1 的 Cb 平面 (x=1,y=1)：偏移 16 + 1*2 + 1 = 19，+3
+        let mut ours = both.clone();
+        ours[24 + 19] += 3;
+        // 帧 1 的 Y 平面 (x=0,y=0)：偏移 0，−1（回绕按字节差 1）
+        ours[24] -= 1;
+        let r = diff_yuv_frames(&ours, &both, 4, 4, ChromaSampling::Yuv420).unwrap();
+        assert_eq!(r.first_diff_frame, Some(1));
+        assert_eq!(
+            r.first_diff,
+            Some(SampleSpot {
+                frame: 1,
+                plane: 0,
+                x: 0,
+                y: 0,
+                abs_diff: 1
+            })
+        );
+        assert_eq!(r.max_abs, 3);
+        assert_eq!(
+            r.max_abs_at,
+            Some(SampleSpot {
+                frame: 1,
+                plane: 1,
+                x: 1,
+                y: 1,
+                abs_diff: 3
+            })
+        );
+        assert_eq!(r.frame_diff_counts, vec![0, 2]);
+        // 归档行：首差帧/宏块/max-abs 四元组（向量名由 runner 拼）
+        let lines = r.archive_lines(ChromaSampling::Yuv420);
+        assert!(lines[0].contains("first_diff_frame=1"), "{lines:?}");
+        // Cb(1,1) → 亮度坐标 (2,2) → 宏块 (0,0)——4×4 帧只有 1 个宏块
+        assert!(lines[1].contains("first_diff_mb=(0,0)"), "{lines:?}");
+        assert!(lines[2].contains("max_abs=3"), "{lines:?}");
+    }
+
+    /// 色度样本 → 亮度宏块换算：640×360 帧 Y(x=100,y=50) → mb=(6,3)；
+    /// Cb(x=10,y=5) → 亮度 (20,10) → mb=(1,0)。
+    #[test]
+    fn mb_conversion_from_chroma() {
+        let mut spot = SampleSpot {
+            frame: 0,
+            plane: 0,
+            x: 100,
+            y: 50,
+            abs_diff: 1,
+        };
+        let r = FrameDiffReport {
+            frames: 1,
+            width: 640,
+            height: 360,
+            frame_samples: 345_600,
+            first_diff_frame: Some(0),
+            first_diff: Some(spot),
+            max_abs: 1,
+            max_abs_at: Some(spot),
+            frame_diff_counts: vec![1],
+        };
+        assert_eq!(r.first_diff_mb(ChromaSampling::Yuv420).unwrap(), (6, 3));
+        spot.plane = 1;
+        spot.x = 10;
+        spot.y = 5;
+        let r = FrameDiffReport {
+            first_diff: Some(spot),
+            ..r
+        };
+        assert_eq!(r.first_diff_mb(ChromaSampling::Yuv420).unwrap(), (1, 0));
+        assert!(r.first_diff_mb(ChromaSampling::Yuv420).is_ok());
+        // 无差异 → Err
+        let clean = FrameDiffReport {
+            frames: 1,
+            width: 4,
+            height: 4,
+            frame_samples: 24,
+            first_diff_frame: None,
+            first_diff: None,
+            max_abs: 0,
+            max_abs_at: None,
+            frame_diff_counts: vec![0],
+        };
+        assert!(clean.first_diff_mb(ChromaSampling::Yuv420).is_err());
+    }
+
+    /// 布局不符（长度不整除 / 不等）→ Err；420 与整缓冲版帧长一致。
+    #[test]
+    fn frame_diff_rejects_bad_layout() {
+        let a = vec![0u8; 48];
+        assert!(diff_yuv_frames(&a, &a, 4, 4, ChromaSampling::Yuv420).is_ok());
+        assert!(diff_yuv_frames(&a[..24], &a, 4, 4, ChromaSampling::Yuv420).is_err());
+        assert!(diff_yuv_frames(&a[..40], &a[..40], 4, 4, ChromaSampling::Yuv420).is_err());
+        assert!(diff_yuv_frames(&a, &a, 0, 4, ChromaSampling::Yuv420).is_err());
     }
 }

@@ -18,10 +18,15 @@
 //! name = "h264-testsrc2-176x144"        # 缓存文件名主干（缓存文件 = name.container）
 //! codec = "h264"
 //! container = "mp4"
+//! set = "intra"                         # 可选：集标签（施工图②子阶段选通，见 runner --set）
 //! generate = "ffmpeg -y … {OUT}"         # {OUT} 由获取脚本替换为缓存路径
 //! ffmpeg_version = "ffmpeg version N-…（ffmpeg -version 首行）"
 //! sha256 = "64 位小写十六进制（只准实测）"
 //! ```
+//!
+//! 集标签（2026-10-24 施工图②增补）：`intra` = ②a 纯 I 集（`-g 1`，
+//! 即被本机 ffmpeg 移除的 `-intra` 的等价形式）；`ip` = ②b I/P 混合集；
+//! **不带 `set` 的既有 v1 条目 = 全集**（②c 跑全集 = 不加 `--set`）。
 //!
 //! 待网络清册（**不参与** ran/skipped 计数与终验断言，摘要行另落
 //! `pending=K`；网络恢复后实测 sha256 并升入 [[vector]]）：
@@ -44,6 +49,8 @@ pub struct VectorEntry {
     pub codec: String,
     /// 容器（缓存文件扩展名，如 "mp4"）。
     pub container: String,
+    /// 集标签（施工图②子阶段选通：intra/ip；None = v1 全集）。
+    pub set: Option<String>,
     /// 下载地址（与 `generate` 二选一）。
     pub source: Option<String>,
     /// 生成配方（完整 ffmpeg 命令行，`{OUT}` 为缓存路径占位）。
@@ -83,7 +90,7 @@ pub struct Manifest {
 /// 就位集必填键。
 const REQUIRED: [&str; 4] = ["name", "codec", "container", "sha256"];
 /// 就位集可选键。
-const OPTIONAL: [&str; 3] = ["source", "generate", "ffmpeg_version"];
+const OPTIONAL: [&str; 4] = ["set", "source", "generate", "ffmpeg_version"];
 /// 清册必填键。
 const PENDING_REQUIRED: [&str; 2] = ["name", "source"];
 /// 清册可选键。
@@ -171,6 +178,7 @@ fn take_vector(fields: &[(String, String)]) -> Result<VectorEntry, String> {
         name: f.get("name").unwrap_or("").to_string(),
         codec: f.get("codec").unwrap_or("").to_string(),
         container: f.get("container").unwrap_or("").to_string(),
+        set: f.get("set").map(str::to_string),
         source,
         generate,
         ffmpeg_version,
@@ -331,6 +339,7 @@ mod tests {
         );
         assert_eq!(m.vectors[0].source, None);
         assert!(m.vectors[0].ffmpeg_version.is_some());
+        assert_eq!(m.vectors[0].set, None);
         assert_eq!(m.vectors[1].name, "dl");
         assert_eq!(
             m.vectors[1].source.as_deref(),
@@ -404,5 +413,24 @@ mod tests {
         .unwrap();
         assert_eq!(p.pending.len(), 1);
         assert!(p.vectors.is_empty());
+    }
+
+    /// 施工图②集标签：可选键 `set`（intra/ip）；不带 = 全集（None）。
+    #[test]
+    fn set_tag_is_optional_and_parsed() {
+        let with = format!(
+            "manifest_version = 1\n\n{}",
+            generated_vector("intra-1").replacen(
+                "container = \"mp4\"\n",
+                "container = \"mp4\"\nset = \"intra\"\n",
+                1,
+            )
+        );
+        let m = Manifest::parse(&with).unwrap();
+        assert_eq!(m.vectors[0].set.as_deref(), Some("intra"));
+        // 不带 set → None（v1 全集语义）
+        let plain = format!("manifest_version = 1\n\n{}", generated_vector("plain"));
+        let m = Manifest::parse(&plain).unwrap();
+        assert_eq!(m.vectors[0].set, None);
     }
 }

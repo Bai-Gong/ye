@@ -3,31 +3,44 @@
 //! 用法：
 //!
 //! ```text
-//! cargo run -p ye-conformance [--manifest PATH] [--cache DIR]
+//! cargo run -p ye-conformance [--manifest PATH] [--cache DIR] [--set NAME]
 //! ```
 //!
 //! 默认清单 = 本 crate 目录的 `manifest.toml`；默认缓存 =
 //! `$YE_CONFORMANCE_CACHE` 或本 crate 目录的 `.cache/`（git 忽略）。
+//! `--set intra|ip|all` 按清单 `set` 标签选通子阶段集（施工图②：
+//! ②a 纯 I 集 / ②b I/P 混合集；不带 `--set` 或 `all` = 全集 = ②c）。
 //! 退出码：0 = 无失败（skip 合法）；1 = 有对拍失败；2 = 用法/清单错误。
 //!
-//! 施工图①的 h264 口径：
+//! h264 口径（施工图①码流层 + 施工图②逐帧）：
 //! - NAL 序列：`ffmpeg -i <vec> -map 0:v:0 -c:v copy -bsf:v
 //!   h264_mp4toannexb -f h264 ref.264` 提取的 NAL 序列与我方
 //!   （ye-container-mp4 解 AVCC + ye-codec-h264 拆包）一致；
 //! - SPS 字段：avcC 内 SPS 解析的 profile/level/width/height 与
-//!   `ffprobe -show_entries stream=profile,level,width,height` 逐项相等。
+//!   `ffprobe -show_entries stream=profile,level,width,height` 逐项相等；
+//! - 逐帧 YUV（施工图②）：`ffmpeg -i <vec> -pix_fmt yuv420p -f rawvideo
+//!   ref.yuv` 的参考帧序列 vs 我方解码输出 `<cache>/<name>.our.yuv`
+//!   （显示尺寸 yuv420p 平面布局）。我方文件**缺席时本口径不参与
+//!   pass/fail**（打 NOTE，②a/②b 解码接线后生成该文件即自动加入）；
+//!   在场则按 [`ye_conformance::tolerance`] 的施工图②容差裁决，失败
+//!   落归档 `<cache>/failures/<name>.fail.txt`（向量名/首差帧/首差
+//!   宏块位置/max-abs），通过时清除旧归档。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use ye_codec_h264::{AvcConfigRecord, Sps, split_annexb, split_avcc};
-use ye_conformance::manifest::Manifest;
+use ye_conformance::compare::{self, ChromaSampling, FrameDiffReport};
+use ye_conformance::manifest::{Manifest, VectorEntry};
+use ye_conformance::nalalign::{
+    align_parameter_sets, first_nal_diff, nal_type, trim_trailing_zeros,
+};
 use ye_conformance::report::{Outcome, Report};
 use ye_conformance::sha256::sha256_hex;
-use ye_conformance::tolerance;
+use ye_conformance::tolerance::{self, Tolerance};
 
 fn main() {
-    let (manifest_path, cache_dir) = match parse_args() {
+    let (manifest_path, cache_dir, set_filter) = match parse_args() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("ye: {msg}");
@@ -48,17 +61,64 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // 集选通（施工图②子阶段门禁）：--set intra/ip 只跑对应标签的向量，
+    // 缺 set 标签的 v1 条目只在全集（不带 --set / --set all）里跑。
+    // 选通不是 skip：选掉的向量不进摘要行计数，运行头行明示选择面。
+    let set_name = set_filter.as_deref().unwrap_or("all");
+    let selected: Vec<&VectorEntry> = match set_filter.as_deref() {
+        None | Some("all") => manifest.vectors.iter().collect(),
+        Some(s) => manifest
+            .vectors
+            .iter()
+            .filter(|v| v.set.as_deref() == Some(s))
+            .collect(),
+    };
+    let mut known_sets: Vec<&str> = manifest
+        .vectors
+        .iter()
+        .filter_map(|v| v.set.as_deref())
+        .collect();
+    known_sets.sort_unstable();
+    known_sets.dedup();
     println!(
-        "conformance: manifest={} vectors={} cache={}",
+        "conformance: manifest={} set={} selected={}/{} cache={}",
         manifest_path.display(),
+        set_name,
+        selected.len(),
         manifest.vectors.len(),
         cache_dir.display()
     );
+    if !matches!(set_filter.as_deref(), None | Some("all")) && selected.is_empty() {
+        // 门禁安全（2026-10-24 施工图②）：②a/②b 过界断言依赖
+        // 「某集全部对拍过」——拼错集名选中 0 条若静默退出 0，门禁会
+        // 假绿。按用法错误退出 2，强制把集名改对。
+        let sets_list = if known_sets.is_empty() {
+            "<无>".to_string()
+        } else {
+            known_sets.join("/")
+        };
+        eprintln!(
+            "ye: --set {set_name} 选中 0 条（清单可用的集标签：{sets_list}；缺 set 键 = v1 全集）"
+        );
+        std::process::exit(2);
+    }
     println!("tolerance ({})", tolerance::POLICY_NOTE);
     for codec in unique_codecs(&manifest) {
         for t in tolerance::tolerances(&codec) {
-            let tolerance::Tolerance::BitExact { dimension } = t;
-            println!("  {codec}: bit-exact [{dimension}]");
+            match t {
+                Tolerance::BitExact { dimension } => {
+                    println!("  {codec}: bit-exact [{dimension}]");
+                }
+                Tolerance::MaxAbs {
+                    dimension,
+                    max_abs,
+                    zero_ratio_permille_min,
+                } => {
+                    println!(
+                        "  {codec}: 全样本|Δ|≤{max_abs} 且每帧 Δ=0 ≥{zero_ratio_permille_min}‰ [{dimension}]"
+                    );
+                }
+            }
         }
     }
 
@@ -83,7 +143,7 @@ fn main() {
         outcomes: Vec::new(),
         pending: manifest.pending.len(),
     };
-    for entry in &manifest.vectors {
+    for entry in &selected {
         let vec_path = Path::new(&cache_dir).join(format!("{}.{}", entry.name, entry.container));
         // 1) 缓存与 sha 对账（裁决：sha 不匹配**不当 skip**——文件在就照跑，
         //    sha_ok=false 落摘要行。sha 漂移（如换 ffmpeg 重生成）是信号，
@@ -141,7 +201,7 @@ fn main() {
         }
         // 4) 分派对拍
         let result = match entry.codec.as_str() {
-            "h264" => h264_run(&entry.name, &vec_path, &data),
+            "h264" => h264_run(&entry.name, &vec_path, &data, &cache_dir),
             other => Err(format!("codec {other} 已声明容差但 runner 未接线")),
         };
         match result {
@@ -182,8 +242,9 @@ fn main() {
     }
 }
 
-/// 解析命令行：`--manifest PATH` / `--cache DIR`（可重复，后写覆盖）。
-fn parse_args() -> Result<(PathBuf, PathBuf), String> {
+/// 解析命令行：`--manifest PATH` / `--cache DIR` / `--set NAME`
+/// （可重复，后写覆盖）。
+fn parse_args() -> Result<(PathBuf, PathBuf, Option<String>), String> {
     let manifest_default = PathBuf::from(format!("{}/manifest.toml", env!("CARGO_MANIFEST_DIR")));
     let cache_default = std::env::var("YE_CONFORMANCE_CACHE")
         .map(PathBuf::from)
@@ -191,6 +252,7 @@ fn parse_args() -> Result<(PathBuf, PathBuf), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut manifest = manifest_default;
     let mut cache = cache_default;
+    let mut set: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -208,14 +270,21 @@ fn parse_args() -> Result<(PathBuf, PathBuf), String> {
                 cache = PathBuf::from(v);
                 i += 2;
             }
+            "--set" => {
+                let Some(v) = args.get(i + 1) else {
+                    return Err("--set 需要集名参数（intra/ip/all，见 manifest set 标签）".into());
+                };
+                set = Some(v.clone());
+                i += 2;
+            }
             other => {
                 return Err(format!(
-                    "未知参数 {other}；用法：ye-conformance [--manifest PATH] [--cache DIR]"
+                    "未知参数 {other}；用法：ye-conformance [--manifest PATH] [--cache DIR] [--set NAME]"
                 ));
             }
         }
     }
-    Ok((manifest, cache))
+    Ok((manifest, cache, set))
 }
 
 /// 清单里出现过的 codec（去重保序），容差打印用。
@@ -240,15 +309,23 @@ fn command_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// h264 全口径对拍：NAL 序列 + SPS 字段。任一口径失败 → Err（明细串联）。
-fn h264_run(name: &str, vec_path: &Path, data: &[u8]) -> Result<String, String> {
+/// h264 全口径对拍：NAL 序列 + SPS 字段 + 逐帧 YUV（施工图②）。
+/// 任一口径失败 → Err（明细串联）。
+fn h264_run(name: &str, vec_path: &Path, data: &[u8], cache_dir: &Path) -> Result<String, String> {
     let mut failures: Vec<String> = Vec::new();
     let mut passes: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
 
     let (mut our_nals, record) = match h264_nal_sequence(data) {
         Ok(v) => v,
         Err(e) => return Err(format!("我方码流层提取失败：{e}")),
     };
+    // SPS 解析一次：口径 b（字段比对）与口径 c（帧尺寸）共用
+    let sps_result: Result<Sps, String> = record
+        .sps_nals
+        .first()
+        .ok_or_else(|| "avcC 无 SPS".to_string())
+        .and_then(|nal| Sps::parse(nal).map_err(|e| format!("SPS 解析失败：{e}")));
 
     // 口径 a：NAL 序列 bit-exact
     let ref_path =
@@ -262,11 +339,12 @@ fn h264_run(name: &str, vec_path: &Path, data: &[u8]) -> Result<String, String> 
                 Ok(ref_slices) => {
                     let mut ref_nals: Vec<Vec<u8>> =
                         ref_slices.iter().map(|s| s.to_vec()).collect();
-                    // 参数集对齐：h264_mp4toannexb 在首个 IDR 前若无带内
-                    // SPS/PPS，则把 avcC（extradata）里的参数集插到 IDR 前
-                    // （实测位置在首个 IDR 紧前——包首若有 SEI，则插在
-                    // SEI 之后）。我方序列为包内 NAL，照同一语义以 avcC
-                    // 记录补插，保证比较的是码流本体的 NAL 序列。
+                    // 参数集对齐：h264_mp4toannexb 在每个 IDR 前若无带内
+                    // SPS/PPS，则把 avcC（extradata）里的参数集插到 IDR 紧前
+                    // （2026-10-24 施工图②以 45-IDR 向量实测锁定：每个 IDR
+                    // 前都插，首个 IDR 前有 SEI 时插在 SEI 之后；语义实现
+                    // 见 lib `nalalign`）。我方序列为包内 NAL，照同一语义
+                    // 以 avcC 记录补插后逐 NAL 比较。
                     our_nals = align_parameter_sets(&our_nals, &record);
                     // 尾 NAL 的 trailing_zero_8bits 两侧归一化（起始码切分
                     // 语义差异，非载荷差异）
@@ -301,14 +379,9 @@ fn h264_run(name: &str, vec_path: &Path, data: &[u8]) -> Result<String, String> 
     match ffprobe_stream_fields(vec_path) {
         Ok(ff) => {
             let (ff_profile, ff_level, ff_width, ff_height) = ff;
-            let check = record
-                .sps_nals
-                .first()
-                .ok_or_else(|| "avcC 无 SPS".to_string())
-                .and_then(|nal| Sps::parse(nal).map_err(|e| format!("SPS 解析失败：{e}")));
-            match check {
+            match &sps_result {
                 Ok(sps) => {
-                    let my_profile = ffprobe_profile_name(&sps);
+                    let my_profile = ffprobe_profile_name(sps);
                     let mut sps_fail: Vec<String> = Vec::new();
                     if my_profile != ff_profile {
                         sps_fail.push(format!("profile 我方={my_profile} ffprobe={ff_profile}"));
@@ -339,11 +412,145 @@ fn h264_run(name: &str, vec_path: &Path, data: &[u8]) -> Result<String, String> 
         Err(e) => failures.push(format!("sps-fields: FAIL（ffprobe oracle 失败：{e}）")),
     }
 
-    if failures.is_empty() {
-        Ok(passes.join(" | "))
-    } else {
-        Err(failures.join(" | "))
+    // 口径 c：逐帧 YUV（施工图②）——我方解码输出缺席时不参与
+    // pass/fail（打 NOTE）；在场则按施工图容差裁决，失败落归档。
+    let yuv_tol = tolerance::tolerances("h264").iter().find_map(|t| match t {
+        Tolerance::MaxAbs { .. } => Some(*t),
+        _ => None,
+    });
+    let our_yuv_path = cache_dir.join(format!("{name}.our.yuv"));
+    match (std::fs::read(&our_yuv_path), yuv_tol) {
+        (Err(_), _) => notes.push(format!(
+            "yuv-frames: 未接线（我方解码输出 {} 缺席；②a/②b 解码输出落此文件后本口径自动加入对拍）",
+            our_yuv_path.display()
+        )),
+        (_, None) => notes.push("yuv-frames: 未接线（容差表无逐帧口径）".into()),
+        (Ok(our_yuv), Some(tol)) => {
+            let ref_path =
+                std::env::temp_dir().join(format!("ye-conformance-{name}.{}.ref.yuv", std::process::id()));
+            match ffmpeg_rawvideo_yuv(vec_path, &ref_path)
+                .and_then(|()| std::fs::read(&ref_path).map_err(|e| format!("读 ref 失败：{e}")))
+            {
+                Ok(ref_yuv) => {
+                    let _ = std::fs::remove_file(&ref_path);
+                    match &sps_result {
+                        Err(e) => failures.push(format!("yuv-frames: FAIL（{e}，帧尺寸不可得）")),
+                        Ok(sps) => match chroma_sampling(sps) {
+                            None => failures.push(format!(
+                                "yuv-frames: FAIL（chroma_format_idc={} 非 4:2:0；逐帧口径仅支持 420 向量）",
+                                sps.chroma_format_idc
+                            )),
+                            Some(chroma) => {
+                                match compare::diff_yuv_frames(
+                                    &our_yuv,
+                                    &ref_yuv,
+                                    sps.width() as usize,
+                                    sps.height() as usize,
+                                    chroma,
+                                ) {
+                                    Err(e) => {
+                                        failures.push(format!("yuv-frames: FAIL（布局不符：{e}）"))
+                                    }
+                                    Ok(report) => match tol.check_yuv_frames(&report) {
+                                        Ok(()) => {
+                                            passes.push(format!(
+                                                "yuv-frames: PASS ({} 帧, max_abs={}, 逐位一致={})",
+                                                report.frames,
+                                                report.max_abs,
+                                                report.max_abs == 0
+                                            ));
+                                            // 通过即清旧归档（防止陈旧失败记录误导）
+                                            let _ = std::fs::remove_file(
+                                                cache_dir
+                                                    .join("failures")
+                                                    .join(format!("{name}.fail.txt")),
+                                            );
+                                        }
+                                        Err(tol_msg) => {
+                                            let archive =
+                                                write_failure_archive(cache_dir, name, &report, chroma, &tol_msg);
+                                            failures.push(format!(
+                                                "yuv-frames: {tol_msg}；失败归档：{}",
+                                                archive.display()
+                                            ));
+                                        }
+                                    },
+                                }
+                            }
+                        },
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&ref_path);
+                    failures.push(format!("yuv-frames: FAIL（ffmpeg oracle 失败：{e}）"));
+                }
+            }
+        }
     }
+
+    let note = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", notes.join(" | "))
+    };
+    if failures.is_empty() {
+        Ok(format!("{}{note}", passes.join(" | ")))
+    } else {
+        Err(format!("{}{note}", failures.join(" | ")))
+    }
+}
+
+/// 施工图②口径的 ffmpeg 逐帧参考：`-pix_fmt yuv420p -f rawvideo`
+/// （施工图原文 `ffmpeg -i vec.mp4 -pix_fmt yuv420p -f rawvideo ref.yuv`；
+/// -map 0:v:0 钉死首视频流，-v error 静噪）。输出为**显示尺寸**
+/// （含裁剪）的 yuv420p 平面布局，与 `Sps::width()/height()` 同口径。
+fn ffmpeg_rawvideo_yuv(input: &Path, out: &Path) -> Result<(), String> {
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(input)
+        .args(["-map", "0:v:0", "-pix_fmt", "yuv420p", "-f", "rawvideo"])
+        .arg(out)
+        .status()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("ffmpeg 退出码 {status}"))
+    }
+}
+
+/// SPS chroma_format_idc → 对拍采样布局（逐帧口径仅支持 420：
+/// ffmpeg 参考侧已被 `-pix_fmt yuv420p` 规格化，非 420 码流两侧
+/// 布局不可直接对齐，明确失败而非静默转换）。
+fn chroma_sampling(sps: &Sps) -> Option<ChromaSampling> {
+    match sps.chroma_format_idc {
+        1 => Some(ChromaSampling::Yuv420),
+        _ => None,
+    }
+}
+
+/// 施工图②失败归档四元组：向量名 / 首差帧 / 首差宏块位置 / max-abs
+/// （外加容差判据行与帧数），落 `<cache>/failures/<name>.fail.txt`；
+/// 向量重新通过时由 runner 清除。返回归档路径（写失败也不阻断对拍
+/// 报告——失败明细已完整打在 FAIL 行里）。
+fn write_failure_archive(
+    cache_dir: &Path,
+    name: &str,
+    report: &FrameDiffReport,
+    chroma: ChromaSampling,
+    tol_msg: &str,
+) -> PathBuf {
+    let dir = cache_dir.join("failures");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{name}.fail.txt"));
+    let mut text = format!("vector={name}\n");
+    text.push_str(&format!("tolerance={tol_msg}\n"));
+    for line in report.archive_lines(chroma) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    let _ = std::fs::write(&path, text);
+    path
 }
 
 /// 我方 NAL 序列：ye-container-mp4 解 AVCC → 包内 NAL 逐包拼接
@@ -487,60 +694,6 @@ fn level_equal(ours: u8, ffprobe: &str) -> bool {
     (mine - ff).abs() <= 0.001 || (mine - ff * 10.0).abs() <= 0.001
 }
 
-/// NAL 首字节的 unit type（低 5 位）。
-fn nal_type(nal: &[u8]) -> u8 {
-    nal.first().map(|b| b & 0x1F).unwrap_or(255)
-}
-
-/// 按 `h264_mp4toannexb` 的参数集语义补插 avcC 的 SPS/PPS：首个 IDR
-/// 之前若无带内参数集，把 avcC 记录里的插到 IDR 紧前（缺哪个补哪个）。
-/// 流内全无 IDR 时，若全流无 SPS 则前置到流首。已知边界：后续 IDR 前
-/// 的重复插入语义未对齐（当前规则只处理首个 IDR）——向量清单扩到
-/// 多 IDR 码流时以诊断输出（YE_CONFORMANCE_DEBUG_NALS=1）核对。
-fn align_parameter_sets(nals: &[Vec<u8>], record: &AvcConfigRecord) -> Vec<Vec<u8>> {
-    let mut insert_at: Option<usize> = None; // IDR 位置
-    for (i, nal) in nals.iter().enumerate() {
-        if nal_type(nal) == 5 {
-            insert_at = Some(i);
-            break;
-        }
-    }
-    match insert_at {
-        Some(idr) => {
-            let sps_seen = nals[..idr].iter().any(|n| nal_type(n) == 7);
-            let pps_seen = nals[..idr].iter().any(|n| nal_type(n) == 8);
-            let mut out: Vec<Vec<u8>> = nals[..idr].to_vec();
-            if !sps_seen {
-                out.extend(record.sps_nals.iter().cloned());
-            }
-            if !pps_seen {
-                out.extend(record.pps_nals.iter().cloned());
-            }
-            out.extend(nals[idr..].iter().cloned());
-            out
-        }
-        None => {
-            if nals.iter().any(|n| nal_type(n) == 7) {
-                nals.to_vec()
-            } else {
-                let mut out = record.sps_nals.clone();
-                out.extend(record.pps_nals.iter().cloned());
-                out.extend_from_slice(nals);
-                out
-            }
-        }
-    }
-}
-
-/// 尾 NAL 去尾随零字节（trailing_zero_8bits 归一化）。
-fn trim_trailing_zeros(nals: &mut [Vec<u8>]) {
-    if let Some(last) = nals.last_mut() {
-        while last.last() == Some(&0) {
-            last.pop();
-        }
-    }
-}
-
 /// 诊断输出：逐 NAL 的 (序号, type, len)。
 fn dump_nals(side: &str, nals: &[Vec<u8>]) {
     eprintln!("--- {side}: {} NALs", nals.len());
@@ -549,23 +702,6 @@ fn dump_nals(side: &str, nals: &[Vec<u8>]) {
     }
 }
 
-/// 首个 NAL 差异的诊断描述。
-fn first_nal_diff(ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> String {
-    let common = ours.len().min(theirs.len());
-    for i in 0..common {
-        if ours[i] != theirs[i] {
-            let ty = |nal: &[u8]| nal.first().map(|b| b & 0x1F).unwrap_or(255);
-            return format!(
-                "第 {i} 个 NAL（type 我方={} ffprobe={}，len 我方={} ffmpeg={}）",
-                ty(&ours[i]),
-                ty(&theirs[i]),
-                ours[i].len(),
-                theirs[i].len()
-            );
-        }
-    }
-    format!("前 {common} 个一致，长度发散")
-}
-
-// main.rs 无单元测试：可离线单测的逻辑都在 lib（见 src/*.rs），
+// main.rs 无单元测试：可离线单测的逻辑都在 lib（参数集对齐见
+// `nalalign`，容差裁决见 `tolerance`，逐帧定位见 `compare`），
 // ffmpeg/ffprobe 依赖的编排以真实运行验证（README「摘要行机制验证」）。

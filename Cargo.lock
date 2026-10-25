@@ -7,6 +7,7 @@ name = "ye"
 version = "0.1.0"
 dependencies = [
  "ye-codec",
+ "ye-codec-h264",
  "ye-container",
  "ye-container-mp4",
  "ye-device",
@@ -33,6 +34,14 @@ dependencies = [
 [[package]]
 name = "ye-codec-h264"
 version = "0.1.0"
+dependencies = [
+ "ye-codec",
+ "ye-conformance",
+ "ye-container",
+ "ye-container-mp4",
+ "ye-pixfmt",
+ "ye-time",
+]
 
 [[package]]
 name = "ye-conformance"

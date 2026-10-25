@@ -13,6 +13,17 @@
 #   SHA256，按裁决登记不进 ran/skipped 计数、不参与终验断言，摘要行
 #   另落 pending=K；网络恢复后实测 sha256 并升入 [[vector]]。
 # - 增删向量须登记理由，选择权不在施工方（施工图 risks 第 13 条）。
+#
+# 2026-10-24 施工图②增补（对拍器维护员落账）：
+# - ②a 纯 I 集（set="intra"，3 条）+ ②b I/P 混合集（set="ip"，3 条），
+#   均为 testsrc2 跨三档分辨率、Baseline profile。GOP 结构以 ffprobe
+#   实测登记于各节注释（intra：45/45 帧 pict_type=I；ip：I@0/15/30 +
+#   P，3×GOP(1I+14P)）。不带 set 键的 6 条 v1 向量 = 全集（②c 跑全集）。
+# - 施工图原文配方 `ffmpeg -intra` 在本机 ffmpeg（见下方 ffmpeg_version）
+#   已移除（实测报 Unrecognized option 'intra'），按其语义等价形式
+#   `-g 1` 生成（GOP=1 ⟹ 全 I 帧）；此偏差已在施工图②口径内登记。
+# - 源自动运动内容选 testsrc2（P 帧运动补偿/参考帧链有真实运动可压）；
+#   静态图（smptebars）的 P 帧几乎全 skip，不构成 ②b 的有效压力。
 
 manifest_version = 1
 
@@ -67,6 +78,84 @@ container = "mp4"
 generate = "ffmpeg -y -v error -f lavfi -i smptebars=size=1280x720:rate=15 -t 3 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
 ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
 sha256 = "fa3be23dd7a56a5595521062f3b94c101c7aa7acd8ad157eb03a53098c8f5620"
+
+# —— ②a 纯 I 集（set=intra，施工图② I 帧闭环对拍用）：——
+# 实测（2026-10-24，本机 ffmpeg）：45/45 帧 pict_type=I 且 key_frame=1，
+# profile=Constrained Baseline（176×144/640×360/1280×720 level 分别为
+# 1.0/2.2/3.1）。配方说明见清单头注（`-intra` → `-g 1` 等价替换）。
+#
+# 2026-10-25 增补（②a 施工商登记）：配方追加 `-x264-params no-deblock=1`
+# 并重生成（sha256 实测更新）。理由：施工图②把 deblocking 放在 ②c
+# （deblock.rs 由第二人在 ②a 数据结构冻结后实现），②a 闭环不含环路
+# 滤波——片头 disable_deblocking_filter_idc 必须为 1（禁用）才能逐帧
+# 对拍；原配方带滤波（idc=0）对无滤波解码器结构性不可过界。向量名、
+# 分辨率、GOP 结构不变（45×I，Constrained Baseline，实测如上）。
+
+[[vector]]
+name = "h264-intra-testsrc2-176x144"
+codec = "h264"
+container = "mp4"
+set = "intra"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=176x144:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 1 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "d2c40ccda28c03ed34676f40125f059f8f7f3a5c8c78747f3a131e253dc40869"
+
+[[vector]]
+name = "h264-intra-testsrc2-640x360"
+codec = "h264"
+container = "mp4"
+set = "intra"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=640x360:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 1 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "54bbbfdf12b238ba934f33024ffbf91924ce8b9aac642dd850a121a2ef2cd0fe"
+
+[[vector]]
+name = "h264-intra-testsrc2-1280x720"
+codec = "h264"
+container = "mp4"
+set = "intra"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 1 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "323a56a2f777dcee39ef76b055b61992e6db90f5aa702d8a68b708a8f860115d"
+
+# —— ②b I/P 混合集（set=ip，施工图② P 帧全链对拍用）：——
+# 实测（2026-10-24，本机 ffmpeg）：GOP=-g 15，45 帧 = 3×(1I+14P)，
+# I(key_frame=1)@0/15/30、无 scenecut 插帧；profile=Constrained
+# Baseline。P 帧含真实运动（testsrc2），运动补偿/参考帧链有效受压。
+#
+# 2026-10-25 增补（②b 施工商登记）：配方追加 `-x264-params
+# no-deblock=1` 并重生成（sha256 实测更新；640x360 顺带修正源参数
+# `testsrc2:size=` 笔误为 `testsrc2=size=`，与实测生成命令一致）。
+# 理由同 intra 集 ②a 增补：deblocking 在 ②c 落地前，②b 闭环（帧间
+# 预测/运动补偿/参考窗）无环路滤波，片头 idc 必须为 1（禁用）才可
+# 逐帧对拍。向量名、GOP 结构不变（45 帧 = 3×(1I+14P)）。
+
+[[vector]]
+name = "h264-ip-testsrc2-176x144"
+codec = "h264"
+container = "mp4"
+set = "ip"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=176x144:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 15 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "57626df78a427eb9584e32e32a164a5e3d591d82ca9386918f0264ea46600bd6"
+
+[[vector]]
+name = "h264-ip-testsrc2-640x360"
+codec = "h264"
+container = "mp4"
+set = "ip"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=640x360:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 15 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "d1093669168361280be2a83c4aa17c48010c5973dac976f2813d29424461d29e"
+
+[[vector]]
+name = "h264-ip-testsrc2-1280x720"
+codec = "h264"
+container = "mp4"
+set = "ip"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=15 -t 3 -c:v libx264 -profile:v baseline -g 15 -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "38e153cb20ab134085fc2bc1315714b94667420cd2b22201680759d0370cf1c1"
 
 # —— 待网络清册：FATE H.264 conformance 的 Baseline 子集（ba*/B* 系列）——
 # 选择规则：profile=Baseline 的 ba*/B* 系列原始码流（.264），下载后须
