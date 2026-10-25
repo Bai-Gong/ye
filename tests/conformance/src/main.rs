@@ -118,6 +118,15 @@ fn main() {
                         "  {codec}: 全样本|Δ|≤{max_abs} 且每帧 Δ=0 ≥{zero_ratio_permille_min}‰ [{dimension}]"
                     );
                 }
+                Tolerance::PcmTwoLevel {
+                    dimension,
+                    max_abs,
+                    ratio1_permille_min,
+                } => {
+                    println!(
+                        "  {codec}: 全样本|Δ|≤{max_abs} 且每帧 |Δ|≤1 ≥{ratio1_permille_min}‰ [{dimension}]"
+                    );
+                }
             }
         }
     }
@@ -202,6 +211,7 @@ fn main() {
         // 4) 分派对拍
         let result = match entry.codec.as_str() {
             "h264" => h264_run(&entry.name, &vec_path, &data, &cache_dir),
+            "aac" => aac_run(&entry.name, &entry.container, &vec_path, &cache_dir),
             other => Err(format!("codec {other} 已声明容差但 runner 未接线")),
         };
         match result {
@@ -500,10 +510,201 @@ fn h264_run(name: &str, vec_path: &Path, data: &[u8], cache_dir: &Path) -> Resul
     }
 }
 
-/// 施工图②口径的 ffmpeg 逐帧参考：`-pix_fmt yuv420p -f rawvideo`
-/// （施工图原文 `ffmpeg -i vec.mp4 -pix_fmt yuv420p -f rawvideo ref.yuv`；
-/// -map 0:v:0 钉死首视频流，-v error 静噪）。输出为**显示尺寸**
-/// （含裁剪）的 yuv420p 平面布局，与 `Sps::width()/height()` 同口径。
+// 施工图②口径的 ffmpeg 逐帧参考：`-pix_fmt yuv420p -f rawvideo`
+// （施工图原文 `ffmpeg -i vec.mp4 -pix_fmt yuv420p -f rawvideo ref.yuv`；
+// -map 0:v:0 钉死首视频流，-v error 静噪）。输出为**显示尺寸**
+// （含裁剪）的 yuv420p 平面布局，与 `Sps::width()/height()` 同口径。
+// ---------------------------------------------------------------------------
+// AAC 对拍（施工图③）：三入口（ADTS / LOAS / MP4-esds）→ s16le 逐帧双层容差
+// ---------------------------------------------------------------------------
+
+/// AAC 全口径对拍：解码向量 → 写 `<cache>/<name>.our.pcm`，与 ffmpeg
+/// `-f s16le` 参考按施工图③双层容差（100% |Δ|≤4 且每帧 |Δ|≤1 占比
+/// ≥999‰，逐帧判定）裁决；失败落 `<cache>/failures/<name>.fail.txt`。
+///
+/// MP4 向量参考侧带 `-ignore_editlist 1`：我方解码器按裸码流语义输出
+/// 全部存储帧（无容器级 priming 裁剪），ffmpeg 默认按 edit list 裁去
+/// 首帧——两侧口径须一致（见 manifest/README 登记）。
+fn aac_run(
+    name: &str,
+    container: &str,
+    vec_path: &Path,
+    cache_dir: &Path,
+) -> Result<String, String> {
+    use ye_codec::{Decoded, Decoder, Packet};
+    use ye_codec_aac::AacDecoder;
+
+    // 1) 我方解码 → 交错 s16le
+    fn decode_one(
+        dec: &mut ye_codec_aac::AacDecoder,
+        pkt: &Packet,
+        channels: &mut usize,
+    ) -> Result<Vec<f32>, String> {
+        dec.feed(pkt).map_err(|e| format!("feed: {e}"))?;
+        let mut out = Vec::new();
+        while let Decoded::Frame(f) = dec.pull().map_err(|e| format!("pull: {e}"))? {
+            let ye_codec::Frame::Audio(a) = f else {
+                return Err("非音频帧".into());
+            };
+            if *channels == 0 {
+                *channels = a.channel_layout().channels() as usize;
+            }
+            let b = a.data();
+            for c in b.chunks_exact(4) {
+                out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        Ok(out)
+    }
+    let mut samples: Vec<f32> = Vec::new();
+    let mut channels: usize = 0;
+    match container {
+        "adts" => {
+            let params =
+                ye_codec::CodecParameters::new(ye_codec::CodecId::Aac, ye_codec::MediaType::Audio);
+            let mut dec = AacDecoder::new(&params).map_err(|e| format!("构造: {e}"))?;
+            let data = std::fs::read(vec_path).map_err(|e| format!("读向量: {e}"))?;
+            let mut off = 0usize;
+            while off + 7 <= data.len() {
+                let len = ((data[off + 3] as usize & 0x03) << 11)
+                    | ((data[off + 4] as usize) << 3)
+                    | ((data[off + 5] as usize >> 5) & 0x07);
+                if len < 7 || off + len > data.len() {
+                    return Err(format!("ADTS 帧长 {len} 异常 @{off}"));
+                }
+                let mut p = Packet::empty(0);
+                p.data = std::sync::Arc::from(data[off..off + len].to_vec());
+                samples.extend(decode_one(&mut dec, &p, &mut channels)?);
+                off += len;
+            }
+        }
+        "loas" => {
+            let params =
+                ye_codec::CodecParameters::new(ye_codec::CodecId::Aac, ye_codec::MediaType::Audio);
+            let mut dec = AacDecoder::new(&params).map_err(|e| format!("构造: {e}"))?;
+            let data = std::fs::read(vec_path).map_err(|e| format!("读向量: {e}"))?;
+            let mut off = 0usize;
+            while off + 3 <= data.len() {
+                if data[off] != 0x56 || data[off + 1] & 0xE0 != 0xE0 {
+                    off += 1;
+                    continue;
+                }
+                let len = (((data[off + 1] & 0x1F) as usize) << 8 | data[off + 2] as usize) + 3;
+                if off + len > data.len() {
+                    break;
+                }
+                let mut p = Packet::empty(0);
+                p.data = std::sync::Arc::from(data[off..off + len].to_vec());
+                samples.extend(decode_one(&mut dec, &p, &mut channels)?);
+                off += len;
+            }
+        }
+        "mp4" => {
+            use ye_container::Demuxer;
+            let file = std::fs::File::open(vec_path).map_err(|e| format!("打开向量: {e}"))?;
+            let mut demux = ye_container_mp4::Mp4Demuxer::new(Box::new(file))
+                .map_err(|e| format!("mp4 解封装: {e}"))?;
+            let header = demux.read_header().map_err(|e| format!("读 mp4 头: {e}"))?;
+            let audio = header
+                .streams
+                .iter()
+                .find(|st| st.media_type == ye_codec::MediaType::Audio)
+                .ok_or_else(|| "向量无音频流".to_string())?;
+            let mut dec = AacDecoder::new(&audio.codec).map_err(|e| format!("构造: {e}"))?;
+            while let Some(pkt) = demux.read_packet().map_err(|e| format!("读包: {e}"))? {
+                samples.extend(decode_one(&mut dec, &pkt, &mut channels)?);
+            }
+        }
+        other => return Err(format!("aac 向量容器 {other} 未接线（adts/loas/mp4）")),
+    }
+    if samples.is_empty() || channels == 0 {
+        return Err("解码输出为空".into());
+    }
+    if channels > 2 {
+        return Err(format!("声道数 {channels} 超支持集（1..=2）"));
+    }
+    let to_s16 = |v: f32| (v * 32768.0).clamp(-32768.0, 32767.0).round() as i16;
+    let our_pcm: Vec<u8> = samples
+        .iter()
+        .flat_map(|&v| to_s16(v).to_le_bytes())
+        .collect();
+    let our_path = cache_dir.join(format!("{name}.our.pcm"));
+    std::fs::write(&our_path, &our_pcm).map_err(|e| format!("写 {}: {e}", our_path.display()))?;
+
+    // 2) oracle：ffmpeg -f s16le（mp4 加 -ignore_editlist 1）
+    let ref_path = std::env::temp_dir().join(format!(
+        "ye-conformance-{name}.{}.ref.pcm",
+        std::process::id()
+    ));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "error"]);
+    if container == "mp4" {
+        cmd.arg("-ignore_editlist").arg("1");
+    }
+    cmd.arg("-i")
+        .arg(vec_path)
+        .args(["-map", "0:a:0", "-f", "s16le", "-c:a", "pcm_s16le"]);
+    let status = cmd
+        .arg(&ref_path)
+        .status()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 退出码 {status}"));
+    }
+    let ref_pcm = std::fs::read(&ref_path).map_err(|e| format!("读 ref: {e}"))?;
+    let _ = std::fs::remove_file(&ref_path);
+
+    // 3) 对拍 + 容差（帧 = 1024 样本/声道 × 声道数）
+    let frame_samples = 1024 * channels;
+    let tol = tolerance::tolerances("aac")[0];
+    let detail = match compare::diff_pcm_frames(&our_pcm, &ref_pcm, frame_samples) {
+        Err(e) => format!("pcm-frames: FAIL（{e}）"),
+        Ok(report) => match tol.check_pcm_frames(&report) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(
+                    cache_dir.join("failures").join(format!("{name}.fail.txt")),
+                );
+                let over1: usize = report.frame_over1_counts.iter().sum();
+                format!(
+                    "pcm-frames: PASS ({} 帧×{} 交错样本, max_abs={}, |Δ|>1 样本 {}/{})",
+                    report.frames,
+                    frame_samples,
+                    report.max_abs,
+                    over1,
+                    report.frames * frame_samples
+                )
+            }
+            Err(tol_msg) => {
+                let dir = cache_dir.join("failures");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(format!("{name}.fail.txt"));
+                let mut text = format!(
+                    "vector={name}
+"
+                );
+                text.push_str(&format!(
+                    "tolerance={tol_msg}
+"
+                ));
+                if let Some((f, i)) = report.max_abs_at {
+                    text.push_str(&format!(
+                        "first-max-abs: frame={} sample={} max_abs={}
+",
+                        f, i, report.max_abs
+                    ));
+                }
+                let _ = std::fs::write(&path, text);
+                format!("pcm-frames: FAIL（{tol_msg}；归档 {}）", path.display())
+            }
+        },
+    };
+    if detail.starts_with("pcm-frames: PASS") {
+        Ok(detail)
+    } else {
+        Err(detail)
+    }
+}
+
 fn ffmpeg_rawvideo_yuv(input: &Path, out: &Path) -> Result<(), String> {
     let status = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-i"])

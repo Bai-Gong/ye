@@ -15,7 +15,7 @@
 //! `zero_ratio_permille_min` 或收为 [`Tolerance::BitExact`]；放宽
 //! （升 max_abs、降占比下限、改全程合并判定）须回施工图重新评审。
 
-use crate::compare::FrameDiffReport;
+use crate::compare::{FrameDiffReport, PcmFrameReport};
 
 /// 单条容差口径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,17 @@ pub enum Tolerance {
         max_abs: u32,
         /// 每帧 Δ=0 样本占比下限（千分比；999 = ≥99.9%）。
         zero_ratio_permille_min: u64,
+    },
+    /// 逐帧双层 PCM 容差（施工图③ AAC 口径）：100% 样本 |Δ|≤max_abs
+    /// 且**每帧** |Δ|≤1 样本占比 ≥ ratio1_permille_min‰（逐帧判定，
+    /// 单帧劣化不能被其他帧摊薄）。
+    PcmTwoLevel {
+        /// 比较维度描述。
+        dimension: &'static str,
+        /// 全部样本的绝对差上界（100% |Δ|≤max_abs）。
+        max_abs: u32,
+        /// 每帧 |Δ|≤1 样本占比下限（千分比；999 = ≥99.9%）。
+        ratio1_permille_min: u64,
     },
 }
 
@@ -56,6 +67,9 @@ impl Tolerance {
                     ))
                 }
             }
+            Self::PcmTwoLevel { dimension, .. } => Err(format!(
+                "{dimension}: check_yuv_frames: PCM 口径不能裁 YUV 报告"
+            )),
             Tolerance::MaxAbs {
                 dimension,
                 max_abs,
@@ -102,6 +116,57 @@ impl Tolerance {
             }
         }
     }
+
+    /// 对逐帧 PCM 对拍报告下裁决（施工图③双层口径）。
+    ///
+    /// # Errors
+    /// 超容差 → `Err`（人类可读明细）。
+    pub fn check_pcm_frames(&self, report: &PcmFrameReport) -> Result<(), String> {
+        match *self {
+            Self::PcmTwoLevel {
+                dimension,
+                max_abs,
+                ratio1_permille_min,
+            } => {
+                let mut fails: Vec<String> = Vec::new();
+                if report.max_abs > i64::from(max_abs) {
+                    fails.push(format!(
+                        "max_abs={} 超 {max_abs}（位于帧 {} 样本 {}）",
+                        report.max_abs,
+                        report.max_abs_at.map(|a| a.0).unwrap_or(0),
+                        report.max_abs_at.map(|a| a.1).unwrap_or(0),
+                    ));
+                }
+                // 每帧 |Δ|≤1 占比 ≥ min‰ ⟺ |Δ|>1 样本数×1000 ≤ (1000−min)×帧样本数
+                let over: Vec<usize> = report
+                    .frame_over1_counts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_f, &c)| {
+                        (c * 1000) as u64
+                            > (1000 - ratio1_permille_min) * report.frame_samples as u64
+                    })
+                    .map(|(f, _)| f)
+                    .collect();
+                if !over.is_empty() {
+                    fails.push(format!(
+                        "|Δ|≤1 帧占比不达 {}‰ 的帧共 {} 个（首帧 {}，该帧 |Δ|>1 样本 {}/{}）",
+                        ratio1_permille_min,
+                        over.len(),
+                        over[0],
+                        report.frame_over1_counts[over[0]],
+                        report.frame_samples
+                    ));
+                }
+                if fails.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!("{dimension}: FAIL（{}）", fails.join("；")))
+                }
+            }
+            other => Err(format!("check_pcm_frames: 容差变体 {other:?} 非 PCM 口径")),
+        }
+    }
 }
 
 /// 政策说明（runner 每次运行打印，防止口径漂移）。
@@ -126,6 +191,14 @@ pub fn tolerances(codec: &str) -> &'static [Tolerance] {
                 zero_ratio_permille_min: 999,
             },
         ],
+        // aac：施工图③逐帧 PCM 口径（原文「f32→s16 后 ≥99.9% 样本
+        // |Δ|≤1 且 100% |Δ|≤4」；逐帧判定）。对拍对象 = ffmpeg
+        // `-f s16le` 参考。
+        "aac" => &[Tolerance::PcmTwoLevel {
+            dimension: "s16le samples vs ffmpeg -f s16le（逐帧）",
+            max_abs: 4,
+            ratio1_permille_min: 999,
+        }],
         _ => &[],
     }
 }

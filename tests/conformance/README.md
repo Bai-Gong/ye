@@ -102,6 +102,30 @@ CONFORMANCE pending=Q（待网络清册，不参与断言）
 施工图①已现场执行过一遍（含 sha 漂移照跑的 `sha_ok=5` 场景），计数
 语义另由 `report::tests::removing_a_vector_shifts_ran_to_skipped` 锁定。
 
+## AAC 对拍口径（施工图③，2026-10-25）
+
+- **向量**（`codec="aac"`，6 条，容器 `adts`/`loas`/`mp4` 三入口）：
+  本机 ffmpeg 确定性 lavfi 源生成，工具矩阵覆盖 48k 立体声正弦
+  （TNS 开）、44.1k 单声道正弦（PNS/TNS 关）、44.1k 立体声 m4a
+  （esds 入口）、48k 瞬态（八短窗）、48k 白噪声（强度立体声开）、
+  48k LOAS/LATM。PNS（噪声码本 13）按 unsupported 收紧——向量全部
+  `-aac_pns 0` 生成，放开须补向量。
+- **参考侧**：`ffmpeg -i <vec> -f s16le -c:a pcm_s16le`（runner 内
+  `-map 0:a:0 -v error`；**mp4 条带 `-ignore_editlist 1`**——我方
+  解码器按裸码流语义输出全部存储帧，ffmpeg 默认按 edit list 裁去
+  1 个 priming 帧，两侧口径须一致）。
+- **我方侧**：`ye-codec-aac` 解码（f32 归一化）→ s16 →
+  `<cache>/<name>.our.pcm`（交错、逐帧顺序，无 padding）。
+- **容差**（施工图③原文定死）：100% 样本 |Δ|≤4 且**每帧** |Δ|≤1
+  样本占比 ≥999‰（逐帧判定，`Tolerance::PcmTwoLevel`）。实测六条
+  全部 max_abs=1、|Δ|>1 样本 0（即 100% ≤1 LSB，严于口径）。
+- **失败归档**：超容差落 `<cache>/failures/<name>.fail.txt`
+  （向量名/容差判据/max_abs 位（帧, 样本））。
+- **标定对齐说明**：FFmpeg AAC 解码器 IMDCT 有效标定 ×1/M（其
+  `ff_mdct_init` 把 `sqrt(1/1024)` 折进旋转因子两次）、M/S 蝶形无
+  1/√2、TNS 反射系数先取负再 Levinson——我方按 ISO 标定实现后由
+  `ye-codec-aac` 调用侧折算对齐（见其 decoder 模块「输出标定」）。
+
 ## 容差（按 codec 逐条写死，**只准收紧**）
 
 见 `src/tolerance.rs`：向更严方向修改免评审；任何放宽（bit-exact →

@@ -9,6 +9,7 @@ license.workspace = true
 # 零第三方依赖（全库约定）：sha256 手写实现，ffmpeg/ffprobe 经
 # std::process::Command 调用。
 ye-codec = { path = "../../crates/ye-codec" }
+ye-codec-aac = { path = "../../crates/ye-codec-aac" }
 ye-codec-h264 = { path = "../../crates/ye-codec-h264" }
 ye-container = { path = "../../crates/ye-container" }
 ye-container-mp4 = { path = "../../crates/ye-container-mp4" }

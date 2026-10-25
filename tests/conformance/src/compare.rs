@@ -589,3 +589,62 @@ mod tests {
         assert!(diff_yuv_frames(&a, &a, 0, 4, ChromaSampling::Yuv420).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// 逐帧 PCM 对拍（施工图③ AAC 口径）
+// ---------------------------------------------------------------------------
+
+/// 逐帧 PCM 对拍报告（交错 s16le）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PcmFrameReport {
+    /// 总帧数（每帧 `frame_samples` 个交错样本）。
+    pub frames: usize,
+    /// 每帧交错样本数。
+    pub frame_samples: usize,
+    /// 全部样本最大绝对差。
+    pub max_abs: i64,
+    /// 逐帧 |Δ|>1 的样本数（双层容差的次级判据输入）。
+    pub frame_over1_counts: Vec<usize>,
+    /// max_abs 所在（帧, 帧内样本）。
+    pub max_abs_at: Option<(usize, usize)>,
+}
+
+/// 比较两份交错 s16le PCM（长度须相等），按 `frame_samples` 分帧。
+///
+/// # Errors
+/// 长度不等或不是 2 字节样本宽整数倍 → `Err`。
+pub fn diff_pcm_frames(
+    ours: &[u8],
+    ref_: &[u8],
+    frame_samples: usize,
+) -> Result<PcmFrameReport, String> {
+    if frame_samples == 0 {
+        return Err("diff_pcm_frames: frame_samples 须 > 0".into());
+    }
+    if ours.len() != ref_.len() {
+        return Err(format!("pcm 长度不等 {}/{}", ours.len(), ref_.len()));
+    }
+    let n_samples = ours.len() / 2;
+    let mut report = PcmFrameReport {
+        frames: n_samples / frame_samples,
+        frame_samples,
+        max_abs: 0,
+        frame_over1_counts: vec![0; n_samples / frame_samples],
+        max_abs_at: None,
+    };
+    for i in 0..n_samples {
+        let sa = le_signed(&ours[i * 2..i * 2 + 2]);
+        let sb = le_signed(&ref_[i * 2..i * 2 + 2]);
+        let d = (sa - sb).abs();
+        if d > report.max_abs {
+            report.max_abs = d;
+            report.max_abs_at = Some((i / frame_samples, i % frame_samples));
+        }
+        if d > 1
+            && let Some(c) = report.frame_over1_counts.get_mut(i / frame_samples)
+        {
+            *c += 1;
+        }
+    }
+    Ok(report)
+}

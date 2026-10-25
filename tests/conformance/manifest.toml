@@ -157,6 +157,87 @@ generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=15 -t 3 -
 ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
 sha256 = "38e153cb20ab134085fc2bc1315714b94667420cd2b22201680759d0370cf1c1"
 
+# —— 施工图③ AAC-LC（M2）：三入口 × 工具组合的六条向量 ——
+# 全部由本机 ffmpeg（版本见各条）确定性 lavfi 源生成；对拍口径 =
+# `ffmpeg -f s16le`（mp4 条带 `-ignore_editlist 1`，对齐我方裸码流
+# 语义——不裁 priming 帧）。工具矩阵：48k 立体声正弦（TNS 开）、
+# 44.1k 单声道正弦（PNS/TNS 关）、44.1k 立体声 m4a（esds 入口）、
+# 48k 瞬态（八短窗，工具全关）、48k 白噪声（强度立体声开）、
+# 48k LOAS/LATM 入口。PNS（噪声码本 13）形态按 unsupported 收紧
+# （向量全部 -aac_pns 0 生成），放开须补向量。
+
+[[vector]]
+name = "aac-48k-st-sine"
+codec = "aac"
+container = "adts"
+generate = "ffmpeg -y -v error -f lavfi -i sine=frequency=1000:sample_rate=48000:duration=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_is 0 {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "ab154f39b4de2a5c7659d28bd39157e8239cc876ececf7f0cc87866646688d48"
+
+[[vector]]
+name = "aac-44k1-mo-sine"
+codec = "aac"
+container = "adts"
+generate = "ffmpeg -y -v error -f lavfi -i sine=frequency=1000:sample_rate=44100:duration=3 -ac 1 -c:a aac -b:a 64k -aac_pns 0 -aac_tns 0 {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "19bea943a8927cc78bb076bd3c2acf8a977bc85cf9b1e5ba25dfb1e8945457b3"
+
+[[vector]]
+name = "aac-44k1-st-m4a"
+codec = "aac"
+container = "mp4"
+generate = "ffmpeg -y -v error -f lavfi -i sine=frequency=1000:sample_rate=44100:duration=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -movflags +faststart -f ipod {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "074019033e33660d106a38182c86e0b3f3b9e1c9cf37623b92189531a69a00c3"
+
+[[vector]]
+name = "aac-48k-st-transient"
+codec = "aac"
+container = "adts"
+generate = "ffmpeg -y -v error -f lavfi -i aevalsrc=0.5*sin(2*PI*1000*t)*abs(sin(2*PI*6*t)):s=48000:d=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_is 0 -aac_tns 0 {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "6401788c21c613a810e695d7e9d623770d2ce5f5d182b47027c0dee6b0aaf62f"
+
+[[vector]]
+name = "aac-48k-st-noise"
+codec = "aac"
+container = "adts"
+generate = "ffmpeg -y -v error -f lavfi -i anoisesrc=color=white:amplitude=0.5:duration=3:seed=1234:sample_rate=48000 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_tns 0 {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "0a573ff9a483c2034445bb19ff0d123dfc3506960cbb29dd57c1c12686da07cc"
+
+[[vector]]
+name = "aac-48k-st-sine-loas"
+codec = "aac"
+container = "loas"
+generate = "ffmpeg -y -v error -f lavfi -i sine=frequency=1000:sample_rate=48000:duration=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_is 0 -f latm {OUT}"
+ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "075bd3c0b5c1eda9d20ddbd18a91a7500c0bde94b03c8f5d2e0f450943fc28f4"
+
+# —— 待网络清册（AAC）：FATE/ISO 官方 AAC 一致性向量（al17/al18 等
+# AAC-LC 码流），下载后实测 sha256 升入 [[vector]]；ISO 14496-26
+# （JMC）AAC 参考向量同册登记。网络恢复前不参与 ran/skipped 计数。
+
+[[pending_vector]]
+name = "fate-aac-al17"
+source = "https://samples.ffmpeg.org/fate-suite/aac/"
+note = "al17.mp4（AAC-LC 立体声，文件名待网络核对）；下载后实测 sha256 升入就位集"
+
+[[pending_vector]]
+name = "fate-aac-al18"
+source = "https://samples.ffmpeg.org/fate-suite/aac/"
+note = "al18.mp4（AAC-LC，文件名待网络核对）"
+
+[[pending_vector]]
+name = "fate-aac-al-sbr"
+source = "https://samples.ffmpeg.org/fate-suite/aac/"
+note = "SBR/HE-AAC 形态——按 unsupported 收紧口径登记，仅作收紧行为回归"
+
+[[pending_vector]]
+name = "iso-14496-aac-conformance"
+source = "https://www.iso.org/standard/53943.html"
+note = "ISO/IEC 14496-26（JMC）附 AAC 参考向量清册，待网络核对下载源"
+
 # —— 待网络清册：FATE H.264 conformance 的 Baseline 子集（ba*/B* 系列）——
 # 选择规则：profile=Baseline 的 ba*/B* 系列原始码流（.264），下载后须
 # remux 进 mp4 容器再入就位集（我方管线对拍入口是 MP4 demux）。

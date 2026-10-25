@@ -1,0 +1,18 @@
+[package]
+name = "ye-codec-aac"
+description = "百工·冶：AAC-LC 解码——码流语法、重量化、立体声工具、TNS、IMDCT 滤波器组"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 零第三方依赖（全库约定）。码表为 ISO/IEC 14496-3 标准数值数据
+# （tables_data.rs，机械转录，来源与许可见 tables.rs 头注）。
+ye-codec = { path = "../ye-codec" }
+ye-pixfmt = { path = "../ye-pixfmt" }
+ye-time = { path = "../ye-time" }
+
+[dev-dependencies]
+ye-conformance = { path = "../../tests/conformance" }
+ye-container = { path = "../ye-container" }
+ye-container-mp4 = { path = "../ye-container-mp4" }

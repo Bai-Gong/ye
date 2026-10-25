@@ -12,6 +12,7 @@
 //! |---------|------|----------|
 //! | `mp4`   | 是   | MP4 容器读写（`ye::container::mp4`，即 `ye-container-mp4`：解封装 + 封装，progressive 与 fMP4；含 `Demuxer`/`Muxer` trait 接线与 `register_mp4` 注册） |
 //! | `h264` | 否 | H.264 解码主链（`ye::codec_h264`，即 `ye-codec-h264`：Annex B/AVCC 输入，I 帧 CAVLC 闭环至 yuv420p `VideoFrame`；含 `register_h264` 注册——取代 `codec-stubs` 中 H.264 解码桩的位置） |
+//! | `aac` | 否 | AAC-LC 解码主链（`ye::codec_aac`，即 `ye-codec-aac`：ADTS/LOAS/esds 输入，noiseless 码表 + 重量化 + M/S 强度 + TNS + IMDCT 至 packed f32 `AudioFrame`，时戳透传；含 `register_aac` 注册——取代 `codec-stubs` 中 AAC 解码桩的位置） |
 //! | `codec-stubs` | 否 | M2+ 编解码桩的聚合入口 `ye::stubs::codec`（H.264/AAC × 解码/编码；注册可查、可构造，`feed`/`pull` 即 `UnsupportedStub`——桩本体在 `ye-codec` 恒编译，本 feature 把「依赖桩」记进依赖声明） |
 //! | `filter-stubs` | 否 | M2+ 处理图桩的聚合入口 `ye::stubs::filter`（`FilterGraph` 组装真实生效，`topological_order` 即 `Unsupported`——语义同上） |
 //!
@@ -24,6 +25,9 @@
 //! 此外 [`container`] 模块提供跨容器 [`remux`](container::remux) 助手
 //! （`ffmpeg -c copy` 等价，不转码）；[`stubs`] 模块是 M2+ 接口桩的
 //! 聚合入口（语义边界见 docs/contracts.md「M2+ 接口桩契约」）。
+
+#[cfg(feature = "aac")]
+pub mod codec_aac;
 
 #[cfg(feature = "h264")]
 pub mod codec_h264;
