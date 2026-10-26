@@ -220,30 +220,31 @@ pub(crate) fn parse_slice_header(
     let mut ref_mods: Vec<(u8, u64)> = Vec::new();
     let mut ref_mods_l1: Vec<(u8, u64)> = Vec::new();
     let mut direct_spatial_mv_pred = true;
-    let mut read_reorder = |r: &mut BitReader<'_>, num_ref: usize| -> Result<Vec<(u8, u64)>, H264Error> {
-        let mut mods = Vec::new();
-        let mut count = 0usize;
-        loop {
-            let op = r.ue()?;
-            if op == 3 {
-                break;
+    let read_reorder =
+        |r: &mut BitReader<'_>, num_ref: usize| -> Result<Vec<(u8, u64)>, H264Error> {
+            let mut mods = Vec::new();
+            let mut count = 0usize;
+            loop {
+                let op = r.ue()?;
+                if op == 3 {
+                    break;
+                }
+                if op > 2 {
+                    return Err(H264Error::InvalidData(format!(
+                        "modification_of_pic_nums_idc {op} invalid"
+                    )));
+                }
+                if count >= num_ref {
+                    return Err(H264Error::InvalidData(
+                        "ref list modification count overflow".into(),
+                    ));
+                }
+                let val = r.ue()?;
+                mods.push((op as u8, val));
+                count += 1;
             }
-            if op > 2 {
-                return Err(H264Error::InvalidData(format!(
-                    "modification_of_pic_nums_idc {op} invalid"
-                )));
-            }
-            if count >= num_ref {
-                return Err(H264Error::InvalidData(
-                    "ref list modification count overflow".into(),
-                ));
-            }
-            let val = r.ue()?;
-            mods.push((op as u8, val));
-            count += 1;
-        }
-        Ok(mods)
-    };
+            Ok(mods)
+        };
     let read_num_ref = |r: &mut BitReader<'_>, which: u8| -> Result<usize, H264Error> {
         if r.u1()? {
             let n = r.ue()?;
@@ -544,8 +545,16 @@ fn decode_slice_cabac(
         let mbx = mb_idx % pic.mb_width;
         let mby = mb_idx / pic.mb_width;
         decode_mb_cabac(
-            &mut reader, pic, mbx, mby, pps, slice_id, &mut qp, &mut last_qscale_diff,
-            pctx, is_b,
+            &mut reader,
+            pic,
+            mbx,
+            mby,
+            pps,
+            slice_id,
+            &mut qp,
+            &mut last_qscale_diff,
+            pctx,
+            is_b,
         )
         .map_err(|e| H264Error::InvalidData(format!("cabac mb ({mbx},{mby}): {e}")))?;
         mb_idx += 1;

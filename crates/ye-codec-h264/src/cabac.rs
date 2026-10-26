@@ -119,11 +119,7 @@ impl<'a> Cabac<'a> {
     /// 旁路符号（FFmpeg get_cabac_bypass_sign 逐字：bypass 比较 ≥
     /// （"1"）→ 原值；<（"0"）→ 取反——与直观相反，经源码核证）。
     pub(crate) fn bypass_sign(&mut self, v: i32) -> i32 {
-        if self.bypass() == 1 {
-            v
-        } else {
-            -v
-        }
+        if self.bypass() == 1 { v } else { -v }
     }
 
     /// 终止决策（spec 9.3.3.3.3）：返回 `true` = end_of_slice_flag=1
@@ -174,6 +170,8 @@ impl CabacCtx {
         CabacCtx { state }
     }
 
+    // M2 WIP（CABAC 对拍收尾）：状态槽直读入口，编码侧/对拍诊断接线在即。
+    #[allow(dead_code)]
     pub(crate) fn get_mut(&mut self, ctx_idx: usize) -> &mut u8 {
         &mut self.state[ctx_idx]
     }
@@ -200,6 +198,9 @@ impl<'a> CabacReader<'a> {
     }
 
     /// 一元截止前缀（spec 9.3.2.3 前缀形态；如 mb_qp_delta 的 |Δ| 前缀）。
+    // M2 WIP（CABAC 对拍收尾）：dqp/mvd 现走专用循环，本形态供后续
+    // 语法元素（如 transform_8x8 族）接线。
+    #[allow(dead_code)]
     pub(crate) fn unary(&mut self, ctx_idx: usize, max: u32) -> u32 {
         let mut v = 0u32;
         while v < max && self.bin(ctx_idx) == 1 {

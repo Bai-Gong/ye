@@ -462,36 +462,34 @@ pub fn synth_frame(
         return Err(FilterbankError::BadPrevTailLen(prev_tail.len()));
     }
 
-    // 本帧对绝对时间轴的全部贡献（从交付区起点起，超出部分进 tail）
-    let mut contrib: Vec<f64>;
-    let tail_len: usize;
-
-    match win.sequence {
+    // 本帧对绝对时间轴的全部贡献（从交付区起点起，超出部分进 tail）。
+    // 匹配即求值 (贡献缓冲, 尾部长度)——两分支各自构造，尾长随形状定。
+    let (mut contrib, tail_len) = match win.sequence {
         BlockSequence::OnlyLong | BlockSequence::LongStart | BlockSequence::LongStop => {
             let w = frame_window(win, len)?;
             let raw = imdct(coeffs)?;
-            contrib = Vec::with_capacity(2 * m);
-            for (c, wi) in raw.into_iter().zip(w.iter()) {
-                contrib.push(c * (*wi as f64));
+            let mut c = Vec::with_capacity(2 * m);
+            for (cv, wi) in raw.into_iter().zip(w.iter()) {
+                c.push(cv * (*wi as f64));
             }
-            tail_len = m;
+            (c, m)
         }
         BlockSequence::EightShort => {
             // 8 块链：块 i 覆盖 [g+i·m, g+i·m+2m)，链总长 M+g+m
             let ws = shape_table(win.shape_curr, 2 * ms)?;
             let chain_len = m + g + ms;
-            contrib = vec![0.0f64; chain_len];
+            let mut c = vec![0.0f64; chain_len];
             for i in 0..8 {
                 let blk = &coeffs[i * ms..(i + 1) * ms];
                 let raw = imdct(blk)?;
                 let off = g + i * ms;
                 for (j, rj) in raw.into_iter().enumerate() {
-                    contrib[off + j] += rj * (ws[j] as f64);
+                    c[off + j] += rj * (ws[j] as f64);
                 }
             }
-            tail_len = g + ms;
+            (c, g + ms)
         }
-    }
+    };
 
     // 交付 = 本帧贡献前 M 点 + 上帧尾部
     let mut samples = Vec::with_capacity(m);

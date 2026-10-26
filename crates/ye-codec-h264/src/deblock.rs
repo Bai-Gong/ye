@@ -191,9 +191,7 @@ pub(crate) fn boundary_strength(
         let dmvy = i32::from(pmv[1]) - i32::from(qmv[1]);
         dmvx.abs() >= 4 || dmvy.abs() >= 4
     };
-    if cmp_list(p_mb, q_mb, p_blk, q_blk, false)
-        || cmp_list(p_mb, q_mb, p_blk, q_blk, true)
-    {
+    if cmp_list(p_mb, q_mb, p_blk, q_blk, false) || cmp_list(p_mb, q_mb, p_blk, q_blk, true) {
         return 1;
     }
     0

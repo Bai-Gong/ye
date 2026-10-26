@@ -14,25 +14,23 @@
 //! cbp luma；77..84 cbp chroma；85..101 coded_block_flag；399..400
 //! transform_8x8；残差 sig/last/abs 按 cat 偏移表（下方常量）。
 
-use std::sync::Arc;
-
 use crate::cabac::CabacReader;
 use crate::error::H264Error;
 use crate::inter::{InterCtx, MvPart, apply_parts, build_mv_grid_list, write_parts};
 use crate::intra8x8;
 use crate::macroblock::{
-    CHROMA_QP, InterShape, MbKind, Macroblock, Picture, Z_ORDER, add_block, chroma_dc_dequant,
-    decode_skip_mb, gather_16x16_edges, gather_chroma_edges, luma_dc_dequant, neighbor_avail,
-    neighbor_i4_mode, pred_16x16, pred_8x8c, prev_i4_mode, reconstruct_4x4, rewrite_4x4_modes,
-    rewrite_dc_mode, pred_motion, pred_16x8, pred_8x16, MvGrid, PART_NOT_AVAILABLE,
+    CHROMA_QP, InterShape, Macroblock, MbKind, MvGrid, Picture, Z_ORDER, add_block,
+    chroma_dc_dequant, decode_skip_mb, gather_16x16_edges, gather_chroma_edges, luma_dc_dequant,
+    neighbor_avail, neighbor_i4_mode, pred_8x8c, pred_8x16, pred_16x8, pred_16x16, pred_motion,
+    prev_i4_mode, reconstruct_4x4, rewrite_4x4_modes, rewrite_dc_mode,
 };
 use crate::sps::Pps;
 
 // ---------------------------------------------------------------------------
 // 上下文偏移（见模块文档）
 // ---------------------------------------------------------------------------
-const CTX_MB_TYPE_I: usize = 3;  // FFmpeg I 片 intra mb_type 基址（0..2 保留未用）
-const CTX_MB_TYPE_PB_INTRA: usize = 17;  // FFmpeg P 片 intra 基址
+const CTX_MB_TYPE_I: usize = 3; // FFmpeg I 片 intra mb_type 基址（0..2 保留未用）
+const CTX_MB_TYPE_PB_INTRA: usize = 17; // FFmpeg P 片 intra 基址
 const CTX_SKIP: usize = 11;
 const CTX_SKIP_B: usize = 24;
 const CTX_MB_TYPE_P: usize = 14;
@@ -181,7 +179,7 @@ fn decode_residual_8x8(
 /// 幅值 + 符号（FFmpeg STORE_BLOCK 逐字：node_ctx 状态机 + UEGk 后缀）。
 fn store_levels(
     r: &mut CabacReader<'_>,
-    mut index: [usize; 64],
+    index: [usize; 64],
     mut coeff_count: usize,
     scan: &[usize],
     qmul: Option<&[u32]>,
@@ -214,7 +212,9 @@ fn store_levels(
                 abs = 1;
                 while k > 0 {
                     k -= 1;
-                    abs += abs + r.cabac.bypass() as i32;
+                    // FFmpeg 逐字 `level += level + get_cabac_bypass(...)`：
+                    // 倍增式 UEGk 后缀（语义即 abs ← 2·abs + bit），非误写。
+                    abs = abs + abs + r.cabac.bypass() as i32;
                 }
                 abs += 14;
             }
@@ -251,8 +251,7 @@ fn decode_skip(r: &mut CabacReader<'_>, pic: &Picture, mbx: usize, mby: usize, i
     if mbx > 0 && pic.mbs[mb_xy - 1].decoded && !pic.mbs[mb_xy - 1].skipped {
         ctx += 1;
     }
-    if mby > 0 && pic.mbs[mb_xy - pic.mb_width].decoded && !pic.mbs[mb_xy - pic.mb_width].skipped
-    {
+    if mby > 0 && pic.mbs[mb_xy - pic.mb_width].decoded && !pic.mbs[mb_xy - pic.mb_width].skipped {
         ctx += 2;
     }
     let base = if is_b { CTX_SKIP_B } else { CTX_SKIP };
@@ -273,12 +272,7 @@ fn decode_intra_mb_type(
     let mut base = ctx_base;
     if intra_slice {
         let mut ctx = 0usize;
-        if mbx > 0
-            && matches!(
-                pic.mbs[mb_xy - 1].kind,
-                MbKind::Intra16x16 | MbKind::Pcm
-            )
-        {
+        if mbx > 0 && matches!(pic.mbs[mb_xy - 1].kind, MbKind::Intra16x16 | MbKind::Pcm) {
             ctx += 1;
         }
         if mby > 0
@@ -332,8 +326,7 @@ fn decode_b_mb_type(
     let mb_xy = mby * pic.mb_width + mbx;
     let mut ctx = 0usize;
     // FFmpeg：!IS_DIRECT(left_type − 1)——邻块非直接（+1 的哨兵位移）
-    let is_direct = |mb: &Macroblock| mb.kind == MbKind::InterB && mb.skipped
-        || direct_mb(pic, mb);
+    let is_direct = |mb: &Macroblock| mb.kind == MbKind::InterB && mb.skipped || direct_mb(pic, mb);
     if mbx == 0 || !is_direct(&pic.mbs[mb_xy - 1]) {
         ctx += 1;
     }
@@ -423,7 +416,8 @@ fn decode_chroma_mode(r: &mut CabacReader<'_>, pic: &Picture, mbx: usize, mby: u
     if mbx > 0 && pic.mbs[mb_xy - 1].decoded && pic.mbs[mb_xy - 1].chroma_mode != 0 {
         ctx += 1;
     }
-    if mby > 0 && pic.mbs[mb_xy - pic.mb_width].decoded
+    if mby > 0
+        && pic.mbs[mb_xy - pic.mb_width].decoded
         && pic.mbs[mb_xy - pic.mb_width].chroma_mode != 0
     {
         ctx += 2;
@@ -463,11 +457,7 @@ const fn cbp_unavailable(cur_intra: bool) -> u16 {
 }
 
 /// cbp luma（FFmpeg decode_cabac_mb_cbp_luma）。
-fn decode_cbp_luma(
-    r: &mut CabacReader<'_>,
-    left_cbp: u16,
-    top_cbp: u16,
-) -> u8 {
+fn decode_cbp_luma(r: &mut CabacReader<'_>, left_cbp: u16, top_cbp: u16) -> u8 {
     let cbp_a = left_cbp;
     let cbp_b = top_cbp;
     let mut cbp = 0u8;
@@ -483,11 +473,7 @@ fn decode_cbp_luma(
 }
 
 /// cbp chroma（FFmpeg decode_cabac_mb_cbp_chroma）。
-fn decode_cbp_chroma(
-    r: &mut CabacReader<'_>,
-    left_cbp: u16,
-    top_cbp: u16,
-) -> u8 {
+fn decode_cbp_chroma(r: &mut CabacReader<'_>, left_cbp: u16, top_cbp: u16) -> u8 {
     let cbp_a = (left_cbp >> 4) & 0x03;
     let cbp_b = (top_cbp >> 4) & 0x03;
     let mut ctx = 0usize;
@@ -512,7 +498,11 @@ fn decode_cbp_chroma(
 
 /// mb_qp_delta（FFmpeg decode_cabac_mb_dqp 逐字：首 bin ctx 由上 MB
 /// delta≠0 决定；一元 |Δ| 后按奇偶定号）。
-fn decode_dqp(r: &mut CabacReader<'_>, last_qscale_diff: &mut i32, qp: &mut u8) -> Result<(), H264Error> {
+fn decode_dqp(
+    r: &mut CabacReader<'_>,
+    last_qscale_diff: &mut i32,
+    qp: &mut u8,
+) -> Result<(), H264Error> {
     if r.bin(CTX_DQP + usize::from(*last_qscale_diff != 0)) == 0 {
         *last_qscale_diff = 0;
         return Ok(());
@@ -545,12 +535,7 @@ fn decode_dqp(r: &mut CabacReader<'_>, last_qscale_diff: &mut i32, qp: &mut u8) 
 
 /// ref_idx（FFmpeg decode_cabac_mb_ref：一元，ctx=(ctx>>2)+4 推进；
 /// B 片邻块 direct 位不计数——近似为邻块 ref>0）。
-fn decode_ref(
-    r: &mut CabacReader<'_>,
-    max: usize,
-    refa: i8,
-    refb: i8,
-) -> Result<usize, H264Error> {
+fn decode_ref(r: &mut CabacReader<'_>, max: usize, refa: i8, refb: i8) -> Result<usize, H264Error> {
     let mut ctx = 0usize;
     if refa > 0 {
         ctx += 1;
@@ -676,15 +661,15 @@ impl RefMvdEdge {
         let mut left = [(-2, [0; 2], false); 4];
         if mbx > 0 {
             let lmb = &pic.mbs[mb_xy - 1];
-            for y in 0..4 {
-                left[y] = entry(lmb, 3 + y * 4);
+            for (y, slot) in left.iter_mut().enumerate() {
+                *slot = entry(lmb, 3 + y * 4);
             }
         }
         let mut top = [(-2, [0; 2], false); 4];
         if mby > 0 {
             let tmb = &pic.mbs[mb_xy - pic.mb_width];
-            for x in 0..4 {
-                top[x] = entry(tmb, 12 + x);
+            for (x, slot) in top.iter_mut().enumerate() {
+                *slot = entry(tmb, 12 + x);
             }
         }
         RefMvdEdge {
@@ -707,6 +692,10 @@ impl RefMvdEdge {
         (self.cur_ref[b], self.cur_mvd[b], self.cur_direct[b])
     }
 
+    // 8 个参数（超 clippy 默认上限 1 个）：矩形锚点 (bx,by,w,h) 与
+    // (ref, mvd, direct) 三元组各占一席——与 [`MvPart`] 字段一一对应的
+    // 落位原语，收拢进结构体会让每个调用点多拆一次包。
+    #[allow(clippy::too_many_arguments)]
     fn set_rect(
         &mut self,
         bx: i32,
@@ -789,9 +778,9 @@ fn read_quad_ref(
 /// B 子分区几何：类型 → (子分区数, 分区列表逐个 (bx,by,w,h))。
 fn b_sub_geometry(s: u8, x0: i32, y0: i32) -> Vec<(i32, i32, i32, i32)> {
     match s {
-        1 | 2 | 3 => vec![(x0, y0, 2, 2)],
-        4 | 5 | 6 => vec![(x0, y0, 2, 1), (x0, y0 + 1, 2, 1)],
-        7 | 8 | 9 => vec![(x0, y0, 1, 2), (x0 + 1, y0, 1, 2)],
+        1..=3 => vec![(x0, y0, 2, 2)],
+        4..=6 => vec![(x0, y0, 2, 1), (x0, y0 + 1, 2, 1)],
+        7..=9 => vec![(x0, y0, 1, 2), (x0 + 1, y0, 1, 2)],
         _ => vec![
             (x0, y0, 1, 1),
             (x0 + 1, y0, 1, 1),
@@ -842,11 +831,17 @@ pub(crate) fn decode_mb_cabac(
 
     // ---- mb_type ----
     let (intra_t, inter_t): (Option<u64>, Option<(bool, u64)>) = if !is_inter_slice {
-        (Some(decode_intra_mb_type(r, pic, mbx, mby, CTX_MB_TYPE_I, true)?), None)
+        (
+            Some(decode_intra_mb_type(r, pic, mbx, mby, CTX_MB_TYPE_I, true)?),
+            None,
+        )
     } else if is_b_slice {
         let t = decode_b_mb_type(r, pic, mbx, mby)?;
         if t == u64::MAX {
-            (Some(decode_intra_mb_type(r, pic, mbx, mby, 32, false)?), None)
+            (
+                Some(decode_intra_mb_type(r, pic, mbx, mby, 32, false)?),
+                None,
+            )
         } else {
             (None, Some((true, t)))
         }
@@ -854,7 +849,14 @@ pub(crate) fn decode_mb_cabac(
         let t = decode_p_mb_type(r);
         if t == u64::MAX {
             (
-                Some(decode_intra_mb_type(r, pic, mbx, mby, CTX_MB_TYPE_PB_INTRA, false)?),
+                Some(decode_intra_mb_type(
+                    r,
+                    pic,
+                    mbx,
+                    mby,
+                    CTX_MB_TYPE_PB_INTRA,
+                    false,
+                )?),
                 None,
             )
         } else {
@@ -918,7 +920,11 @@ pub(crate) fn decode_mb_cabac(
             slice_id,
             ictx.map(|c| c.constrained).unwrap_or(false),
         );
-        let left_mb = if avail.left { Some(&pic.mbs[mb_xy - 1]) } else { None };
+        let left_mb = if avail.left {
+            Some(&pic.mbs[mb_xy - 1])
+        } else {
+            None
+        };
         let top_mb = if avail.top {
             Some(&pic.mbs[mb_xy - pic.mb_width])
         } else {
@@ -941,9 +947,10 @@ pub(crate) fn decode_mb_cabac(
             if mb.transform_8x8 {
                 // 4 个 8x8 模式（z 序象限：q = 2·(块行/2)+块列/2，与 Z_ORDER 对齐）
                 for q in 0..4usize {
-                    let b = q * 4;
-                    let left = left_mb.map(|m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 0));
-                    let top = top_mb.map(|m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 1));
+                    let left =
+                        left_mb.map(|_m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 0));
+                    let top =
+                        top_mb.map(|_m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 1));
                     let prev = prev_i4_mode(left, top);
                     let mode = decode_i4_mode(r, prev);
                     for k in 0..4usize {
@@ -1003,7 +1010,17 @@ pub(crate) fn decode_mb_cabac(
                 rewrite_dc_mode(mb.chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
             decode_dqp(r, last_qscale_diff, qp)?;
         }
-        decode_residual_mb(r, &mut mb, pps, *qp, &mut luma_blocks, &mut luma8_blocks, &mut chroma_blocks, left_mb, top_mb)?;
+        decode_residual_mb(
+            r,
+            &mut mb,
+            pps,
+            *qp,
+            &mut luma_blocks,
+            &mut luma8_blocks,
+            &mut chroma_blocks,
+            left_mb,
+            top_mb,
+        )?;
         reconstruct_intra(
             pic,
             mbx,
@@ -1048,24 +1065,31 @@ pub(crate) fn decode_mb_cabac(
             let n_parts = if t == 0 { 1 } else { 2 };
             // ref 先读全（FFmpeg：两分区 ref 在 mvd 前）
             let mut refs = [0i8; 2];
-            for i in 0..n_parts {
+            for (i, ri) in refs.iter_mut().enumerate().take(n_parts) {
                 let (bx, by, w, h) = p_part_pos(t, i);
-                refs[i] = read_quad_ref(r, &mut edge0, n0, bx, by)?;
+                *ri = read_quad_ref(r, &mut edge0, n0, bx, by)?;
                 let _ = (w, h);
             }
-            for i in 0..n_parts {
+            for (i, &ri) in refs.iter().enumerate().take(n_parts) {
                 let (bx, by, _w, _h) = p_part_pos(t, i);
                 let (w, h) = (_w, _h);
                 let mv = if t == 0 {
-                    read_partition_mvd(r, &mut edge0, &grid0, bx, by, w, h, refs[i])?
+                    read_partition_mvd(r, &mut edge0, &grid0, bx, by, w, h, ri)?
                 } else if t == 1 {
-                    let mvp = pred_16x8(&grid0, by, refs[i]);
-                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, refs[i], mvp)?
+                    let mvp = pred_16x8(&grid0, by, ri);
+                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, ri, mvp)?
                 } else {
-                    let mvp = pred_8x16(&grid0, bx, refs[i]);
-                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, refs[i], mvp)?
+                    let mvp = pred_8x16(&grid0, bx, ri);
+                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, ri, mvp)?
                 };
-                parts.push(MvPart { bx, by, w, h, l0: Some((refs[i], mv)), l1: None });
+                parts.push(MvPart {
+                    bx,
+                    by,
+                    w,
+                    h,
+                    l0: Some((ri, mv)),
+                    l1: None,
+                });
             }
         } else {
             // P_8x8
@@ -1084,7 +1108,14 @@ pub(crate) fn decode_mb_cabac(
                 let (x0, y0) = (((i8x8 & 1) * 2) as i32, ((i8x8 >> 1) * 2) as i32);
                 for (bx, by, w, h) in p_sub_geometry(subs[i8x8], x0, y0) {
                     let mv = read_partition_mvd(r, &mut edge0, &grid0, bx, by, w, h, refs[i8x8])?;
-                    parts.push(MvPart { bx, by, w, h, l0: Some((refs[i8x8], mv)), l1: None });
+                    parts.push(MvPart {
+                        bx,
+                        by,
+                        w,
+                        h,
+                        l0: Some((refs[i8x8], mv)),
+                        l1: None,
+                    });
                 }
             }
         }
@@ -1123,9 +1154,16 @@ pub(crate) fn decode_mb_cabac(
             }
             // refs（FFmpeg list 外层 → 象限内层；象限内按 8x8 粒度先读）
             let mut refs = [[0i8; 2]; 4]; // [quad][list]
+            // `list` 是 refs 的内层维下标（另驱动 edge/n 选择）；按外层维
+            //（象限）迭代会颠倒 CABAC 读取顺序（FFmpeg 为 list 外层）。
+            #[allow(clippy::needless_range_loop)]
             for list in 0..2usize {
                 let n = if list == 0 { n0 } else { n1 };
-                let edge = if list == 0 { &mut edge0 } else { edge1.as_mut().expect("b slice") };
+                let edge = if list == 0 {
+                    &mut edge0
+                } else {
+                    edge1.as_mut().expect("b slice")
+                };
                 for i8x8 in 0..4usize {
                     let s = subs[i8x8];
                     if s == 0 {
@@ -1143,8 +1181,7 @@ pub(crate) fn decode_mb_cabac(
                     refs[i8x8][list] = read_quad_ref(r, edge, n, x0, y0)?;
                 }
                 // n<=1 且 uses：ref=0（读 8x8 域内落位）
-                for i8x8 in 0..4usize {
-                    let s = subs[i8x8];
+                for (i8x8, &s) in subs.iter().enumerate() {
                     if s == 0 {
                         continue;
                     }
@@ -1160,9 +1197,19 @@ pub(crate) fn decode_mb_cabac(
                 }
             }
             // mvd（FFmpeg list 外层 → 象限 → 子分区）
+            // 同上：`list` 为 refs 内层维下标，重排迭代序即改码流读序。
+            #[allow(clippy::needless_range_loop)]
             for list in 0..2usize {
-                let edge = if list == 0 { &mut edge0 } else { edge1.as_mut().expect("b slice") };
-                let grid = if list == 0 { &grid0 } else { grid1.as_ref().expect("b slice") };
+                let edge = if list == 0 {
+                    &mut edge0
+                } else {
+                    edge1.as_mut().expect("b slice")
+                };
+                let grid = if list == 0 {
+                    &grid0
+                } else {
+                    grid1.as_ref().expect("b slice")
+                };
                 for i8x8 in 0..4usize {
                     let s = subs[i8x8];
                     if s == 0 {
@@ -1213,7 +1260,11 @@ pub(crate) fn decode_mb_cabac(
                     continue;
                 }
                 let n = if list == 0 { n0 } else { n1 };
-                let edge = if list == 0 { &mut edge0 } else { edge1.as_mut().expect("b slice") };
+                let edge = if list == 0 {
+                    &mut edge0
+                } else {
+                    edge1.as_mut().expect("b slice")
+                };
                 for i in 0..n_parts {
                     if !lists[i][list] {
                         continue;
@@ -1230,8 +1281,16 @@ pub(crate) fn decode_mb_cabac(
             }
             // mvd：list 外层 → 分区内层（分区预测按形状）
             for list in 0..2usize {
-                let edge = if list == 0 { &mut edge0 } else { edge1.as_mut().expect("b slice") };
-                let grid = if list == 0 { &grid0 } else { grid1.as_ref().expect("b slice") };
+                let edge = if list == 0 {
+                    &mut edge0
+                } else {
+                    edge1.as_mut().expect("b slice")
+                };
+                let grid = if list == 0 {
+                    &grid0
+                } else {
+                    grid1.as_ref().expect("b slice")
+                };
                 for i in 0..n_parts {
                     if !lists[i][list] {
                         continue;
@@ -1304,8 +1363,14 @@ pub(crate) fn decode_mb_cabac(
     write_mvd(&mut mb, &edge0, edge1.as_ref());
     let ys = pic.luma_stride();
     if mb.transform_8x8 {
-        for q in 0..4usize {
-            add_block8(&mut pic.luma, ys, mby * 16 + (q >> 1) * 8, mbx * 16 + (q & 1) * 8, &mut luma8_blocks[q]);
+        for (q, blk) in luma8_blocks.iter_mut().enumerate() {
+            add_block8(
+                &mut pic.luma,
+                ys,
+                mby * 16 + (q >> 1) * 8,
+                mbx * 16 + (q & 1) * 8,
+                blk,
+            );
         }
     } else {
         for &b in Z_ORDER.iter() {
@@ -1378,6 +1443,10 @@ fn read_partition_mvd_pred(
 }
 
 /// B 分区累积（同几何分区两列表分两次到达时合并）。
+// 8 个参数（超 clippy 默认上限 1 个）：目标 Vec + 分区几何四元组 +
+// (list, ref, mv) 三元组——与 [`MvPart`] 字段一一对应的累积原语，
+// 收拢进结构体会让两个调用点各多拆一次包。
+#[allow(clippy::too_many_arguments)]
 fn push_b_part(
     parts: &mut Vec<MvPart>,
     bx: i32,
@@ -1398,7 +1467,14 @@ fn push_b_part(
             return;
         }
     }
-    let mut p = MvPart { bx, by, w, h, l0: None, l1: None };
+    let mut p = MvPart {
+        bx,
+        by,
+        w,
+        h,
+        l0: None,
+        l1: None,
+    };
     if list == 0 {
         p.l0 = Some((ref_idx, mv));
     } else {
@@ -1433,6 +1509,9 @@ fn add_block8(plane: &mut [u8], stride: usize, y0: usize, x0: usize, block: &mut
 // ---------------------------------------------------------------------------
 
 /// chroma AC 块 (plane, i) 的左/上 nnz。
+// M2 WIP（CABAC 对拍收尾）：nnz 不可用哨兵语义改走 decode_residual_mb
+// 内闭包（chroma_nnz）后保留的 Option 形态变体，收尾轮定去留。
+#[allow(dead_code)]
 fn chroma_nnz_pair(
     left_mb: Option<&Macroblock>,
     top_mb: Option<&Macroblock>,
@@ -1475,7 +1554,7 @@ fn decode_residual_mb(
     left_mb: Option<&Macroblock>,
     top_mb: Option<&Macroblock>,
 ) -> Result<(), H264Error> {
-    use crate::macroblock::{CHROMA_DC_SCAN, ZIGZAG};
+    use crate::macroblock::ZIGZAG;
     let cur_intra = matches!(mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm);
     let lw = left_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
     let tw = top_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
@@ -1513,7 +1592,7 @@ fn decode_residual_mb(
     };
     // 8x8 象限 cbf：象限左上 4x4 的左/上（象限内左/上属未解区 → 当前
     // MB 内部取 0——与 FFmpeg nnz 缓存对角位初值 0x40?? 不同：
-    // FFmpeg 象限内角块读缓存扫描位（内部块已含当前 MB 未解码区 = 
+    // FFmpeg 象限内角块读缓存扫描位（内部块已含当前 MB 未解码区 =
     // 缓存初值——FFmpeg 缓存预置 0x40?? 实为扫描位旁的内区块按已填
     // 缓存取—— CABAC 残差解码时内部块尚未解、缓存为初始复制值，
     // 其左/上恰为邻边值。此处按象限左上块的邻边语义：cx>0/cy>0 恒
@@ -1579,7 +1658,7 @@ fn decode_residual_mb(
         }
     } else if mb.transform_8x8 {
         let qmul = pps.dequant8_coeff(qp, if list == 0 { 0 } else { 1 });
-        for q in 0..4usize {
+        for (q, blk) in luma8_blocks.iter_mut().enumerate() {
             if mb.cbp & (1 << q) != 0 {
                 let (a, c) = quad_nnz(&mb.nnz, q);
                 let n = decode_residual(
@@ -1589,7 +1668,7 @@ fn decode_residual_mb(
                     &intra8x8::ZIGZAG8,
                     Some(&qmul),
                     (Some(a), Some(c)),
-                    &mut luma8_blocks[q],
+                    blk,
                 )?;
                 let nnz = n as u8;
                 for k in 0..4usize {
@@ -1620,7 +1699,7 @@ fn decode_residual_mb(
     let qpc_cb = CHROMA_QP[(i32::from(qp) + pps.chroma_qp_offset(0)).clamp(0, 51) as usize];
     let qpc_cr = CHROMA_QP[(i32::from(qp) + pps.chroma_qp_offset(1)).clamp(0, 51) as usize];
     if mb.cbp & 0x30 != 0 {
-        for plane in 0..2usize {
+        for (plane, cblocks) in chroma_blocks.iter_mut().enumerate() {
             let nza = ((lw >> (6 + plane)) & 1) as u8;
             let nzb = ((tw >> (6 + plane)) & 1) as u8;
             let mut buf = [0i16; 16];
@@ -1637,17 +1716,17 @@ fn decode_residual_mb(
             let x = [buf[0], buf[1], buf[4], buf[5]];
             let qpc = if plane == 0 { qpc_cb } else { qpc_cr };
             let dcs = chroma_dc_dequant(&x, pps.dequant4_coeff(qpc, 1 + plane)[0])?;
-            for (cblk, &dc) in chroma_blocks[plane].iter_mut().zip(dcs.iter()) {
+            for (cblk, &dc) in cblocks.iter_mut().zip(dcs.iter()) {
                 cblk[0] = dc;
             }
         }
     }
     // ---- chroma AC（cat 4）----
     if mb.cbp & 0x20 != 0 {
-        for plane in 0..2usize {
+        for (plane, cblocks) in chroma_blocks.iter_mut().enumerate() {
             let qpc = if plane == 0 { qpc_cb } else { qpc_cr };
             let qmul = pps.dequant4_coeff(qpc, 1 + plane);
-            for i in 0..4usize {
+            for (i, cblk) in cblocks.iter_mut().enumerate() {
                 let base = 16 + plane * 4;
                 let nnz_snap = mb.nnz;
                 let (a, c) = chroma_nnz(&nnz_snap, plane, i);
@@ -1658,7 +1737,7 @@ fn decode_residual_mb(
                     &ZIGZAG[1..].iter().map(|v| *v as usize).collect::<Vec<_>>(),
                     Some(&qmul),
                     (Some(a), Some(c)),
-                    &mut chroma_blocks[plane][i],
+                    cblk,
                 )? as u8;
             }
         }
@@ -1681,21 +1760,13 @@ fn reconstruct_intra(
     let ys = pic.luma_stride();
     match mb.kind {
         MbKind::Intra4x4 if mb.transform_8x8 => {
-            for q in 0..4usize {
-                intra8x8::reconstruct_8x8(pic, mbx, mby, q, mb.i4_modes[q * 4], &mut luma8_blocks[q]);
+            for (q, blk) in luma8_blocks.iter_mut().enumerate() {
+                intra8x8::reconstruct_8x8(pic, mbx, mby, q, mb.i4_modes[q * 4], blk);
             }
         }
         MbKind::Intra4x4 => {
             for &b in Z_ORDER.iter() {
-                reconstruct_4x4(
-                    pic,
-                    mbx,
-                    mby,
-                    b,
-                    avail,
-                    mb.i4_modes[b],
-                    &mut luma_blocks[b],
-                );
+                reconstruct_4x4(pic, mbx, mby, b, avail, mb.i4_modes[b], &mut luma_blocks[b]);
             }
         }
         MbKind::Intra16x16 => {

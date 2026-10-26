@@ -10,8 +10,10 @@
 //!    比较器与施工图③容差（100% |Δ|≤4 且每帧 |Δ|≤1 占比 ≥99.9%，
 //!    逐帧判定）独立裁决。
 //!
-//! 向量缺席（未跑 `bash tests/conformance/fetch.sh`）按**失败**处理——
-//! 门禁不许假绿。
+//! 三分支门禁语义：PATH 无 ffmpeg → 整组打印跳过、不计失败（oracle
+//! 缺位时对拍无从谈起，先于向量检查短路）；ffmpeg 在而向量缓存缺席
+//! （未跑 `bash tests/conformance/fetch.sh`）→ 仍按**失败**处理——
+//! 工具就绪却没拉向量是维护疏漏，跳过即是假绿；两者齐备 → 逐条对拍。
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,8 +53,8 @@ fn decode_vector(vec_path: &PathBuf, container: &str) -> (Vec<f32>, usize) {
                     if channels == 0 {
                         channels = a.channel_layout().channels() as usize;
                     }
-                    for c in a.data().chunks_exact(4) {
-                        samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                    for c in a.data().as_chunks::<4>().0 {
+                        samples.push(f32::from_le_bytes(*c));
                     }
                 }
                 Decoded::NeedInput | Decoded::Finished => return Ok(()),
@@ -125,6 +127,16 @@ fn decode_vector(vec_path: &PathBuf, container: &str) -> (Vec<f32>, usize) {
     (samples, channels)
 }
 
+/// PATH 上是否有可用 ffmpeg（探测式启动 `-version`，不依赖 shell）。
+fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 #[test]
 fn aac_vectors_pass_conformance() {
     let manifest_path = workspace_root().join("tests/conformance/manifest.toml");
@@ -146,6 +158,15 @@ fn aac_vectors_pass_conformance() {
     let Tolerance::PcmTwoLevel { .. } = tol else {
         panic!("aac 容差非 PCM 双层口径")
     };
+    // 三分支守卫①：ffmpeg 缺位 → 整组跳过（先于向量缓存检查，不计失败；
+    // 清单/容差表的库内完整性检查不受影响）。
+    if !ffmpeg_available() {
+        eprintln!(
+            "跳过 aac 对拍：PATH 无 ffmpeg（oracle 缺位；\
+             装回 ffmpeg 并跑 `bash tests/conformance/fetch.sh` 后复测）"
+        );
+        return;
+    }
     let mut passed = 0usize;
     for entry in &aac {
         let vec_path = cache.join(format!("{}.{}", entry.name, entry.container));
@@ -174,7 +195,12 @@ fn aac_vectors_pass_conformance() {
         cmd.arg("-i")
             .arg(&vec_path)
             .args(["-map", "0:a:0", "-f", "s16le", "-c:a", "pcm_s16le"]);
-        let status = cmd.arg(&ref_path).status().expect("spawn ffmpeg");
+        // 守卫语义：入口已查 ffmpeg 在位（缺席即整组跳过），此处失联
+        // 属环境竞态，按失败暴露。
+        let status = cmd
+            .arg(&ref_path)
+            .status()
+            .expect("启动 ffmpeg（入口守卫已确认在位）");
         assert!(status.success(), "ffmpeg 退出码 {status}");
         let ref_pcm = std::fs::read(&ref_path).expect("读 ref");
         let _ = std::fs::remove_file(&ref_path);

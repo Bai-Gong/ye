@@ -9,8 +9,10 @@
 //! 4. 本测试内再以 ffmpeg rawvideo 为 oracle、用 ye-conformance 的
 //!    比较器与施工图②容差（100% |Δ|≤1 且 ≥99.9% Δ=0）独立裁决。
 //!
-//! 向量缺席（未跑 `bash tests/conformance/fetch.sh`）按**失败**处理——
-//! 门禁不许假绿。
+//! 三分支门禁语义：PATH 无 ffmpeg → 整组打印跳过、不计失败（oracle
+//! 缺位时对拍无从谈起，先于向量检查短路）；ffmpeg 在而向量缓存缺席
+//! （未跑 `bash tests/conformance/fetch.sh`）→ 仍按**失败**处理——
+//! 工具就绪却没拉向量是维护疏漏，跳过即是假绿；两者齐备 → 逐条对拍。
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -104,6 +106,16 @@ fn decode_vector(mp4: &PathBuf) -> (Vec<u8>, usize, usize) {
     (yuv, w, h)
 }
 
+/// PATH 上是否有可用 ffmpeg（探测式启动 `-version`，不依赖 shell）。
+fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// ffmpeg oracle：`-pix_fmt yuv420p -f rawvideo`。
 fn ffmpeg_oracle_yuv(mp4: &PathBuf) -> Vec<u8> {
     let out = std::env::temp_dir().join(format!(
@@ -126,7 +138,9 @@ fn ffmpeg_oracle_yuv(mp4: &PathBuf) -> Vec<u8> {
         .arg("rawvideo")
         .arg(&out)
         .status()
-        .expect("启动 ffmpeg（PATH 需有 ffmpeg）");
+        // 守卫语义：入口已查 ffmpeg 在位（缺席即整组跳过），此处失联
+        // 属环境竞态，按失败暴露。
+        .expect("启动 ffmpeg（入口守卫已确认在位）");
     assert!(status.success(), "ffmpeg oracle 解码失败");
     let mut buf = Vec::new();
     std::fs::File::open(&out)
@@ -151,6 +165,15 @@ fn run_set(manifest_set: &str) {
         "清单缺 {manifest_set} 集（对拍器维护员负责）"
     );
 
+    // 三分支守卫①：ffmpeg 缺位 → 整组跳过（先于向量缓存检查，不计失败）。
+    if !ffmpeg_available() {
+        eprintln!(
+            "跳过 {manifest_set} 集对拍：PATH 无 ffmpeg（oracle 缺位；\
+             装回 ffmpeg 并跑 `bash tests/conformance/fetch.sh` 后复测）"
+        );
+        return;
+    }
+
     let cache = cache_dir();
     if let Ok(path) = std::env::var("YE_H264_SCRATCH_VEC") {
         // 诊断通道：单向量临时路径（不走清单/缓存）
@@ -165,12 +188,9 @@ fn run_set(manifest_set: &str) {
             report.frames, report.max_abs, report.first_diff
         );
         if std::env::var_os("YE_H264_SCRATCH_DUMP").is_some() {
-            std::fs::write(
-                "C:/Users/hi/AppData/Local/Temp/our_f0.yuv",
-                &our_yuv[..w * h],
-            )
-            .unwrap();
-            println!("dumped our frame0 ({w}x{h})");
+            let dump = std::env::temp_dir().join("ye-h264-scratch-our-f0.yuv");
+            std::fs::write(&dump, &our_yuv[..w * h]).expect("写 scratch dump");
+            println!("dumped our frame0 ({w}x{h}) -> {}", dump.display());
         }
         return;
     }

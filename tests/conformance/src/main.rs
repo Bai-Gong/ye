@@ -550,8 +550,8 @@ fn aac_run(
                 *channels = a.channel_layout().channels() as usize;
             }
             let b = a.data();
-            for c in b.chunks_exact(4) {
-                out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            for c in b.as_chunks::<4>().0 {
+                out.push(f32::from_le_bytes(*c));
             }
         }
         Ok(out)

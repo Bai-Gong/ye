@@ -85,33 +85,41 @@ const ZIGZAG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 
 
 /// 8x8 zigzag 扫描（spec 表 7-6 = FFmpeg ff_zigzag_direct 逐字）。
 const ZIGZAG8: [usize; 64] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
-    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 /// jvt 缺省 4x4 量化表（FFmpeg default_scaling4 逐字；仅"使用缺省矩阵"
 /// 语义（首 delta 落 0）时启用，未发 scaling list 时用全 16 平表）。
 const JVT_SCALING4: [[u8; 16]; 2] = [
-    [6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42],
-    [10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34],
+    [
+        6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42,
+    ],
+    [
+        10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34,
+    ],
 ];
 
 /// jvt 缺省 8x8 量化表（FFmpeg default_scaling8 逐字）。
 const JVT_SCALING8: [[u8; 64]; 2] = [
     [
         6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29, 13, 16, 18, 23, 25, 27, 29,
-        31, 16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31,
-        33, 36, 38, 25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
+        31, 16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31, 33,
+        36, 38, 25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
     ],
     [
         9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25, 15, 17, 19, 21, 22, 24, 25,
-        27, 17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27,
-        28, 30, 32, 22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
+        27, 17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27, 28,
+        30, 32, 22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
     ],
 ];
 
 /// 全 16 平表（未发任何 scaling list 时的有效量化矩阵）。
+// M2 WIP（High profile 收尾）：seq_scaling_matrix_present 缺席时的
+/// fallback 基表接线在即（现经 dequant4_coeff 的 `[16; 16]` 字面量
+// 兜底，语义同值）。
+#[allow(dead_code)]
 const FLAT4: [u8; 16] = [16; 16];
 
 /// 解析一条 scaling list（FFmpeg decode_scaling_list 逐字：
@@ -149,6 +157,9 @@ fn parse_scaling_list(
     Ok(out)
 }
 
+/// scaling matrix 组解析结果：4x4 六条（恒有）+ 8x8 两条（High 族才有）。
+type ScalingMatrices = ([[u8; 16]; 6], Option<[[u8; 64]; 2]>);
+
 /// SPS/PPS 的 scaling matrix 组解析（FFmpeg decode_scaling_matrices 逐字，
 /// 4:2:0 面：6 条 4x4 + 2 条 8x8；回退链：4x4[1]←[0]、[2]←[1]、
 /// 4x4[4]←[3]、[5]←[4]、8x8 组←SPS 对应组（PPS 层）或 jvt 缺省）。
@@ -158,12 +169,19 @@ fn parse_scaling_matrices(
     parse_8x8: bool,
     sps4: Option<&[[u8; 16]; 6]>,
     sps8: Option<&[[u8; 64]; 2]>,
-) -> Result<([[u8; 16]; 6], Option<[[u8; 64]; 2]>), H264Error> {
+) -> Result<ScalingMatrices, H264Error> {
     let fb4: [&[u8]; 2] = match sps4 {
         Some(s) => [&s[0], &s[3]],
         None => [&JVT_SCALING4[0], &JVT_SCALING4[1]],
     };
-    let mut s4: [Vec<u8>; 6] = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut s4: [Vec<u8>; 6] = [
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ];
     s4[0] = parse_scaling_list(r, 16, &JVT_SCALING4[0], fb4[0])?;
     s4[1] = parse_scaling_list(r, 16, &JVT_SCALING4[0], &s4[0])?;
     s4[2] = parse_scaling_list(r, 16, &JVT_SCALING4[0], &s4[1])?;
@@ -326,8 +344,7 @@ impl Sps {
             // 6 条 4x4 + 2 条 8x8；chroma == 3 → 6 条 4x4 + 6 条 8x8
             //（本解码器 4:2:0 恒走前一档；== 3 的额外 4 条如实收紧）
             if u1f(&mut r, "sps.seq_scaling_matrix_present_flag")? {
-                let (m4, m8) =
-                    parse_scaling_matrices(&mut r, chroma_format_idc != 3, None, None)?;
+                let (m4, m8) = parse_scaling_matrices(&mut r, chroma_format_idc != 3, None, None)?;
                 scaling4 = Some(m4);
                 scaling8 = m8;
             }
@@ -674,15 +691,12 @@ impl Pps {
         // 门槛②：more_rbsp_data_in_pps——Baseline/Main/Extended 且
         // constraint_set0..2 任一置位（Constrained 族）则无扩展段。
         let data_bits = crate::slice::rbsp_data_bits(&rbsp);
-        let more_rbsp_data = match sps {
+        let more_rbsp_data = !matches!(
+            sps,
             Some(s)
                 if matches!(s.profile_idc, 66 | 77 | 88)
-                    && (s.constraint_set(0) || s.constraint_set(1) || s.constraint_set(2)) =>
-            {
-                false
-            }
-            _ => true,
-        };
+                    && (s.constraint_set(0) || s.constraint_set(1) || s.constraint_set(2))
+        );
         let mut transform_8x8_mode_flag = false;
         let mut second_chroma_qp_index_offset = chroma_qp_index_offset;
         let mut scaling4: Option<[[u8; 16]; 6]> = None;
@@ -702,9 +716,9 @@ impl Pps {
                 }
             } else if let Some(s) = sps {
                 // PPS 未发 scaling → 沿用 SPS 有效矩阵
-                scaling4 = s.scaling4.clone();
+                scaling4 = s.scaling4;
                 if transform_8x8_mode_flag {
-                    scaling8 = s.scaling8.clone();
+                    scaling8 = s.scaling8;
                 }
             }
             second_chroma_qp_index_offset = narrow_i32(
@@ -745,16 +759,12 @@ impl Pps {
     /// `qmul[转置槽] = V[qp%6][class(x)] · scaling[x] << (qp/6+2)`。
     /// `list`：0=IntraY 1=IntraCr 2=IntraCb 3=InterY 4=InterCr 5=InterCb。
     pub(crate) fn dequant4_coeff(&self, qp: u8, list: usize) -> [u32; 16] {
-        let scaling: [u8; 16] = self
-            .scaling4
-            .as_ref()
-            .map(|s| s[list])
-            .unwrap_or([16; 16]);
+        let scaling: [u8; 16] = self.scaling4.as_ref().map(|s| s[list]).unwrap_or([16; 16]);
         let mut qmul = [0u32; 16];
         for x in 0..16usize {
             let class = (x & 1) + ((x >> 2) & 1);
-            let v = u32::from(crate::macroblock::DEQUANT_V[usize::from(qp % 6)][class])
-                * u32::from(scaling[x]);
+            let v =
+                crate::macroblock::DEQUANT_V[usize::from(qp % 6)][class] * u32::from(scaling[x]);
             // 槽位转置（FFmpeg (x>>2)|((x<<2)&0xF)）——平坦/对称矩阵下
             // 与现行光栅布局等价，带自定义矩阵时按 FFmpeg 转置口径
             qmul[(x >> 2) | ((x << 2) & 0xF)] = v << (u32::from(qp / 6) + 2);
@@ -766,11 +776,7 @@ impl Pps {
     /// `qmul8[转置槽] = V8[qp%6][scanclass(x)] · scaling8[x] << (qp/6)`。
     /// `list`：0=IntraY 1=InterY。
     pub(crate) fn dequant8_coeff(&self, qp: u8, list: usize) -> [u32; 64] {
-        let scaling: [u8; 64] = self
-            .scaling8
-            .as_ref()
-            .map(|s| s[list])
-            .unwrap_or([16; 64]);
+        let scaling: [u8; 64] = self.scaling8.as_ref().map(|s| s[list]).unwrap_or([16; 64]);
         let mut qmul = [0u32; 64];
         for x in 0..64usize {
             let cls = usize::from(DEQUANT8_SCAN[((x >> 1) & 12) | (x & 3)]);
@@ -781,9 +787,11 @@ impl Pps {
     }
 
     /// chroma DC 反量化乘子（4x4 平表 DC 类，chroma DC 无独立矩阵）。
+    // M2 WIP（High profile 收尾）：chroma DC 现经 dequant4_coeff + Hadamard
+    // 反量化路径，本直读形态留待自定义 scaling list 对拍时定去留。
+    #[allow(dead_code)]
     pub(crate) fn chroma_dc_qmul(&self, qpc: u8) -> u32 {
-        u32::from(crate::macroblock::DEQUANT_V[usize::from(qpc % 6)][0])
-            << (u32::from(qpc / 6) + 6)
+        crate::macroblock::DEQUANT_V[usize::from(qpc % 6)][0] << (u32::from(qpc / 6) + 6)
     }
 
     /// chroma QP（按平面：0=Cb 用第一偏移、1=Cr 用第二偏移；

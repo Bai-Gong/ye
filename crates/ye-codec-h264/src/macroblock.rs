@@ -12,8 +12,6 @@
 //! - 行为约定：解不对的形态一律 `Err`（InvalidData/Unsupported），
 //!   绝不静默输出错帧；所有数组下标经边界检查，无 panic 路径。
 
-use std::sync::Arc;
-
 use crate::bitreader::BitReader;
 use crate::cavlc::{self, BlockKind};
 use crate::error::H264Error;
@@ -453,7 +451,14 @@ pub(crate) fn pred_4x4(mode: u8, e: &Edges4, out: &mut [u8; 16]) {
 /// Intra16x16 预测（mode：spec 编号 0=V,1=H,2=DC,3=Plane + 4/5/6 变体）。
 /// `top`/`left` 不可用侧由调用方填 0（模式改写保证不读）；`tl` 为左上角
 /// 样本（Plane 需要：H/V 求和的 i=7 项读 p[6−i]=p[−1] 即角点）。
-pub(crate) fn pred_16x16(mode: u8, top: &[u8; 16], left: &[u8; 16], tl: u8, out: &mut [u8], stride: usize) {
+pub(crate) fn pred_16x16(
+    mode: u8,
+    top: &[u8; 16],
+    left: &[u8; 16],
+    tl: u8,
+    out: &mut [u8],
+    stride: usize,
+) {
     match mode {
         0 => {
             for y in 0..16 {
@@ -521,7 +526,14 @@ pub(crate) fn pred_16x16(mode: u8, top: &[u8; 16], left: &[u8; 16], tl: u8, out:
 
 /// chroma 8x8 预测（mode：spec 编号 0=DC,1=H,2=V,3=Plane + 4/5/6 变体）。
 /// `tl` 为左上角样本（Plane 的 i=3 项读 p[2−i]=p[−1] 即角点）。
-pub(crate) fn pred_8x8c(mode: u8, top: &[u8; 8], left: &[u8; 8], tl: u8, out: &mut [u8], stride: usize) {
+pub(crate) fn pred_8x8c(
+    mode: u8,
+    top: &[u8; 8],
+    left: &[u8; 8],
+    tl: u8,
+    out: &mut [u8],
+    stride: usize,
+) {
     match mode {
         0 | P8_DC_LEFT | P8_DC_TOP | P8_DC_128 => {
             // 四象限 DC（x264 predict_8x8c_dc* 逐字）及变体
@@ -963,7 +975,13 @@ pub(crate) fn nc_luma(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, b: usiz
 }
 
 /// chroma AC 块 i（2x2 光栅）的 nC；plane：0=Cb（nnz 16..19）、1=Cr。
-pub(crate) fn nc_chroma_ac(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, plane: usize, i: usize) -> u8 {
+pub(crate) fn nc_chroma_ac(
+    cur: &[u8; 24],
+    left: Option<u8>,
+    top: Option<u8>,
+    plane: usize,
+    i: usize,
+) -> u8 {
     let base = 16 + plane * 4;
     let (cx, cy) = (i % 2, i / 2);
     let a = if cx > 0 {
@@ -1954,7 +1972,13 @@ fn apply_qp_delta(r: &mut BitReader<'_>, qp: &mut u8) -> Result<(), H264Error> {
 /// - 光栅块 (3,0)（=z5）：右上 E 宏块底行，不可用 → 复制 D；
 /// - 其余右列块（z7/z13/z15 等）：E..H 无真实来源（FFmpeg 在此读
 ///   未解码区，合法编码器不会对这些块发 DDL/VL）→ 复制 D。
-pub(crate) fn gather_edges4(pic: &Picture, mbx: usize, mby: usize, b: usize, avail: &NeighAvail) -> Edges4 {
+pub(crate) fn gather_edges4(
+    pic: &Picture,
+    mbx: usize,
+    mby: usize,
+    b: usize,
+    avail: &NeighAvail,
+) -> Edges4 {
     let (cx, cy) = (b % 4, b / 4);
     let px = mbx * 16 + cx * 4;
     let py = mby * 16 + cy * 4;
@@ -2035,7 +2059,13 @@ pub(crate) fn reconstruct_4x4(
 /// dc_add；含任意 AC → 全 idct_add（数学上 dc_add ≡ idct_add 的仅 DC
 /// 特例，按内容判定与 FFmpeg 的 nnz 判定在 I16/chroma（nnz 只计 AC）
 /// 场景等价且不丢单 AC 系数）。
-pub(crate) fn add_block(plane: &mut [u8], stride: usize, y0: usize, x0: usize, block: &mut [i16; 16]) {
+pub(crate) fn add_block(
+    plane: &mut [u8],
+    stride: usize,
+    y0: usize,
+    x0: usize,
+    block: &mut [i16; 16],
+) {
     let base = y0 * stride + x0;
     if block.iter().all(|&v| v == 0) {
         return;

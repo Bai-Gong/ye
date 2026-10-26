@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use crate::error::H264Error;
 use crate::macroblock::{
-    InterShape, MbKind, MvGrid, MvNb, Picture, PART_NOT_AVAILABLE, LIST_NOT_USED, build_mv_grid,
-    mc_partition, mid3,
+    InterShape, LIST_NOT_USED, MbKind, MvGrid, MvNb, PART_NOT_AVAILABLE, Picture, mc_partition,
+    mid3,
 };
 use crate::mc;
 
@@ -35,6 +35,9 @@ pub(crate) struct InterCtx<'a> {
     /// 直接预测模式（direct_spatial_mv_pred_flag）。
     pub direct_spatial: bool,
     /// 当前图 POC。
+    // M2 WIP（B 帧收尾）：POC 类直接预测（POC 型 spatial direct 的
+    // dist_scale 换算）接线在即，写入方 decoder.rs 已就位。
+    #[allow(dead_code)]
     pub cur_poc: i32,
     /// 共置图（List1[0]）。
     pub colocated: Option<Arc<Picture>>,
@@ -42,6 +45,9 @@ pub(crate) struct InterCtx<'a> {
     pub col_is_long: bool,
     /// 当前图参考 POC 表（解码该图时的两列 POC 快照，供后续共置缩放）。
     /// `[list][ref_idx]`。
+    // M2 WIP（B 帧收尾）：temporal direct 的 dist_scale/map_col 消费方
+    // 接线在即，写入方 decoder.rs 已就位。
+    #[allow(dead_code)]
     pub ref_poc: [[i32; 32]; 2],
     /// temporal direct 的 list0 参考缩放因子（`dist_scale_factor[ref0]`）。
     pub dist_scale: [i32; 32],
@@ -75,7 +81,10 @@ fn mv_entry_b(mb: &crate::macroblock::Macroblock, b: usize, list: u8) -> MvNb {
     match mb.kind {
         MbKind::InterP => {
             if list == 0 {
-                MvNb { mv: mb.mv[b], ref_idx: mb.ref_idx[b] }
+                MvNb {
+                    mv: mb.mv[b],
+                    ref_idx: mb.ref_idx[b],
+                }
             } else {
                 MvNb::UNUSED
             }
@@ -162,7 +171,7 @@ pub(crate) fn pred_spatial_direct(
             a.min(b).min(c)
         };
         let r = pick(lr, tr, cr);
-        if r >= 0 && r < 32 {
+        if (0..32).contains(&r) {
             let mc = usize::from(lr == r) + usize::from(tr == r) + usize::from(cr == r);
             let mv: [i16; 2] = if mc > 1 {
                 [
@@ -192,7 +201,9 @@ pub(crate) fn pred_spatial_direct(
 
     // ---- 共置信息 ----
     let Some(col) = ctx.colocated.clone() else {
-        return Err(H264Error::InvalidData("spatial direct without colocated".into()));
+        return Err(H264Error::InvalidData(
+            "spatial direct without colocated".into(),
+        ));
     };
     let mb_xy = mby * pic.mb_width + mbx;
     let col_mb = &col.mbs[mb_xy];
@@ -202,11 +213,19 @@ pub(crate) fn pred_spatial_direct(
         || col_mb.kind == MbKind::Pcm;
 
     let quad_part = |x8: i32, y8: i32, zero_flag: bool| -> MvPart {
-        let (a, b): (Option<(i8, [i16; 2])>, Option<(i8, [i16; 2])>) = if zero_flag {
+        /// 单列表的 (ref, mv) 贡献。
+        type ListMv = Option<(i8, [i16; 2])>;
+        let (a, b): (ListMv, ListMv) = if zero_flag {
             // col_zero：ref>0 才用 mv，ref==0 → 0
             (
-                Some((refs[0].max(0) as i8, if refs[0] > 0 { mvs[0] } else { [0; 2] })),
-                Some((refs[1].max(0) as i8, if refs[1] > 0 { mvs[1] } else { [0; 2] })),
+                Some((
+                    refs[0].max(0) as i8,
+                    if refs[0] > 0 { mvs[0] } else { [0; 2] },
+                )),
+                Some((
+                    refs[1].max(0) as i8,
+                    if refs[1] > 0 { mvs[1] } else { [0; 2] },
+                )),
             )
         } else {
             (
@@ -214,7 +233,14 @@ pub(crate) fn pred_spatial_direct(
                 Some((refs[1].max(0) as i8, mvs[1])),
             )
         };
-        MvPart { bx: x8 * 2, by: y8 * 2, w: 2, h: 2, l0: a, l1: b }
+        MvPart {
+            bx: x8 * 2,
+            by: y8 * 2,
+            w: 2,
+            h: 2,
+            l0: a,
+            l1: b,
+        }
     };
 
     if !is8x8 && col_is16 {
@@ -247,7 +273,12 @@ pub(crate) fn pred_spatial_direct(
 /// ref 物理粒度 8x8，块内任意下标同值）。
 fn col_zero_flag(col_mb: &crate::macroblock::Macroblock, b: usize, col_is_long: bool) -> bool {
     use crate::macroblock::MbKind;
-    if col_is_long || matches!(col_mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm) {
+    if col_is_long
+        || matches!(
+            col_mb.kind,
+            MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm
+        )
+    {
         return false;
     }
     let mv = col_mb.mv[b];
@@ -279,12 +310,17 @@ pub(crate) fn pred_temp_direct(
 ) -> Result<(), H264Error> {
     let _ = is8x8; // 形状折叠仅影响记账，像素与象限等价
     let Some(col) = ctx.colocated.clone() else {
-        return Err(H264Error::InvalidData("temporal direct without colocated".into()));
+        return Err(H264Error::InvalidData(
+            "temporal direct without colocated".into(),
+        ));
     };
     let mb_xy = mby * pic.mb_width + mbx;
     let col_mb = &col.mbs[mb_xy];
     use crate::macroblock::MbKind;
-    let col_intra = matches!(col_mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm);
+    let col_intra = matches!(
+        col_mb.kind,
+        MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm
+    );
 
     for q in 0..4usize {
         let x8 = (q & 1) as i32;
@@ -324,6 +360,9 @@ pub(crate) fn pred_temp_direct(
     Ok(())
 }
 
+// M2 WIP（B 帧收尾）：16x16 形态判定现走 pred_spatial_direct 内联的
+// col_is16（含 None 形状），本变体留待 16x8/8x16 共置折叠接线时定去留。
+#[allow(dead_code)]
 fn col_is16ish(mb: &crate::macroblock::Macroblock) -> bool {
     matches!(mb.shape, InterShape::P16x16)
         || matches!(mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm)
@@ -353,7 +392,7 @@ pub(crate) fn build_b_lists(
     cur_poc: i32,
     max_refs: usize,
 ) -> (Vec<Arc<Picture>>, Vec<Arc<Picture>>) {
-    let mut build = |future_first: bool| -> Vec<Arc<Picture>> {
+    let build = |future_first: bool| -> Vec<Arc<Picture>> {
         let mut out: Vec<Arc<Picture>> = Vec::new();
         // 阶段①：按方向取近侧（升序）
         let dir_pick = |want_future: bool, out: &mut Vec<Arc<Picture>>| {
@@ -364,9 +403,7 @@ pub(crate) fn build_b_lists(
                     if out.len() >= max_refs {
                         break;
                     }
-                    let used = out
-                        .iter()
-                        .any(|p| Arc::ptr_eq(p, &short[i].0));
+                    let used = out.iter().any(|p| Arc::ptr_eq(p, &short[i].0));
                     if used {
                         continue;
                     }
@@ -399,7 +436,7 @@ pub(crate) fn build_b_lists(
         dir_pick(future_first, &mut out);
         dir_pick(!future_first, &mut out);
         // 阶段②：长窗按索引
-        for (i, l) in long.iter().enumerate() {
+        for l in long {
             if out.len() >= max_refs {
                 break;
             }
@@ -420,15 +457,12 @@ pub(crate) fn build_b_lists(
         }
         out
     };
-    let mut l0 = build(false); // L0：过去最近优先，再未来近优先
+    let l0 = build(false); // L0：过去最近优先，再未来近优先
     let mut l1 = build(true); // L1：未来近优先，再过去近优先
     // FFmpeg：两列相同且 >1 → L1[0]/[1] 互换
     if l0.len() == l1.len()
         && l1.len() > 1
-        && l0
-            .iter()
-            .zip(l1.iter())
-            .all(|(a, b)| Arc::ptr_eq(a, b))
+        && l0.iter().zip(l1.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
     {
         l1.swap(0, 1);
     }

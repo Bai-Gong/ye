@@ -258,8 +258,7 @@ impl H264Decoder {
         // 参数集级门槛（M2：CABAC 与 High 档已落地，仅挡真正未实现面）
         if !matches!(
             sps.profile_idc,
-            66 | 77 | 88 | 100 | 110 | 118 | 122 | 244 | 44 | 83 | 86 | 128 | 138 | 139
-                | 134 | 135
+            66 | 77 | 88 | 100 | 110 | 118 | 122 | 244 | 44 | 83 | 86 | 128 | 138 | 139 | 134 | 135
         ) {
             return Err(CodecError::UnsupportedStub(
                 "profile not supported (accepted: Baseline/Main/Extended/High family)",
@@ -312,9 +311,7 @@ impl H264Decoder {
             if is_idr {
                 // IDR：参考窗全清（spec 8.2.5）
                 self.short_ref.clear();
-                for l in &mut self.long_ref {
-                    *l = None;
-                }
+                self.long_ref.fill(None);
             } else if self.short_ref.is_empty() && self.long_ref.iter().all(|l| l.is_none()) {
                 return Err(CodecError::UnsupportedStub(
                     "stream does not start with an IDR picture",
@@ -364,34 +361,29 @@ impl H264Decoder {
             .expect("sps active since picture start");
 
         // ---- 参考列表（P：List0；B：双列表 POC 序 + 重排）----
-        let cur_poc = self
-            .cur
-            .as_ref()
-            .map(|c| c.poc)
-            .unwrap_or(0);
-        let (list0, list1): (Vec<Arc<Picture>>, Vec<Arc<Picture>>) =
-            match sh.slice_type {
-                SliceType::P => (self.build_list0(&sh)?, Vec::new()),
-                SliceType::B => {
-                    let (mut l0, mut l1) = crate::inter::build_b_lists(
-                        &self.short_ref_with_poc(),
-                        &self.long_ref,
-                        cur_poc,
-                        sh.num_ref_l0.max(1),
-                    );
-                    // 长窗 POC 由 Picture 自带（build_b_lists 以 pic.poc 读取）
-                    // 长窗补位（build_b_lists 内已含；重排在后）
-                    l0 = self.apply_reorder(l0, &sh.ref_mods, sh.num_ref_l0.max(1))?;
-                    l1 = self.apply_reorder(l1, &sh.ref_mods_l1, sh.num_ref_l1.max(1))?;
-                    (l0, l1)
-                }
-                _ => (Vec::new(), Vec::new()),
-            };
-        if let Some(c) = self.cur.as_mut() {
-            if !list0.is_empty() || !list1.is_empty() {
-                c.used_l0 = list0.clone();
-                c.used_l1 = list1.clone();
+        let cur_poc = self.cur.as_ref().map(|c| c.poc).unwrap_or(0);
+        let (list0, list1): (Vec<Arc<Picture>>, Vec<Arc<Picture>>) = match sh.slice_type {
+            SliceType::P => (self.build_list0(&sh)?, Vec::new()),
+            SliceType::B => {
+                let (mut l0, mut l1) = crate::inter::build_b_lists(
+                    &self.short_ref_with_poc(),
+                    &self.long_ref,
+                    cur_poc,
+                    sh.num_ref_l0.max(1),
+                );
+                // 长窗 POC 由 Picture 自带（build_b_lists 以 pic.poc 读取）
+                // 长窗补位（build_b_lists 内已含；重排在后）
+                l0 = self.apply_reorder(l0, &sh.ref_mods, sh.num_ref_l0.max(1))?;
+                l1 = self.apply_reorder(l1, &sh.ref_mods_l1, sh.num_ref_l1.max(1))?;
+                (l0, l1)
             }
+            _ => (Vec::new(), Vec::new()),
+        };
+        if let Some(c) = self.cur.as_mut()
+            && (!list0.is_empty() || !list1.is_empty())
+        {
+            c.used_l0 = list0.clone();
+            c.used_l1 = list1.clone();
         }
         let ctx = self.cur.as_mut().expect("picture ctx just ensured");
         let slice_id = ctx.next_slice_id;
@@ -427,29 +419,23 @@ impl H264Decoder {
                         .ok_or_else(|| CodecError::InvalidData("B slice without list1".into()))?;
                     let mut dist_scale = [256i32; 32];
                     for (i, r0) in list0.iter().enumerate().take(32) {
-                        dist_scale[i] = crate::inter::scale_factor(
-                            cur_poc,
-                            col.poc,
-                            r0.poc,
-                            r0.is_long_term,
-                        );
+                        dist_scale[i] =
+                            crate::inter::scale_factor(cur_poc, col.poc, r0.poc, r0.is_long_term);
                     }
                     let mut map_col = [[0usize; 32]; 2];
-                    for list in 0..2usize {
-                        let used = if list == 0 { &col.used_l0 } else { &col.used_l1 };
+                    for (list, mc) in map_col.iter_mut().enumerate() {
+                        let used = if list == 0 {
+                            &col.used_l0
+                        } else {
+                            &col.used_l1
+                        };
                         for (idx, entry) in used.iter().enumerate().take(32) {
                             if let Some(p) = entry {
-                                map_col[list][idx] = list0
-                                    .iter()
-                                    .position(|q| Arc::ptr_eq(q, p))
-                                    .unwrap_or(0);
+                                mc[idx] = list0.iter().position(|q| Arc::ptr_eq(q, p)).unwrap_or(0);
                             }
                         }
                     }
-                    let ref_poc = [
-                        list0_poc(&list0),
-                        list0_poc(&list1),
-                    ];
+                    let ref_poc = [list0_poc(&list0), list0_poc(&list1)];
                     Some(InterCtx {
                         l0: &list0,
                         l1: &list1,
@@ -532,10 +518,8 @@ impl H264Decoder {
             for (p, _) in &self.short_ref {
                 h = h.min(p.poc);
             }
-            for l in &self.long_ref {
-                if let Some(p) = l {
-                    h = h.min(p.poc);
-                }
+            for p in self.long_ref.iter().flatten() {
+                h = h.min(p.poc);
             }
             h
         };
@@ -588,20 +572,13 @@ impl H264Decoder {
             0 => {
                 let max_lsb = 1i32 << (i32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4);
                 let lsb = sh.poc_lsb as i32;
-                if is_idr {
-                    self.poc.prev_lsb = 0;
-                    self.poc.prev_msb = 0;
-                } else if self.poc.last_has_mmco_5 {
+                if is_idr || self.poc.last_has_mmco_5 {
                     self.poc.prev_lsb = 0;
                     self.poc.prev_msb = 0;
                 }
-                let msb = if lsb < self.poc.prev_lsb
-                    && self.poc.prev_lsb - lsb >= max_lsb / 2
-                {
+                let msb = if lsb < self.poc.prev_lsb && self.poc.prev_lsb - lsb >= max_lsb / 2 {
                     self.poc.prev_msb + max_lsb
-                } else if lsb > self.poc.prev_lsb
-                    && lsb - self.poc.prev_lsb > max_lsb / 2
-                {
+                } else if lsb > self.poc.prev_lsb && lsb - self.poc.prev_lsb > max_lsb / 2 {
                     self.poc.prev_msb - max_lsb
                 } else {
                     self.poc.prev_msb
@@ -674,11 +651,7 @@ impl H264Decoder {
                     0
                 } else {
                     let abs = frame_num_offset + sh.frame_num as i32;
-                    if is_ref {
-                        2 * abs
-                    } else {
-                        2 * abs - 1
-                    }
+                    if is_ref { 2 * abs } else { 2 * abs - 1 }
                 };
                 self.poc.prev_frame_num = sh.frame_num;
                 self.poc.prev_frame_num_offset = frame_num_offset;
@@ -704,11 +677,7 @@ impl H264Decoder {
         num_ref: usize,
     ) -> Result<Vec<Arc<Picture>>, CodecError> {
         let max_pic_num = 1u32 << u32::from(self.log2_max_frame_num);
-        let mut pred = self
-            .cur
-            .as_ref()
-            .map(|c| c.frame_num)
-            .unwrap_or(0);
+        let mut pred = self.cur.as_ref().map(|c| c.frame_num).unwrap_or(0);
         for (index, &(op, val)) in mods.iter().enumerate() {
             if index >= num_ref {
                 return Err(CodecError::InvalidData(
@@ -835,9 +804,7 @@ impl H264Decoder {
                     }
                     5 => {
                         self.short_ref.clear();
-                        for l in &mut self.long_ref {
-                            *l = None;
-                        }
+                        self.long_ref.fill(None);
                     }
                     6 if li < self.long_ref.len() => {
                         self.long_ref[li] = Some(ctx.pic.clone());

@@ -19,13 +19,13 @@
 //!   存留、DC→TOP、LEFT→128；缺左上的对角模式 → Unsupported。
 
 use crate::error::H264Error;
-use crate::macroblock::{Picture, neighbor_avail, NeighAvail};
+use crate::macroblock::{NeighAvail, Picture, neighbor_avail};
 
 /// 8x8 zigzag（spec 表 7-6）。
 pub(crate) const ZIGZAG8: [usize; 64] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
-    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 /// 8x8 模式变体码（FFmpeg 编号：9=LEFT_DC、10=TOP_DC、11=DC_128；
@@ -81,8 +81,8 @@ pub(crate) fn rewrite_8x8_mode(mode: u8, q: &QuadAvail) -> Result<u8, H264Error>
     }
     if !q.left {
         m = match m {
-            0 | 3 | 7 => m,  // V、DDL、VL 不需要左
-            2 => TOP_DC,     // DC → DC_TOP
+            0 | 3 | 7 => m, // V、DDL、VL 不需要左
+            2 => TOP_DC,    // DC → DC_TOP
             LEFT_DC => DC_128,
             _ => {
                 return Err(H264Error::InvalidData(
@@ -113,7 +113,11 @@ pub(crate) fn neighbor_i8_mode_quads(
     use crate::macroblock::MbKind;
     let (w, mb_xy) = (pic.mb_width, mby * pic.mb_width + mbx);
     let nb = if side == 0 {
-        if mbx == 0 { None } else { Some(&pic.mbs[mb_xy - 1]) }
+        if mbx == 0 {
+            None
+        } else {
+            Some(&pic.mbs[mb_xy - 1])
+        }
     } else if mby == 0 {
         None
     } else {
@@ -124,11 +128,18 @@ pub(crate) fn neighbor_i8_mode_quads(
         return 2;
     }
     // 左：右列块 3 + 8·(q>>1)；上：底行块 12 + 2·(q&1)
-    let b = if side == 0 { 3 + 8 * (q >> 1) } else { 12 + 2 * (q & 1) };
+    let b = if side == 0 {
+        3 + 8 * (q >> 1)
+    } else {
+        12 + 2 * (q & 1)
+    };
     nb.i4_modes[b]
 }
 
 /// 邻块贡献的 8x8 模式（非 I8x8 邻块贡献 2=DC——与 4x4 族同语义）。
+// M2 WIP（CABAC 对拍收尾）：邻块取值改走象限版 neighbor_i8_mode_quads
+// 后保留的标量形态变体，收尾轮定去留。
+#[allow(dead_code)]
 pub(crate) fn neighbor_i8_mode(pic: &Picture, mb_xy: usize, quad: usize) -> u8 {
     use crate::macroblock::MbKind;
     let mb = &pic.mbs[mb_xy];
@@ -170,8 +181,8 @@ fn load_top(e: &Edge8, q: &QuadAvail) -> [i32; 8] {
     let s = |x: i32| e.at(x, -1);
     let mut t = [0i32; 8];
     t[0] = ((if q.topleft { s(-1) } else { s(0) }) + 2 * s(0) + s(1) + 2) >> 2;
-    for i in 1..7usize {
-        t[i] = (s(i as i32 - 1) + 2 * s(i as i32) + s(i as i32 + 1) + 2) >> 2;
+    for (i, slot) in (1..7).zip(t.iter_mut().skip(1)) {
+        *slot = (s(i - 1) + 2 * s(i) + s(i + 1) + 2) >> 2;
     }
     t[7] = ((if q.topright { s(8) } else { s(7) }) + 2 * s(7) + s(6) + 2) >> 2;
     t
@@ -182,8 +193,8 @@ fn load_topright(e: &Edge8, q: &QuadAvail, t7: i32) -> [i32; 8] {
     let s = |x: i32| e.at(x, -1);
     let mut t = [0i32; 8];
     if q.topright {
-        for i in 0..7usize {
-            t[i] = (s(8 + i as i32 - 1) + 2 * s(8 + i as i32) + s(8 + i as i32 + 1) + 2) >> 2;
+        for (i, slot) in (0..7).zip(t.iter_mut()) {
+            *slot = (s(8 + i - 1) + 2 * s(8 + i) + s(8 + i + 1) + 2) >> 2;
         }
         t[7] = (s(14) + 3 * s(15) + 2) >> 2;
     } else {
@@ -197,8 +208,8 @@ fn load_left(e: &Edge8, _q: &QuadAvail) -> [i32; 8] {
     let s = |y: i32| e.at(-1, y);
     let mut l = [0i32; 8];
     l[0] = ((if _q.topleft { s(-1) } else { s(0) }) + 2 * s(0) + s(1) + 2) >> 2;
-    for i in 1..7usize {
-        l[i] = (s(i as i32 - 1) + 2 * s(i as i32) + s(i as i32 + 1) + 2) >> 2;
+    for (i, slot) in (1..7).zip(l.iter_mut().skip(1)) {
+        *slot = (s(i - 1) + 2 * s(i) + s(i + 1) + 2) >> 2;
     }
     l[7] = (s(6) + 3 * s(7) + 2) >> 2;
     l
@@ -213,13 +224,8 @@ fn load_topleft(e: &Edge8) -> i32 {
 // 预测（FFmpeg pred8x8l_* 逐字；写入 8x8 光栅 out）
 // ---------------------------------------------------------------------------
 
-pub(crate) fn pred_8x8l(
-    mode: u8,
-    e: &Edge8,
-    q: &QuadAvail,
-    out: &mut [u8],
-    stride: usize,
-) {
+/// 8x8 帧内方向预测（模式分派；仅本模块 [`Edge8`] 载入消费）。
+fn pred_8x8l(mode: u8, e: &Edge8, q: &QuadAvail, out: &mut [u8], stride: usize) {
     let put = |out: &mut [u8], stride: usize, x: i32, y: i32, v: i32| {
         out[(y as usize) * stride + x as usize] = v.clamp(0, 255) as u8;
     };
@@ -747,7 +753,7 @@ pub(crate) fn pred_8x8l(
             put(out, stride, 7, 0, l[7]);
             for y in 1..8 {
                 for x in 4..8 {
-                    put(out, stride, x, y as i32, l[7]);
+                    put(out, stride, x, y, l[7]);
                 }
             }
         }
@@ -782,7 +788,16 @@ pub(crate) fn idct8x8_add(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) 
         let b3 = a3 + (a5 >> 2);
         let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
-        let outs = [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7];
+        let outs = [
+            b0 + b7,
+            b2 + b5,
+            b4 + b3,
+            b6 + b1,
+            b6 - b1,
+            b4 - b3,
+            b2 - b5,
+            b0 - b7,
+        ];
         for (k, &v) in outs.iter().enumerate() {
             block[i + k * 8] = v as i16;
         }
@@ -806,7 +821,16 @@ pub(crate) fn idct8x8_add(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) 
         let b3 = a3 + (a5 >> 2);
         let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
-        let outs = [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7];
+        let outs = [
+            b0 + b7,
+            b2 + b5,
+            b4 + b3,
+            b6 + b1,
+            b6 - b1,
+            b4 - b3,
+            b2 - b5,
+            b0 - b7,
+        ];
         for (k, &v) in outs.iter().enumerate() {
             let d = i32::from(dst[i * stride + k]) + (v >> 6);
             dst[i * stride + k] = d.clamp(0, 255) as u8;
@@ -837,14 +861,25 @@ pub(crate) fn reconstruct_8x8(
 ) {
     let qx = quad & 1;
     let qy = quad >> 1;
-    let avail = neighbor_avail(pic, mbx, mby, pic.mbs[mby * pic.mb_width + mbx].slice_id, false);
+    let avail = neighbor_avail(
+        pic,
+        mbx,
+        mby,
+        pic.mbs[mby * pic.mb_width + mbx].slice_id,
+        false,
+    );
     let q = quad_avail(&avail, qx, qy);
     let s = pic.luma_stride();
     let (ox, oy) = (mbx * 16 + qx * 8, mby * 16 + qy * 8);
     let base = oy * s + ox;
     {
         let luma = &pic.luma[..];
-        let e = Edge8 { luma, stride: s, ox, oy };
+        let e = Edge8 {
+            luma,
+            stride: s,
+            ox,
+            oy,
+        };
         // 直接写入平面（pred 无越界：写 8x8 区域内）
         let mut tmp = [0u8; 64];
         pred_8x8l(mode, &e, &q, &mut tmp, 8);
@@ -871,14 +906,19 @@ mod tests {
     /// 8x8 DC（全 16 平面）预测：滤波边全 16 → DC = (8*16+8*16+8)>>4 = 16。
     #[test]
     fn pred8x8l_dc_flat() {
-        let mut plane = vec![16u8; 24 * 24];
+        let plane = vec![16u8; 24 * 24];
         let e = Edge8 {
             luma: &plane,
             stride: 24,
             ox: 8,
             oy: 8,
         };
-        let q = QuadAvail { top: true, left: true, topleft: true, topright: true };
+        let q = QuadAvail {
+            top: true,
+            left: true,
+            topleft: true,
+            topright: true,
+        };
         let mut out = [0u8; 64];
         pred_8x8l(2, &e, &q, &mut out, 8);
         assert!(out.iter().all(|&v| v == 16));
