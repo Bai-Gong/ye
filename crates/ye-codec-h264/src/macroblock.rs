@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::bitreader::BitReader;
 use crate::cavlc::{self, BlockKind};
 use crate::error::H264Error;
+use crate::inter::InterCtx;
 use crate::mc;
 use crate::sps::Pps;
 
@@ -26,7 +27,7 @@ use crate::sps::Pps;
 
 /// 反量化基表 `V[qp%6][class]`（FFmpeg `ff_h264_dequant4_coeff_init`）。
 /// class：0=DC 位、1=首行/首列、2=内部。
-const DEQUANT_V: [[u32; 3]; 6] = [
+pub(crate) const DEQUANT_V: [[u32; 3]; 6] = [
     [10, 13, 16],
     [11, 14, 18],
     [13, 16, 20],
@@ -36,21 +37,21 @@ const DEQUANT_V: [[u32; 3]; 6] = [
 ];
 
 /// chroma QP 映射表（FFmpeg `ff_h264_chroma_qp` 8bit 行，52 项）。
-const CHROMA_QP: [u8; 52] = [
+pub(crate) const CHROMA_QP: [u8; 52] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, // 0..29 恒等
     29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
 ];
 
 /// 4x4 zigzag 扫描（槽位 = 行*4+列）。
-const ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+pub(crate) const ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 /// I 帧宏块残差解析/重建顺序：z 序（象限光栅 × 象限内光栅）→ 光栅块号。
 /// 即 FFmpeg scan8 序；`Z_ORDER[i]` = 第 i 个解析的块的光栅下标。
-const Z_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
+pub(crate) const Z_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
 /// 光栅 (cx,cy) → z 序号（用于 E..H 重建可用性判断）。
-const fn z_of(cx: usize, cy: usize) -> usize {
+pub(crate) const fn z_of(cx: usize, cy: usize) -> usize {
     4 * (2 * (cy >> 1) + (cx >> 1)) + (cx & 1) + 2 * (cy & 1)
 }
 
@@ -58,7 +59,7 @@ const fn z_of(cx: usize, cy: usize) -> usize {
 /// `ff_h264_golomb_to_intra4x4_cbp` 逐字）。位约定：bit0..3 = 四个 8x8
 /// 象限（象限 q = 2·(cy/2) + cx/2）luma AC，bit4 = chroma DC，
 /// bit5 = chroma AC。
-const GOLOMB_TO_INTRA4X4_CBP: [u8; 48] = [
+pub(crate) const GOLOMB_TO_INTRA4X4_CBP: [u8; 48] = [
     47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19, 21, 26, 28,
     35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36, 40, 38, 41,
 ];
@@ -67,23 +68,23 @@ const GOLOMB_TO_INTRA4X4_CBP: [u8; 48] = [
 /// （0=V, 1=H, 2=DC, 3=Plane）：mb_type 1=V、2=H、3=DC、4=Plane 起循环。
 /// （FFmpeg `ff_h264_i_mb_type_info` 的 (2,1,0,3) 是其内部枚举
 /// DC=0/H=1/V=2 的换算，勿混用。）
-const I16_PRED: [u8; 4] = [0, 1, 2, 3];
-const I16_CBP: [u8; 6] = [0, 0x10, 0x20, 0x0F, 0x1F, 0x2F];
+pub(crate) const I16_PRED: [u8; 4] = [0, 1, 2, 3];
+pub(crate) const I16_CBP: [u8; 6] = [0, 0x10, 0x20, 0x0F, 0x1F, 0x2F];
 
 /// chroma DC 的 2x2 扫描（槽位语义 = 2x2 光栅）。
-const CHROMA_DC_SCAN: [u8; 4] = [0, 1, 4, 5];
+pub(crate) const CHROMA_DC_SCAN: [u8; 4] = [0, 1, 4, 5];
 
 /// 4x4 模式改写变体码（FFmpeg h264pred.h 编号：9=LEFT_DC、10=TOP_DC、
 /// 11=DC_128，避开 spec 模式码 0..8）。
-const P4_DC_LEFT: u8 = 9;
-const P4_DC_TOP: u8 = 10;
-const P4_DC_128: u8 = 11;
+pub(crate) const P4_DC_LEFT: u8 = 9;
+pub(crate) const P4_DC_TOP: u8 = 10;
+pub(crate) const P4_DC_128: u8 = 11;
 
 /// 16x16/chroma 模式改写变体码（FFmpeg LEFT_DC_PRED8x8=4、TOP_DC=5、
 /// DC_128=6；这两族 spec 模式码只用 0..3，无冲突）。
-const P8_DC_LEFT: u8 = 4;
-const P8_DC_TOP: u8 = 5;
-const P8_DC_128: u8 = 6;
+pub(crate) const P8_DC_LEFT: u8 = 4;
+pub(crate) const P8_DC_TOP: u8 = 5;
+pub(crate) const P8_DC_128: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // 反量化 / 反变换
@@ -92,7 +93,7 @@ const P8_DC_128: u8 = 6;
 /// 4x4 反量化乘子表（逐槽位）：`qmul[slot] = V[qp%6][class] · 64 · 2^(qp/6)`，
 /// `class = min(row,1) + min(col,1)`（FFmpeg `dequant4_coeff_init` +
 /// `ff_h264_dequant4_coeff_init_scan` 交叉验证）。
-fn dequant4_coeff(qp: u8) -> [u32; 16] {
+pub(crate) fn dequant4_coeff(qp: u8) -> [u32; 16] {
     let v = DEQUANT_V[usize::from(qp % 6)];
     let shift = u32::from(qp / 6) + 6;
     let mut qmul = [0u32; 16];
@@ -109,14 +110,14 @@ fn dequant4_coeff(qp: u8) -> [u32; 16] {
 }
 
 /// DC 乘子：`V[qp%6][0] · 64 · 2^(qp/6)`。
-fn dc_qmul(qp: u8) -> u32 {
+pub(crate) fn dc_qmul(qp: u8) -> u32 {
     DEQUANT_V[usize::from(qp % 6)][0] << (u32::from(qp / 6) + 6)
 }
 
 /// 4x4 整数反变换 + 叠加（FFmpeg h264idct_template.c `ff_h264_idct_add`
 /// 逐字：DC 预加 1<<5 折入舍入，先列（垂直）后行（水平），输出裸 `>>6`）。
 /// `block` 为光栅 [row*4+col]；`dst` 指向平面内 4x4 区域左上角起的长切片。
-fn idct4x4_add(dst: &mut [u8], stride: usize, block: &mut [i16; 16]) {
+pub(crate) fn idct4x4_add(dst: &mut [u8], stride: usize, block: &mut [i16; 16]) {
     block[0] += 1 << 5;
     // 垂直 pass：处理列 i（block[i + 4*j]，行主序即列 i）
     for i in 0..4usize {
@@ -151,7 +152,7 @@ fn idct4x4_add(dst: &mut [u8], stride: usize, block: &mut [i16; 16]) {
 }
 
 /// DC-only 反变换叠加（FFmpeg `ff_h264_idct_dc_add` 逐字）。
-fn idct4x4_dc_add(dst: &mut [u8], stride: usize, block: &[i16; 16]) {
+pub(crate) fn idct4x4_dc_add(dst: &mut [u8], stride: usize, block: &[i16; 16]) {
     let dc = (i32::from(block[0]) + 32) >> 6;
     for y in 0..4usize {
         for x in 0..4usize {
@@ -165,7 +166,7 @@ fn idct4x4_dc_add(dst: &mut [u8], stride: usize, block: &[i16; 16]) {
 /// 与 FFmpeg `ff_h264_luma_dc_dequant_idct` 同数学；落位映射经实测
 /// 对拍锁定为自然光栅序，回归见单测 `luma_dc_dequant_matches_ffmpeg_pipeline`）。
 /// 输入/输出均为 16 项光栅；`qmul` = `V[qp%6][0]·64·2^(qp/6)`。
-fn luma_dc_dequant(x: &[i16; 16], qmul: u32) -> Result<[i16; 16], H264Error> {
+pub(crate) fn luma_dc_dequant(x: &[i16; 16], qmul: u32) -> Result<[i16; 16], H264Error> {
     let mut temp = [0i64; 16];
     for i in 0..4usize {
         let (a, b, c, d) = (
@@ -212,7 +213,7 @@ fn luma_dc_dequant(x: &[i16; 16], qmul: u32) -> Result<[i16; 16], H264Error> {
 /// `ff_h264_chroma_dc_dequant_idct` 逐字：截断 `>>7`，无舍入加项）。
 /// `qmul` = `V[qpc%6][0]·64·2^(qpc/6)`；输入/输出均为 2x2 光栅序
 /// （[UL, UR, LL, LR]）。
-fn chroma_dc_dequant(x: &[i16; 4], qmul: u32) -> Result<[i16; 4], H264Error> {
+pub(crate) fn chroma_dc_dequant(x: &[i16; 4], qmul: u32) -> Result<[i16; 4], H264Error> {
     let mut a = x[0];
     let mut b = x[1];
     let e = a - b;
@@ -246,7 +247,7 @@ const fn f2(a: i32, b: i32, c: i32) -> i32 {
 
 /// 4x4 预测边沿：top[0..4]=A..D、top[4..8]=E..H（可能为 D 复制）、
 /// left[0..4]=I..L、tl=M。不可用侧填 0（模式改写保证不读）。
-struct Edges4 {
+pub(crate) struct Edges4 {
     top: [u8; 8],
     left: [u8; 4],
     tl: u8,
@@ -254,7 +255,7 @@ struct Edges4 {
 
 /// 4x4 帧内预测（mode：spec 编号 0=V..8=HU；9/10/11 为 DC 变体改写产物）。
 /// 写入 `out`（4x4 光栅）。
-fn pred_4x4(mode: u8, e: &Edges4, out: &mut [u8; 16]) {
+pub(crate) fn pred_4x4(mode: u8, e: &Edges4, out: &mut [u8; 16]) {
     let t: [i32; 8] = std::array::from_fn(|i| i32::from(e.top[i]));
     let l: [i32; 4] = std::array::from_fn(|i| i32::from(e.left[i]));
     let tl = i32::from(e.tl);
@@ -452,7 +453,7 @@ fn pred_4x4(mode: u8, e: &Edges4, out: &mut [u8; 16]) {
 /// Intra16x16 预测（mode：spec 编号 0=V,1=H,2=DC,3=Plane + 4/5/6 变体）。
 /// `top`/`left` 不可用侧由调用方填 0（模式改写保证不读）；`tl` 为左上角
 /// 样本（Plane 需要：H/V 求和的 i=7 项读 p[6−i]=p[−1] 即角点）。
-fn pred_16x16(mode: u8, top: &[u8; 16], left: &[u8; 16], tl: u8, out: &mut [u8], stride: usize) {
+pub(crate) fn pred_16x16(mode: u8, top: &[u8; 16], left: &[u8; 16], tl: u8, out: &mut [u8], stride: usize) {
     match mode {
         0 => {
             for y in 0..16 {
@@ -520,7 +521,7 @@ fn pred_16x16(mode: u8, top: &[u8; 16], left: &[u8; 16], tl: u8, out: &mut [u8],
 
 /// chroma 8x8 预测（mode：spec 编号 0=DC,1=H,2=V,3=Plane + 4/5/6 变体）。
 /// `tl` 为左上角样本（Plane 的 i=3 项读 p[2−i]=p[−1] 即角点）。
-fn pred_8x8c(mode: u8, top: &[u8; 8], left: &[u8; 8], tl: u8, out: &mut [u8], stride: usize) {
+pub(crate) fn pred_8x8c(mode: u8, top: &[u8; 8], left: &[u8; 8], tl: u8, out: &mut [u8], stride: usize) {
     match mode {
         0 | P8_DC_LEFT | P8_DC_TOP | P8_DC_128 => {
             // 四象限 DC（x264 predict_8x8c_dc* 逐字）及变体
@@ -604,7 +605,7 @@ fn pred_8x8c(mode: u8, top: &[u8; 8], left: &[u8; 8], tl: u8, out: &mut [u8], st
 // 冻结数据结构
 // ---------------------------------------------------------------------------
 
-/// 宏块类型（②a 仅 I 帧三种）。
+/// 宏块类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MbKind {
     Intra4x4,
@@ -612,6 +613,20 @@ pub(crate) enum MbKind {
     Pcm,
     /// P 片帧间宏块（含 P_Skip；残差与重建同 intra 路径叠加）。
     InterP,
+    /// B 片帧间宏块（含 B_Skip/B_Direct；双向预测经 mv_l1/ref_l1）。
+    InterB,
+}
+
+/// 帧间宏块的分区形状（直接预测的共置形状推断与 col_zero 判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterShape {
+    /// 非 inter（intra/PCM）。
+    None,
+    P16x16,
+    P16x8,
+    P8x16,
+    /// 8x8 四象限（含 B 的混合象限；细粒度见 [`Macroblock::sub_shape`]）。
+    P8x8,
 }
 
 /// 单宏块解码结果（冻结面：②b/②c deblock.rs 消费 qp/nnz/slice_id/
@@ -637,6 +652,8 @@ pub(crate) struct Macroblock {
     pub nnz: [u8; 24],
     /// chroma DC 块的 nnz（Cb、Cr；PCM 时 = 16）。
     pub nnz_chroma_dc: [u8; 2],
+    /// luma DC（I16x16）是否编码（CABAC 下一 MB 的 DC cbf 上下文）。
+    pub luma_dc_coded: bool,
     /// 帧内片编号。
     pub slice_id: u16,
     // ---- ②b 增补（P 帧冻结面；②c deblock 消费）----
@@ -648,6 +665,25 @@ pub(crate) struct Macroblock {
     /// 4x4 光栅网格的参考帧索引（P：0..；intra/未用块 = −1）。
     /// 参考索引物理粒度为 8x8（同 8x8 内四块共享），此处按 4x4 复制存储。
     pub ref_idx: [i8; 16],
+    // ---- B 片增补（M2；直接预测/deblock/CABAC 上下文消费）----
+    /// list1 运动矢量（B 片；InterP/intra 全 0）。
+    pub mv_l1: [[i16; 2]; 16],
+    /// list1 参考索引（B 片未用块 = −1）。
+    pub ref_idx_l1: [i8; 16],
+    /// list0 mvd（mv−mvp；CABAC 邻块上下文；无邻语义 = 0）。
+    pub mvd: [[i16; 2]; 16],
+    /// list1 mvd。
+    pub mvd_l1: [[i16; 2]; 16],
+    /// luma 8x8 变换（High 档；deblock 内边与 8x8 残差路径消费）。
+    pub transform_8x8: bool,
+    /// 帧间分区形状（intra = None）。
+    pub shape: InterShape,
+    /// B 片直接预测宏块（B_Skip/B_Direct_16x16；CABAC 邻块 ctx 与
+    /// ref ctx 的 direct 排除判定用）。
+    pub direct: bool,
+    /// 8x8 象限的子分区粒度（shape==P8x8 时有效）：
+    /// 0=8x8、1=8x4、2=4x8、3=4x4、255=direct 象限。
+    pub sub_shape: [u8; 4],
 }
 
 impl Default for Macroblock {
@@ -662,10 +698,19 @@ impl Default for Macroblock {
             chroma_mode: 0,
             nnz: [0; 24],
             nnz_chroma_dc: [0; 2],
+            luma_dc_coded: false,
             slice_id: 0,
             skipped: false,
             mv: [[0; 2]; 16],
             ref_idx: [-1; 16],
+            mv_l1: [[0; 2]; 16],
+            ref_idx_l1: [-1; 16],
+            mvd: [[0; 2]; 16],
+            mvd_l1: [[0; 2]; 16],
+            transform_8x8: false,
+            shape: InterShape::None,
+            direct: false,
+            sub_shape: [0; 4],
         }
     }
 }
@@ -685,6 +730,14 @@ pub(crate) struct Picture {
     pub cr: Vec<u8>,
     /// 宏块光栅网格。
     pub mbs: Vec<Macroblock>,
+    // ---- B 片增补（M2）----
+    /// 本图 POC（直接预测缩放与 DPB 重排）。
+    pub poc: i32,
+    /// 长期参考标记（col_zero / dist_scale 门控）。
+    pub is_long_term: bool,
+    /// 解码本图时的两列参考快照（map_col 匹配用；缺项 None）。
+    pub used_l0: Vec<Option<std::sync::Arc<Picture>>>,
+    pub used_l1: Vec<Option<std::sync::Arc<Picture>>>,
 }
 
 impl Picture {
@@ -698,6 +751,10 @@ impl Picture {
             cb: vec![0; mb_width * 8 * mb_height * 8],
             cr: vec![0; mb_width * 8 * mb_height * 8],
             mbs: vec![Macroblock::default(); mb_width * mb_height],
+            poc: 0,
+            is_long_term: false,
+            used_l0: Vec::new(),
+            used_l1: Vec::new(),
         }
     }
 
@@ -715,15 +772,15 @@ impl Picture {
 
 /// MB 级邻居可用性（progressive、无 FMO；片判定含 FFmpeg 的 topleft
 /// 短路怪癖：仅当 topleft 跨片/未解码时才连带检查 top/left 的片归属）。
-struct NeighAvail {
-    top: bool,
-    left: bool,
-    topleft: bool,
+pub(crate) struct NeighAvail {
+    pub(crate) top: bool,
+    pub(crate) left: bool,
+    pub(crate) topleft: bool,
     /// 右上 E 宏块（仅光栅块 (3,0) 的 E..H 用）。
-    er: bool,
+    pub(crate) er: bool,
 }
 
-fn neighbor_avail(
+pub(crate) fn neighbor_avail(
     pic: &Picture,
     mbx: usize,
     mby: usize,
@@ -789,7 +846,7 @@ fn nc_of(a: u32, b: u32) -> u8 {
 /// `ff_h264_check_intra_pred_mode` 逐字；`dc_code` 传各自族的 DC 编号——
 /// 16x16 为 2，chroma 为 0。H 需左、V 需顶、Plane 需两侧、DC 按可用面
 /// 变体；先按顶改写再按左改写）。
-fn rewrite_dc_mode(
+pub(crate) fn rewrite_dc_mode(
     mode: u8,
     top: bool,
     left: bool,
@@ -839,7 +896,7 @@ fn rewrite_dc_mode(
 
 /// 4x4 模式改写（FFmpeg `ff_h264_check_intra4x4_pred_mode` 逐字）：
 /// 行 0 块按顶可用改写、列 0 块按左可用改写；需要侧缺失的模式 → Err。
-fn rewrite_4x4_modes(
+pub(crate) fn rewrite_4x4_modes(
     modes: &mut [u8; 16],
     top: bool,
     left: bool,
@@ -890,7 +947,7 @@ fn rewrite_4x4_modes(
 
 /// luma 块 b（光栅）的 nC。`cur` = 本宏块已解析的 nnz（luma 槽），
 /// `left`/`top` = 邻块对应块的 nnz（不可用 → None）。
-fn nc_luma(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, b: usize) -> u8 {
+pub(crate) fn nc_luma(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, b: usize) -> u8 {
     let (cx, cy) = (b % 4, b / 4);
     let a = if cx > 0 {
         u32::from(cur[b - 1])
@@ -906,7 +963,7 @@ fn nc_luma(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, b: usize) -> u8 {
 }
 
 /// chroma AC 块 i（2x2 光栅）的 nC；plane：0=Cb（nnz 16..19）、1=Cr。
-fn nc_chroma_ac(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, plane: usize, i: usize) -> u8 {
+pub(crate) fn nc_chroma_ac(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, plane: usize, i: usize) -> u8 {
     let base = 16 + plane * 4;
     let (cx, cy) = (i % 2, i / 2);
     let a = if cx > 0 {
@@ -923,7 +980,7 @@ fn nc_chroma_ac(cur: &[u8; 24], left: Option<u8>, top: Option<u8>, plane: usize,
 }
 
 /// chroma DC 块的 nC（无块内邻居，只用邻块 DC nnz）。
-fn nc_chroma_dc(left: Option<u8>, top: Option<u8>) -> u8 {
+pub(crate) fn nc_chroma_dc(left: Option<u8>, top: Option<u8>) -> u8 {
     nc_of(
         left.map(u32::from).unwrap_or(64),
         top.map(u32::from).unwrap_or(64),
@@ -932,7 +989,7 @@ fn nc_chroma_dc(left: Option<u8>, top: Option<u8>) -> u8 {
 
 /// 邻块 Intra4x4 模式（非 I4x4 邻块贡献 2=DC——FFmpeg
 /// `fill_decode_caches` 的 `2 - 3*!avail` 语义；可用性由调用方判定）。
-fn neighbor_i4_mode(mb: &Macroblock, slot: usize) -> u8 {
+pub(crate) fn neighbor_i4_mode(mb: &Macroblock, slot: usize) -> u8 {
     if mb.kind == MbKind::Intra4x4 {
         mb.i4_modes[slot]
     } else {
@@ -941,7 +998,7 @@ fn neighbor_i4_mode(mb: &Macroblock, slot: usize) -> u8 {
 }
 
 /// 最可能模式（FFmpeg `pred_intra_mode`：任一侧不可用 → DC，否则 min）。
-fn prev_i4_mode(left: Option<u8>, top: Option<u8>) -> u8 {
+pub(crate) fn prev_i4_mode(left: Option<u8>, top: Option<u8>) -> u8 {
     match (left, top) {
         (Some(l), Some(t)) => l.min(t),
         _ => 2,
@@ -956,31 +1013,23 @@ fn prev_i4_mode(left: Option<u8>, top: Option<u8>) -> u8 {
 // ②b：P 片帧间解码（mvp / MC / skip）
 // ---------------------------------------------------------------------------
 
-/// P 片解码所需的帧级上下文（参考帧窗）。
-pub(crate) struct PFrameCtx<'a> {
-    /// List0（已按默认序 + 重排序就绪；下标 = ref_idx_l0）。
-    pub refs: &'a [Arc<Picture>],
-    /// constrained_intra_pred_flag（P 片内 intra MB 的样本可用性）。
-    pub constrained: bool,
-}
-
 /// 参考索引哨兵（FFmpeg h264pred.h / h264dec.h 逐字）。
-const LIST_NOT_USED: i8 = -1;
-const PART_NOT_AVAILABLE: i8 = -2;
+pub(crate) const LIST_NOT_USED: i8 = -1;
+pub(crate) const PART_NOT_AVAILABLE: i8 = -2;
 
 /// 单 4x4 块的 MV/参考预测项。
 #[derive(Clone, Copy)]
-struct MvNb {
-    mv: [i16; 2],
-    ref_idx: i8,
+pub(crate) struct MvNb {
+    pub(crate) mv: [i16; 2],
+    pub(crate) ref_idx: i8,
 }
 
 impl MvNb {
-    const PART: MvNb = MvNb {
+    pub(crate) const PART: MvNb = MvNb {
         mv: [0; 2],
         ref_idx: PART_NOT_AVAILABLE,
     };
-    const UNUSED: MvNb = MvNb {
+    pub(crate) const UNUSED: MvNb = MvNb {
         mv: [0; 2],
         ref_idx: LIST_NOT_USED,
     };
@@ -989,15 +1038,15 @@ impl MvNb {
 /// 当前宏块的 MV 预测网格：坐标 x ∈ −1..=4（列）、y ∈ −1..=3（行），
 /// 覆盖左/上/左上/右上边沿 + 本宏块 4x4 内部（随解析逐分区填充；
 /// 未填充分量 = PART_NOT_AVAILABLE，与 FFmpeg cache 预置语义一致）。
-struct MvGrid {
-    cells: [[MvNb; 6]; 5], // [y+1][x+1]
+pub(crate) struct MvGrid {
+    pub(crate) cells: [[MvNb; 6]; 5], // [y+1][x+1]
 }
 
 impl MvGrid {
-    fn get(&self, x: i32, y: i32) -> MvNb {
+    pub(crate) fn get(&self, x: i32, y: i32) -> MvNb {
         self.cells[(y + 1) as usize][(x + 1) as usize]
     }
-    fn set_rect(&mut self, bx: i32, by: i32, w: i32, h: i32, mv: [i16; 2], ref_idx: i8) {
+    pub(crate) fn set_rect(&mut self, bx: i32, by: i32, w: i32, h: i32, mv: [i16; 2], ref_idx: i8) {
         for yy in by..by + h {
             for xx in bx..bx + w {
                 self.cells[(yy + 1) as usize][(xx + 1) as usize] = MvNb { mv, ref_idx };
@@ -1008,7 +1057,7 @@ impl MvGrid {
 
 /// 从邻块宏块取 4x4 预测项（inter：真实 mv/ref；intra：LIST_NOT_USED+0；
 /// 未解码：PART_NOT_AVAILABLE）。
-fn mv_entry(mb: &Macroblock, b: usize) -> MvNb {
+pub(crate) fn mv_entry(mb: &Macroblock, b: usize) -> MvNb {
     if !mb.decoded {
         return MvNb::PART;
     }
@@ -1023,7 +1072,7 @@ fn mv_entry(mb: &Macroblock, b: usize) -> MvNb {
 }
 
 /// 构建 MB 起始的 MV 网格（边沿填邻块，内部 = PART_NOT_AVAILABLE）。
-fn build_mv_grid(pic: &Picture, mbx: usize, mby: usize) -> MvGrid {
+pub(crate) fn build_mv_grid(pic: &Picture, mbx: usize, mby: usize) -> MvGrid {
     let mut cells = [[MvNb::PART; 6]; 5];
     let inb = |x: i32, y: i32| -> bool {
         x >= 0 && y >= 0 && (x as usize) < pic.mb_width && (y as usize) < pic.mb_height
@@ -1050,7 +1099,7 @@ fn build_mv_grid(pic: &Picture, mbx: usize, mby: usize) -> MvGrid {
     MvGrid { cells }
 }
 
-fn mid3(a: i16, b: i16, c: i16) -> i16 {
+pub(crate) fn mid3(a: i16, b: i16, c: i16) -> i16 {
     let mx = a.max(b).max(c);
     let mn = a.min(b).min(c);
     a + b + c - mx - mn
@@ -1058,7 +1107,7 @@ fn mid3(a: i16, b: i16, c: i16) -> i16 {
 
 /// 通用 MV 预测（FFmpeg pred_motion 决策树逐字；无参考缩放——与
 /// oracle 行为一致，见 FFmpeg 源：match_count 选择 + 兜底中值）。
-fn pred_motion(g: &MvGrid, bx: i32, by: i32, pw: i32, ref_idx: i8) -> [i16; 2] {
+pub(crate) fn pred_motion(g: &MvGrid, bx: i32, by: i32, pw: i32, ref_idx: i8) -> [i16; 2] {
     let a = g.get(bx - 1, by);
     let b = g.get(bx, by - 1);
     let tr = g.get(bx + pw, by - 1);
@@ -1098,7 +1147,7 @@ fn pred_motion(g: &MvGrid, bx: i32, by: i32, pw: i32, ref_idx: i8) -> [i16; 2] {
 
 /// P_16x8 分区预测（FFmpeg pred_16x8_motion 逐字：先查同参考的
 /// 定向邻块，未命中走 pred_motion）。`by` = 分区首行（0 或 2）。
-fn pred_16x8(g: &MvGrid, by: i32, ref_idx: i8) -> [i16; 2] {
+pub(crate) fn pred_16x8(g: &MvGrid, by: i32, ref_idx: i8) -> [i16; 2] {
     if by == 0 {
         let b = g.get(0, -1);
         if b.ref_idx == ref_idx {
@@ -1114,7 +1163,7 @@ fn pred_16x8(g: &MvGrid, by: i32, ref_idx: i8) -> [i16; 2] {
 }
 
 /// P_8x16 分区预测（FFmpeg pred_8x16_motion 逐字）。`bx` = 0 或 2。
-fn pred_8x16(g: &MvGrid, bx: i32, ref_idx: i8) -> [i16; 2] {
+pub(crate) fn pred_8x16(g: &MvGrid, bx: i32, ref_idx: i8) -> [i16; 2] {
     if bx == 0 {
         let a = g.get(-1, 0);
         if a.ref_idx == ref_idx {
@@ -1195,7 +1244,7 @@ fn pred_pskip(pic: &Picture, mbx: usize, mby: usize) -> [i16; 2] {
 /// 尺寸 `w × h` 个 4x4 块；`mv` 为 QPEL）。坐标组不可收拢（各为
 /// 独立语义轴），加 allow。
 #[allow(clippy::too_many_arguments)]
-fn mc_partition(
+pub(crate) fn mc_partition(
     pic: &mut Picture,
     refp: &Picture,
     mbx: usize,
@@ -1261,15 +1310,15 @@ pub(crate) fn decode_skip_mb(
     pic: &mut Picture,
     mbx: usize,
     mby: usize,
-    pctx: &PFrameCtx<'_>,
+    pctx: &InterCtx<'_>,
     slice_id: u16,
     qp: u8,
 ) -> Result<(), H264Error> {
-    if pctx.refs.is_empty() {
+    if pctx.l0.is_empty() {
         return Err(H264Error::InvalidData("P_Skip without reference".into()));
     }
     let mv = pred_pskip(pic, mbx, mby);
-    let refp = pctx.refs[0].clone();
+    let refp = pctx.l0[0].clone();
     mc_partition(pic, &refp, mbx, mby, 0, 0, 4, 4, mv)?;
     let mb_xy = mby * pic.mb_width + mbx;
     let mut mb = Macroblock {
@@ -1290,7 +1339,7 @@ pub(crate) fn decode_skip_mb(
 
 /// 读 ref_idx_l0（te(v)：FFmpeg 语义——1 个参考不读、2 个读 1 位
 /// 取反、否则 ue 并校验 < max）。
-fn read_ref_idx(r: &mut BitReader<'_>, max: usize) -> Result<usize, H264Error> {
+pub(crate) fn read_ref_idx(r: &mut BitReader<'_>, max: usize) -> Result<usize, H264Error> {
     if max == 1 {
         return Ok(0);
     }
@@ -1306,14 +1355,14 @@ fn read_ref_idx(r: &mut BitReader<'_>, max: usize) -> Result<usize, H264Error> {
     Ok(v as usize)
 }
 
-fn mvd_add(r: &mut BitReader<'_>, m: i16) -> Result<i16, H264Error> {
+pub(crate) fn mvd_add(r: &mut BitReader<'_>, m: i16) -> Result<i16, H264Error> {
     let d = r.se()?;
     let v = i32::from(m) + (d as i32);
     i16::try_from(v).map_err(|_| H264Error::InvalidData(format!("mv {v} out of range")))
 }
 
 /// inter cbp 的 me(v) 48 项映射（FFmpeg `ff_h264_golomb_to_inter_cbp` 逐字）。
-const GOLOMB_TO_INTER_CBP: [u8; 48] = [
+pub(crate) const GOLOMB_TO_INTER_CBP: [u8; 48] = [
     0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13, 14, 6, 9, 31, 35, 37, 42, 44, 33, 34,
     36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
@@ -1332,7 +1381,7 @@ fn decode_inter_mb(
     pps: &Pps,
     slice_id: u16,
     qp: &mut u8,
-    pctx: &PFrameCtx<'_>,
+    pctx: &InterCtx<'_>,
     mb_type: u64,
 ) -> Result<(), H264Error> {
     let mb_xy = mby * pic.mb_width + mbx;
@@ -1348,7 +1397,7 @@ fn decode_inter_mb(
     } else {
         None
     };
-    let num_ref = pctx.refs.len().max(1);
+    let num_ref = pctx.l0.len().max(1);
     let luma_left_nnz = |b: usize| left_mb.map(|m| m.nnz[b]);
     let luma_top_nnz = |b: usize| top_mb.map(|m| m.nnz[b]);
     let mut grid = build_mv_grid(pic, mbx, mby);
@@ -1523,7 +1572,7 @@ fn decode_inter_mb(
     // ---- 重建：MC 全宏块 + 残差叠加 ----
     for &(bx, by, w, h, mv, ri) in &parts {
         let refp = pctx
-            .refs
+            .l0
             .get(ri as usize)
             .ok_or_else(|| H264Error::InvalidData(format!("ref_idx {ri} out of range")))?
             .clone();
@@ -1579,7 +1628,7 @@ pub(crate) fn decode_macroblock(
     pps: &Pps,
     slice_id: u16,
     qp: &mut u8,
-    pctx: Option<&PFrameCtx<'_>>,
+    pctx: Option<&InterCtx<'_>>,
 ) -> Result<(), H264Error> {
     let mb_xy = mby * pic.mb_width + mbx;
     let constrained = pctx.map(|c| c.constrained).unwrap_or(false);
@@ -1656,6 +1705,8 @@ pub(crate) fn decode_macroblock(
         }
         mb.kind = MbKind::Pcm;
         mb.qp = 0;
+        mb.cbp = 0x2F;
+        mb.luma_dc_coded = true;
         mb.nnz = [16; 24];
         mb.nnz_chroma_dc = [16; 2];
         mb.decoded = true;
@@ -1855,7 +1906,7 @@ pub(crate) fn decode_macroblock(
                 );
             }
         }
-        MbKind::Pcm | MbKind::InterP => return Ok(()), // PCM 已早退；InterP 不走此路径
+        MbKind::Pcm | MbKind::InterP | MbKind::InterB => return Ok(()), // PCM 已早退；inter 不走此路径
     }
 
     // ---- 重建：chroma（Cb、Cr）----
@@ -1903,7 +1954,7 @@ fn apply_qp_delta(r: &mut BitReader<'_>, qp: &mut u8) -> Result<(), H264Error> {
 /// - 光栅块 (3,0)（=z5）：右上 E 宏块底行，不可用 → 复制 D；
 /// - 其余右列块（z7/z13/z15 等）：E..H 无真实来源（FFmpeg 在此读
 ///   未解码区，合法编码器不会对这些块发 DDL/VL）→ 复制 D。
-fn gather_edges4(pic: &Picture, mbx: usize, mby: usize, b: usize, avail: &NeighAvail) -> Edges4 {
+pub(crate) fn gather_edges4(pic: &Picture, mbx: usize, mby: usize, b: usize, avail: &NeighAvail) -> Edges4 {
     let (cx, cy) = (b % 4, b / 4);
     let px = mbx * 16 + cx * 4;
     let py = mby * 16 + cy * 4;
@@ -1950,7 +2001,7 @@ fn gather_edges4(pic: &Picture, mbx: usize, mby: usize, b: usize, avail: &NeighA
 
 /// 4x4 块：预测 + 残差叠加（内容等价于 FFmpeg 的 nnz 判定：
 /// 仅 DC 非零 → dc_add；全零 → 不加；否则 idct_add）。
-fn reconstruct_4x4(
+pub(crate) fn reconstruct_4x4(
     pic: &mut Picture,
     mbx: usize,
     mby: usize,
@@ -1984,7 +2035,7 @@ fn reconstruct_4x4(
 /// dc_add；含任意 AC → 全 idct_add（数学上 dc_add ≡ idct_add 的仅 DC
 /// 特例，按内容判定与 FFmpeg 的 nnz 判定在 I16/chroma（nnz 只计 AC）
 /// 场景等价且不丢单 AC 系数）。
-fn add_block(plane: &mut [u8], stride: usize, y0: usize, x0: usize, block: &mut [i16; 16]) {
+pub(crate) fn add_block(plane: &mut [u8], stride: usize, y0: usize, x0: usize, block: &mut [i16; 16]) {
     let base = y0 * stride + x0;
     if block.iter().all(|&v| v == 0) {
         return;
@@ -1997,7 +2048,7 @@ fn add_block(plane: &mut [u8], stride: usize, y0: usize, x0: usize, block: &mut 
 }
 
 /// 16x16 边沿（顶行 + 左列，各 16；左上角；不可用侧填 0）。
-fn gather_16x16_edges(
+pub(crate) fn gather_16x16_edges(
     pic: &Picture,
     mbx: usize,
     mby: usize,
@@ -2026,7 +2077,7 @@ fn gather_16x16_edges(
 }
 
 /// chroma 边沿（顶行 + 左列，各 8；左上角；不可用侧填 0）。
-fn gather_chroma_edges(
+pub(crate) fn gather_chroma_edges(
     plane: &[u8],
     stride: usize,
     mbx: usize,

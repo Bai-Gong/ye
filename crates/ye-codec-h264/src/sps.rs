@@ -79,27 +79,118 @@ fn narrow_i32(v: i64, field: &str) -> Result<i32, H264Error> {
     i32::try_from(v).map_err(|_| H264Error::InvalidData(format!("{field} = {v} exceeds i32")))
 }
 
-/// 跳过 scaling list（§7.3.2.1.1.1 语义：只推进位位置，不存储内容）。
-/// `count` = 12（chroma_format_idc != 3 时）或 8（== 3 时）。
-fn skip_scaling_lists(r: &mut BitReader<'_>, count: usize) -> Result<(), H264Error> {
-    for i in 0..count {
-        if !u1f(r, "sps.seq_scaling_list_present_flag")? {
-            continue;
-        }
-        let size = if i < 6 { 16 } else { 64 };
-        let mut last_scale: i64 = 8;
-        let mut next_scale: i64 = 8;
-        for _ in 0..size {
-            if next_scale != 0 {
-                let delta = sef(r, "sps.delta_scale")?;
-                next_scale = ((last_scale + delta + 256) % 256 + 256) % 256;
-            }
-            if next_scale != 0 {
-                last_scale = next_scale;
-            }
-        }
+/// 4x4 zigzag 扫描（spec 表 7-5；与 macroblock::ZIGZAG 同值，独立持有
+/// 避免 crate 内循环依赖）。
+const ZIGZAG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// 8x8 zigzag 扫描（spec 表 7-6 = FFmpeg ff_zigzag_direct 逐字）。
+const ZIGZAG8: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
+    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// jvt 缺省 4x4 量化表（FFmpeg default_scaling4 逐字；仅"使用缺省矩阵"
+/// 语义（首 delta 落 0）时启用，未发 scaling list 时用全 16 平表）。
+const JVT_SCALING4: [[u8; 16]; 2] = [
+    [6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42],
+    [10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34],
+];
+
+/// jvt 缺省 8x8 量化表（FFmpeg default_scaling8 逐字）。
+const JVT_SCALING8: [[u8; 64]; 2] = [
+    [
+        6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29, 13, 16, 18, 23, 25, 27, 29,
+        31, 16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31,
+        33, 36, 38, 25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
+    ],
+    [
+        9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25, 15, 17, 19, 21, 22, 24, 25,
+        27, 17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27,
+        28, 30, 32, 22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
+    ],
+];
+
+/// 全 16 平表（未发任何 scaling list 时的有效量化矩阵）。
+const FLAT4: [u8; 16] = [16; 16];
+
+/// 解析一条 scaling list（FFmpeg decode_scaling_list 逐字：
+/// present=0 → 整条取 `fallback`；首 delta 落 0 → 整条取 `jvt`；
+/// 否则 delta 链推进，nextScale 归 0 后沿用 lastScale）。
+fn parse_scaling_list(
+    r: &mut BitReader<'_>,
+    size: usize,
+    jvt: &[u8],
+    fallback: &[u8],
+) -> Result<Vec<u8>, H264Error> {
+    let scan: &[usize] = if size == 16 { &ZIGZAG4 } else { &ZIGZAG8 };
+    if !u1f(r, "scaling_list_present_flag")? {
+        return Ok(fallback.to_vec());
     }
-    Ok(())
+    let mut out = vec![0u8; size];
+    let mut last: i64 = 8;
+    let mut next: i64 = 8;
+    for i in 0..size {
+        if next != 0 {
+            let v = sef(r, "delta_scale")?;
+            if !(-128..=127).contains(&v) {
+                return Err(H264Error::InvalidData(format!("delta_scale {v} invalid")));
+            }
+            next = (last + v) & 0xff;
+        }
+        if i == 0 && next == 0 {
+            // 使用缺省矩阵（useDefaultScalingMatrix 语义）
+            return Ok(jvt[..size].to_vec());
+        }
+        let v = if next != 0 { next } else { last };
+        out[scan[i]] = v as u8;
+        last = v;
+    }
+    Ok(out)
+}
+
+/// SPS/PPS 的 scaling matrix 组解析（FFmpeg decode_scaling_matrices 逐字，
+/// 4:2:0 面：6 条 4x4 + 2 条 8x8；回退链：4x4[1]←[0]、[2]←[1]、
+/// 4x4[4]←[3]、[5]←[4]、8x8 组←SPS 对应组（PPS 层）或 jvt 缺省）。
+/// `sps4`/`sps8`：上层已解析的 SPS 有效矩阵（SPS 层解析传 None）。
+fn parse_scaling_matrices(
+    r: &mut BitReader<'_>,
+    parse_8x8: bool,
+    sps4: Option<&[[u8; 16]; 6]>,
+    sps8: Option<&[[u8; 64]; 2]>,
+) -> Result<([[u8; 16]; 6], Option<[[u8; 64]; 2]>), H264Error> {
+    let fb4: [&[u8]; 2] = match sps4 {
+        Some(s) => [&s[0], &s[3]],
+        None => [&JVT_SCALING4[0], &JVT_SCALING4[1]],
+    };
+    let mut s4: [Vec<u8>; 6] = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    s4[0] = parse_scaling_list(r, 16, &JVT_SCALING4[0], fb4[0])?;
+    s4[1] = parse_scaling_list(r, 16, &JVT_SCALING4[0], &s4[0])?;
+    s4[2] = parse_scaling_list(r, 16, &JVT_SCALING4[0], &s4[1])?;
+    s4[3] = parse_scaling_list(r, 16, &JVT_SCALING4[1], fb4[1])?;
+    s4[4] = parse_scaling_list(r, 16, &JVT_SCALING4[1], &s4[3])?;
+    s4[5] = parse_scaling_list(r, 16, &JVT_SCALING4[1], &s4[4])?;
+    let mut out4: [[u8; 16]; 6] = [[0; 16]; 6];
+    for (o, v) in out4.iter_mut().zip(s4.iter()) {
+        *o = v
+            .clone()
+            .try_into()
+            .expect("parse_scaling_list 尺寸恒为 16");
+    }
+    if !parse_8x8 {
+        return Ok((out4, None));
+    }
+    let fb8: [&[u8]; 2] = match sps8 {
+        Some(s) => [&s[0], &s[1]],
+        None => [&JVT_SCALING8[0], &JVT_SCALING8[1]],
+    };
+    let l0 = parse_scaling_list(r, 64, &JVT_SCALING8[0], fb8[0])?;
+    let l1 = parse_scaling_list(r, 64, &JVT_SCALING8[1], fb8[1])?;
+    let out8: [[u8; 64]; 2] = [
+        l0.try_into().expect("parse_scaling_list 尺寸恒为 64"),
+        l1.try_into().expect("parse_scaling_list 尺寸恒为 64"),
+    ];
+    Ok((out4, Some(out8)))
 }
 
 // —— SPS ——
@@ -164,6 +255,11 @@ pub struct Sps {
     pub frame_crop_bottom: u16,
     /// VUI 存在标志（内容不解析，供后续按需扩展）。
     pub vui_parameters_present_flag: bool,
+    /// 高档位 scaling matrix（6 条 4x4 有效值；缺省 = None = 平表）。
+    /// `Some` 时 PPS 缺席项回退到此。
+    pub scaling4: Option<[[u8; 16]; 6]>,
+    /// 高档位 scaling matrix 8x8（IntraY / InterY；chroma 4:2:0 只有这两条）。
+    pub scaling8: Option<[[u8; 64]; 2]>,
 }
 
 impl Sps {
@@ -204,6 +300,8 @@ impl Sps {
         let mut separate_colour_plane_flag = false;
         let mut bit_depth_luma_minus8 = 0u8;
         let mut bit_depth_chroma_minus8 = 0u8;
+        let mut scaling4: Option<[[u8; 16]; 6]> = None;
+        let mut scaling8: Option<[[u8; 64]; 2]> = None;
         if is_high_profile(profile_idc) {
             chroma_format_idc = narrow(
                 uef(&mut r, "sps.chroma_format_idc")?,
@@ -224,9 +322,14 @@ impl Sps {
                 "sps.bit_depth_chroma_minus8",
             )? as u8;
             let _ = u1f(&mut r, "sps.qpprime_y_zero_transform_bypass_flag")?;
+            // 布局（spec 7.3.2.1.1.1，FFmpeg 同）：chroma != 3 →
+            // 6 条 4x4 + 2 条 8x8；chroma == 3 → 6 条 4x4 + 6 条 8x8
+            //（本解码器 4:2:0 恒走前一档；== 3 的额外 4 条如实收紧）
             if u1f(&mut r, "sps.seq_scaling_matrix_present_flag")? {
-                let count = if chroma_format_idc != 3 { 12 } else { 8 };
-                skip_scaling_lists(&mut r, count)?;
+                let (m4, m8) =
+                    parse_scaling_matrices(&mut r, chroma_format_idc != 3, None, None)?;
+                scaling4 = Some(m4);
+                scaling8 = m8;
             }
         }
 
@@ -346,6 +449,8 @@ impl Sps {
             frame_crop_top: frame_crop[2],
             frame_crop_bottom: frame_crop[3],
             vui_parameters_present_flag,
+            scaling4,
+            scaling8,
         };
         // 裁剪量越界在解析末尾校验——此后 width()/height() 免失败
         let crop_x = u32::from(sps.frame_crop_left) + u32::from(sps.frame_crop_right);
@@ -463,14 +568,42 @@ pub struct Pps {
     pub constrained_intra_pred_flag: bool,
     /// 冗余片计数出现。
     pub redundant_pic_cnt_present_flag: bool,
+    /// transform_8x8 允许（High 档；PPS 扩展段）。
+    pub transform_8x8_mode_flag: bool,
+    /// 第二 chroma QP 偏移（Cr；High 档；未出现 = 第一偏移）。
+    pub second_chroma_qp_index_offset: i32,
+    /// PPS scaling matrix 4x4 有效值（含 SPS/jvt 回退解析；None = 平表）。
+    pub scaling4: Option<[[u8; 16]; 6]>,
+    /// PPS scaling matrix 8x8 有效值（[IntraY, InterY]；None = 平表）。
+    pub scaling8: Option<[[u8; 64]; 2]>,
 }
+
+/// 8x8 反量化基表（FFmpeg ff_h264_dequant8_coeff_init 逐字）。
+const DEQUANT8_V: [[u8; 6]; 6] = [
+    [20, 18, 32, 19, 25, 24],
+    [22, 19, 35, 21, 28, 26],
+    [26, 23, 42, 24, 33, 31],
+    [28, 25, 45, 26, 35, 33],
+    [32, 28, 51, 30, 40, 38],
+    [36, 32, 58, 34, 46, 43],
+];
+
+/// 8x8 反量化类别扫描（FFmpeg ff_h264_dequant8_coeff_init_scan 逐字）。
+const DEQUANT8_SCAN: [u8; 16] = [0, 3, 4, 3, 3, 1, 5, 1, 4, 5, 2, 5, 3, 1, 5, 1];
 
 impl Pps {
     /// 解析完整 PPS NAL（含头字节）。类型非 8 → `InvalidData`；
     /// FMO 多片组（num_slice_groups_minus1 > 0）→ `Unsupported`
     /// （FFmpeg 同样拒绝；Baseline 码流不受影响）。
-    /// 更多的 rbsp 数据（transform_8x8 扩展段）不解析。
+    /// transform_8x8 扩展段（High 档 PPS）随本里程碑解析；
+    /// scaling 回退不带 SPS 上下文（按 jvt 缺省链）。
     pub fn parse(nal: &[u8]) -> Result<Self, H264Error> {
+        Self::parse_with_sps(nal, None)
+    }
+
+    /// 带 SPS 上下文解析（PPS 扩展段的 scaling 回退需要 SPS 有效矩阵；
+    /// `sps` 传 None 时 scaling 按无 SPS 回退链解析）。
+    pub(crate) fn parse_with_sps(nal: &[u8], sps: Option<&Sps>) -> Result<Self, H264Error> {
         let (header, payload) =
             nal_header_and_payload(nal).map_err(|e| H264Error::InvalidData(format!("pps: {e}")))?;
         if header.nal_unit_type != 8 {
@@ -535,6 +668,57 @@ impl Pps {
             u1f(&mut r, "pps.deblocking_filter_control_present_flag")?;
         let constrained_intra_pred_flag = u1f(&mut r, "pps.constrained_intra_pred_flag")?;
         let redundant_pic_cnt_present_flag = u1f(&mut r, "pps.redundant_pic_cnt_present_flag")?;
+
+        // ---- 扩展段（FFmpeg h264_ps.c 逐字）----
+        // 门槛①：有效数据位（剥 rbsp 尾随位）有余量；
+        // 门槛②：more_rbsp_data_in_pps——Baseline/Main/Extended 且
+        // constraint_set0..2 任一置位（Constrained 族）则无扩展段。
+        let data_bits = crate::slice::rbsp_data_bits(&rbsp);
+        let more_rbsp_data = match sps {
+            Some(s)
+                if matches!(s.profile_idc, 66 | 77 | 88)
+                    && (s.constraint_set(0) || s.constraint_set(1) || s.constraint_set(2)) =>
+            {
+                false
+            }
+            _ => true,
+        };
+        let mut transform_8x8_mode_flag = false;
+        let mut second_chroma_qp_index_offset = chroma_qp_index_offset;
+        let mut scaling4: Option<[[u8; 16]; 6]> = None;
+        let mut scaling8: Option<[[u8; 64]; 2]> = None;
+        if data_bits > r.bit_position() && more_rbsp_data {
+            transform_8x8_mode_flag = u1f(&mut r, "pps.transform_8x8_mode_flag")?;
+            if u1f(&mut r, "pps.pic_scaling_matrix_present_flag")? {
+                let (m4, m8) = parse_scaling_matrices(
+                    &mut r,
+                    transform_8x8_mode_flag,
+                    sps.and_then(|s| s.scaling4.as_ref()),
+                    sps.and_then(|s| s.scaling8.as_ref()),
+                )?;
+                scaling4 = Some(m4);
+                if transform_8x8_mode_flag {
+                    scaling8 = m8;
+                }
+            } else if let Some(s) = sps {
+                // PPS 未发 scaling → 沿用 SPS 有效矩阵
+                scaling4 = s.scaling4.clone();
+                if transform_8x8_mode_flag {
+                    scaling8 = s.scaling8.clone();
+                }
+            }
+            second_chroma_qp_index_offset = narrow_i32(
+                sef(&mut r, "pps.second_chroma_qp_index_offset")?,
+                "pps.second_chroma_qp_index_offset",
+            )?;
+        }
+        if !(-12..=12).contains(&chroma_qp_index_offset)
+            || !(-12..=12).contains(&second_chroma_qp_index_offset)
+        {
+            return Err(H264Error::InvalidData(
+                "chroma_qp_index_offset out of range (-12..=12)".into(),
+            ));
+        }
         Ok(Pps {
             pic_parameter_set_id,
             seq_parameter_set_id,
@@ -550,7 +734,67 @@ impl Pps {
             deblocking_filter_control_present_flag,
             constrained_intra_pred_flag,
             redundant_pic_cnt_present_flag,
+            transform_8x8_mode_flag,
+            second_chroma_qp_index_offset,
+            scaling4,
+            scaling8,
         })
+    }
+
+    /// 4x4 反量化乘子表（FFmpeg init_dequant4_coeff_table 逐字）：
+    /// `qmul[转置槽] = V[qp%6][class(x)] · scaling[x] << (qp/6+2)`。
+    /// `list`：0=IntraY 1=IntraCr 2=IntraCb 3=InterY 4=InterCr 5=InterCb。
+    pub(crate) fn dequant4_coeff(&self, qp: u8, list: usize) -> [u32; 16] {
+        let scaling: [u8; 16] = self
+            .scaling4
+            .as_ref()
+            .map(|s| s[list])
+            .unwrap_or([16; 16]);
+        let mut qmul = [0u32; 16];
+        for x in 0..16usize {
+            let class = (x & 1) + ((x >> 2) & 1);
+            let v = u32::from(crate::macroblock::DEQUANT_V[usize::from(qp % 6)][class])
+                * u32::from(scaling[x]);
+            // 槽位转置（FFmpeg (x>>2)|((x<<2)&0xF)）——平坦/对称矩阵下
+            // 与现行光栅布局等价，带自定义矩阵时按 FFmpeg 转置口径
+            qmul[(x >> 2) | ((x << 2) & 0xF)] = v << (u32::from(qp / 6) + 2);
+        }
+        qmul
+    }
+
+    /// 8x8 反量化乘子表（FFmpeg init_dequant8_coeff_table 逐字）：
+    /// `qmul8[转置槽] = V8[qp%6][scanclass(x)] · scaling8[x] << (qp/6)`。
+    /// `list`：0=IntraY 1=InterY。
+    pub(crate) fn dequant8_coeff(&self, qp: u8, list: usize) -> [u32; 64] {
+        let scaling: [u8; 64] = self
+            .scaling8
+            .as_ref()
+            .map(|s| s[list])
+            .unwrap_or([16; 64]);
+        let mut qmul = [0u32; 64];
+        for x in 0..64usize {
+            let cls = usize::from(DEQUANT8_SCAN[((x >> 1) & 12) | (x & 3)]);
+            let v = u32::from(DEQUANT8_V[usize::from(qp % 6)][cls]) * u32::from(scaling[x]);
+            qmul[(x >> 3) | ((x & 7) << 3)] = v << u32::from(qp / 6);
+        }
+        qmul
+    }
+
+    /// chroma DC 反量化乘子（4x4 平表 DC 类，chroma DC 无独立矩阵）。
+    pub(crate) fn chroma_dc_qmul(&self, qpc: u8) -> u32 {
+        u32::from(crate::macroblock::DEQUANT_V[usize::from(qpc % 6)][0])
+            << (u32::from(qpc / 6) + 6)
+    }
+
+    /// chroma QP（按平面：0=Cb 用第一偏移、1=Cr 用第二偏移；
+    /// FFmpeg get_chroma_qp 的 4:2:0 形态：clip 后查 CHROMA_QP 表——
+    /// 表在 macroblock.rs，经此只提供偏移选择）。
+    pub(crate) fn chroma_qp_offset(&self, plane: usize) -> i32 {
+        if plane == 1 {
+            self.second_chroma_qp_index_offset
+        } else {
+            self.chroma_qp_index_offset
+        }
     }
 }
 

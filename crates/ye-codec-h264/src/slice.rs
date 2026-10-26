@@ -14,7 +14,8 @@
 use crate::bitreader::BitReader;
 use crate::deblock;
 use crate::error::H264Error;
-use crate::macroblock::{PFrameCtx, Picture, decode_macroblock, decode_skip_mb};
+use crate::inter::InterCtx;
+use crate::macroblock::{Picture, decode_macroblock, decode_skip_mb};
 use crate::sps::{Pps, Sps};
 
 /// 片类型（golomb_to_pict_type = [P, B, I, SP, SI]）。
@@ -65,6 +66,21 @@ pub(crate) struct SliceHeader {
     pub long_term_reference_flag: bool,
     /// dec_ref_pic_marking：非 IDR 自适应标记操作 (opcode, diff, long_arg)。
     pub mmco: Vec<(u8, u64, u64)>,
+    // ---- B 片 / POC / CABAC 增补（M2）----
+    /// B 片：NumRefIdxL1Active；非 B = 0。
+    pub num_ref_l1: usize,
+    /// B 片：List1 的 ref_pic_list_modification 操作序列。
+    pub ref_mods_l1: Vec<(u8, u64)>,
+    /// B 片：direct_spatial_mv_pred_flag。
+    pub direct_spatial_mv_pred: bool,
+    /// poc type 0：pic_order_cnt_lsb。
+    pub poc_lsb: u32,
+    /// poc type 0：delta_pic_order_cnt_bottom。
+    pub delta_poc_bottom: i32,
+    /// poc type 1：delta_pic_order_cnt[0..2]。
+    pub delta_poc: [i32; 2],
+    /// cabac_init_idc（CABAC 且非 I 片时出现；CAVLC = 0）。
+    pub cabac_init_idc: u8,
     /// 去块参数（片级）。
     pub deblock: DeblockParams,
 }
@@ -134,12 +150,7 @@ pub(crate) fn parse_slice_header(
 
     let slice_type = SliceType::from_code(r.ue()?)?;
     match slice_type {
-        SliceType::I | SliceType::P => {}
-        SliceType::B => {
-            return Err(H264Error::Unsupported(
-                "B slices land in a later stage (Baseline 无 B)",
-            ));
-        }
+        SliceType::I | SliceType::P | SliceType::B => {}
         SliceType::Sp | SliceType::Si => {
             return Err(H264Error::Unsupported("SP/SI slices unsupported"));
         }
@@ -170,19 +181,21 @@ pub(crate) fn parse_slice_header(
         }
     }
 
-    // poc：按 SPS 类型消费位（②a 输出按解码序，不维护 POC 状态，
-    // 但必须吃掉位流位置）
+    // poc：按 SPS 类型消费并记录（M2 起 POC 参与计算）
+    let mut poc_lsb = 0u32;
+    let mut delta_poc_bottom = 0i32;
+    let mut delta_poc = [0i32; 2];
     match sps.pic_order_cnt_type {
         0 => {
-            let _poc_lsb = r.u(u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4)?;
+            poc_lsb = r.u(u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4)? as u32;
             if pps.bottom_field_pic_order_in_frame_present_flag {
-                let _d = r.se()?;
+                delta_poc_bottom = r.se()? as i32;
             }
         }
         1 if !sps.delta_pic_order_always_zero_flag => {
-            let _d0 = r.se()?;
+            delta_poc[0] = r.se()? as i32;
             if pps.bottom_field_pic_order_in_frame_present_flag {
-                let _d1 = r.se()?;
+                delta_poc[1] = r.se()? as i32;
             }
         }
         _ => {}
@@ -200,10 +213,49 @@ pub(crate) fn parse_slice_header(
         }
     }
 
-    // ---- P 片：参考帧数量覆盖 + 列表重排序（FFmpeg parse_ref_count /
+    // ---- P/B 片：参考帧数量覆盖 + 列表重排序（FFmpeg parse_ref_count /
     // decode_ref_pic_list_reordering 逐字语义；I 片跳过）----
     let mut num_ref_l0 = 0usize;
+    let mut num_ref_l1 = 0usize;
     let mut ref_mods: Vec<(u8, u64)> = Vec::new();
+    let mut ref_mods_l1: Vec<(u8, u64)> = Vec::new();
+    let mut direct_spatial_mv_pred = true;
+    let mut read_reorder = |r: &mut BitReader<'_>, num_ref: usize| -> Result<Vec<(u8, u64)>, H264Error> {
+        let mut mods = Vec::new();
+        let mut count = 0usize;
+        loop {
+            let op = r.ue()?;
+            if op == 3 {
+                break;
+            }
+            if op > 2 {
+                return Err(H264Error::InvalidData(format!(
+                    "modification_of_pic_nums_idc {op} invalid"
+                )));
+            }
+            if count >= num_ref {
+                return Err(H264Error::InvalidData(
+                    "ref list modification count overflow".into(),
+                ));
+            }
+            let val = r.ue()?;
+            mods.push((op as u8, val));
+            count += 1;
+        }
+        Ok(mods)
+    };
+    let read_num_ref = |r: &mut BitReader<'_>, which: u8| -> Result<usize, H264Error> {
+        if r.u1()? {
+            let n = r.ue()?;
+            if n > 14 {
+                return Err(H264Error::InvalidData(format!(
+                    "num_ref_idx_l{which}_active_minus1 {n} out of range"
+                )));
+            }
+            return Ok(n as usize + 1);
+        }
+        Ok(usize::MAX) // 哨兵：未覆盖
+    };
     if slice_type == SliceType::P {
         if pps.weighted_pred_flag {
             return Err(H264Error::Unsupported(
@@ -211,38 +263,44 @@ pub(crate) fn parse_slice_header(
             ));
         }
         num_ref_l0 = usize::from(pps.num_ref_idx_l0_default_active_minus1) + 1;
-        if r.u1()? {
-            let n = r.ue()?;
-            if n > 14 {
-                return Err(H264Error::InvalidData(format!(
-                    "num_ref_idx_l0_active_minus1 {n} out of range"
-                )));
-            }
-            num_ref_l0 = n as usize + 1;
+        if let n @ 0..=15 = read_num_ref(r, 0)? {
+            num_ref_l0 = n;
         }
         if r.u1()? {
-            // ref_pic_list_modification_flag_l0
-            let mut count = 0usize;
-            loop {
-                let op = r.ue()?;
-                if op == 3 {
-                    break;
-                }
-                if op > 2 {
-                    return Err(H264Error::InvalidData(format!(
-                        "modification_of_pic_nums_idc {op} invalid"
-                    )));
-                }
-                if count >= num_ref_l0 {
-                    return Err(H264Error::InvalidData(
-                        "ref list modification count overflow".into(),
-                    ));
-                }
-                let val = r.ue()?;
-                ref_mods.push((op as u8, val));
-                count += 1;
-            }
+            ref_mods = read_reorder(r, num_ref_l0)?;
         }
+    } else if slice_type == SliceType::B {
+        if pps.weighted_bipred_idc != 0 {
+            return Err(H264Error::Unsupported(
+                "explicit weighted biprediction lands in a later stage",
+            ));
+        }
+        direct_spatial_mv_pred = r.u1()?;
+        num_ref_l0 = usize::from(pps.num_ref_idx_l0_default_active_minus1) + 1;
+        num_ref_l1 = usize::from(pps.num_ref_idx_l1_default_active_minus1) + 1;
+        if let n @ 0..=15 = read_num_ref(r, 0)? {
+            num_ref_l0 = n;
+        }
+        if let n @ 0..=15 = read_num_ref(r, 1)? {
+            num_ref_l1 = n;
+        }
+        if r.u1()? {
+            ref_mods = read_reorder(r, num_ref_l0)?;
+        }
+        if r.u1()? {
+            ref_mods_l1 = read_reorder(r, num_ref_l1)?;
+        }
+    }
+    // cabac_init_idc（CABAC 且非 I/SI 片；spec 7.3.3）
+    let mut cabac_init_idc = 0u8;
+    if pps.entropy_coding_mode_flag && slice_type != SliceType::I {
+        let v = r.ue()?;
+        if v > 2 {
+            return Err(H264Error::InvalidData(format!(
+                "cabac_init_idc {v} out of range"
+            )));
+        }
+        cabac_init_idc = v as u8;
     }
 
     // dec_ref_pic_marking（I/P 参考帧；nal_ref_idc==0 不标记）。
@@ -335,6 +393,13 @@ pub(crate) fn parse_slice_header(
         long_term_reference_flag,
         mmco,
         deblock,
+        num_ref_l1,
+        ref_mods_l1,
+        direct_spatial_mv_pred,
+        poc_lsb,
+        delta_poc_bottom,
+        delta_poc,
+        cabac_init_idc,
     })
 }
 
@@ -350,13 +415,17 @@ pub(crate) fn parse_slice_header(
 pub(crate) fn decode_slice(
     r: &mut BitReader<'_>,
     data_bits: usize,
+    rbsp: &[u8],
     pic: &mut Picture,
     pps: &Pps,
     slice_id: u16,
     header: &SliceHeader,
     slice_end_mb: usize,
-    pctx: Option<&PFrameCtx<'_>>,
+    pctx: Option<&InterCtx<'_>>,
 ) -> Result<usize, H264Error> {
+    if pps.entropy_coding_mode_flag {
+        return decode_slice_cabac(r, rbsp, pic, pps, slice_id, header, slice_end_mb, pctx);
+    }
     let mut qp = header.slice_qp;
     let mut mb_idx = header.first_mb_in_slice;
     // 去块滞后调度（FFmpeg loop_filter 调用点同构）：每解码完一整行
@@ -430,6 +499,82 @@ pub(crate) fn decode_slice(
 }
 
 // ---------------------------------------------------------------------------
+// CABAC 片数据循环（spec 7.3.4 CABAC 分支；FFmpeg decode_slice 语义）
+// ---------------------------------------------------------------------------
+
+/// CABAC 片循环：逐 MB 解码，`end_of_slice_flag`（terminate bin）收尾；
+/// 去块滞后调度与 CAVLC 路径同构（整行滤波）。
+#[allow(clippy::too_many_arguments)]
+fn decode_slice_cabac(
+    r: &mut BitReader<'_>,
+    rbsp: &[u8],
+    pic: &mut Picture,
+    pps: &Pps,
+    slice_id: u16,
+    header: &SliceHeader,
+    slice_end_mb: usize,
+    pctx: Option<&InterCtx<'_>>,
+) -> Result<usize, H264Error> {
+    use crate::cabac::{Cabac, CabacCtx};
+    use crate::cabac_mb::decode_mb_cabac;
+    let byte_pos = r.bit_position().div_ceil(8);
+    let ctx_model = CabacCtx::init(
+        header.slice_qp,
+        usize::from(header.cabac_init_idc),
+        header.slice_type == SliceType::I,
+    );
+    let mut reader = crate::cabac::CabacReader::new(Cabac::new(rbsp, byte_pos), ctx_model);
+    let is_b = header.slice_type == SliceType::B;
+    let mut qp = header.slice_qp;
+    let mut last_qscale_diff = 0i32;
+    let mut mb_idx = header.first_mb_in_slice;
+    let w = pic.mb_width;
+    let mut lf_x_start = header.first_mb_in_slice % w;
+    loop {
+        if mb_idx >= slice_end_mb {
+            return Err(H264Error::InvalidData(
+                "slice data exceeds picture boundary (end_of_slice_flag missing)".into(),
+            ));
+        }
+        if pic.mbs[mb_idx].decoded {
+            return Err(H264Error::InvalidData(
+                "slice overlaps already-decoded macroblock".into(),
+            ));
+        }
+        let mbx = mb_idx % pic.mb_width;
+        let mby = mb_idx / pic.mb_width;
+        decode_mb_cabac(
+            &mut reader, pic, mbx, mby, pps, slice_id, &mut qp, &mut last_qscale_diff,
+            pctx, is_b,
+        )
+        .map_err(|e| H264Error::InvalidData(format!("cabac mb ({mbx},{mby}): {e}")))?;
+        mb_idx += 1;
+        if mb_idx.is_multiple_of(w) {
+            if header.deblock.enabled {
+                deblock_row(pic, (mb_idx - 1) / w, lf_x_start, w, &header.deblock);
+            }
+            lf_x_start = 0;
+        }
+        if reader.cabac.terminate() {
+            break; // end_of_slice_flag = 1
+        }
+        if std::env::var_os("YE_DBG_FORCE_END").is_some() && mb_idx + 1 >= slice_end_mb {
+            eprintln!("DBG force end at mb {mb_idx} (terminate=false)");
+            break;
+        }
+    }
+    if mb_idx > slice_end_mb {
+        return Err(H264Error::InvalidData(
+            "slice overlaps with next slice boundary".into(),
+        ));
+    }
+    if header.deblock.enabled && mb_idx % w > lf_x_start {
+        deblock_row(pic, mb_idx / w, lf_x_start, mb_idx % w, &header.deblock);
+    }
+    Ok(mb_idx)
+}
+
+// ---------------------------------------------------------------------------
 // ②c：去块主链接线（边组织循环；滤波核与阈值全部来自 deblock.rs）。
 // 边序与 QP 取值按 FFmpeg h264_loopfilter.c `h264_filter_mb_fast_internal`
 // 逐字（progressive、4x4 DCT、4:2:0）：逐 MB luma 垂直边 0..3 →
@@ -464,7 +609,14 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize, dp: &DeblockParams) {
     let x0 = mbx * 16;
 
     // ---- luma 垂直边 e = 0..4（列 x0 + 4e，p 块列 e−1 | q 块列 e） ----
+    // 8x8 变换的块内部边（e ∈ {1,3}，跨 8x8 象限内的 4x4 边）bS = 0
+    //（spec 8.8.2.4：transform_size_8x8_flag=1 的两侧块间边不滤；
+    // e=1 在象限 (0,*)/(1,*) 内部、e=3 在 (2,*)/(3,*) 内部——仅当
+    // 本 MB 8x8 时跳过；跨 MB 边（e=0）不受影响）
     for e in 0..4usize {
+        if e % 2 == 1 && pic.mbs[mb_xy].transform_8x8 {
+            continue;
+        }
         let mut bs = [0u8; 4];
         let mut any = false;
         let (p_src, q_src): (Option<usize>, Option<usize>) = if e == 0 {
@@ -506,6 +658,9 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize, dp: &DeblockParams) {
 
     // ---- luma 水平边 e = 0..4（行 y0 + 4e） ----
     for e in 0..4usize {
+        if e % 2 == 1 && pic.mbs[mb_xy].transform_8x8 {
+            continue;
+        }
         let mut bs = [0u8; 4];
         let mut any = false;
         let (p_src, q_src): (Option<usize>, Option<usize>) = if e == 0 {

@@ -164,13 +164,36 @@ pub(crate) fn boundary_strength(
     if mb_is_intra(p_mb) || mb_is_intra(q_mb) {
         return if mb_boundary { 4 } else { 3 };
     }
-    // inter：系数非零 → 2（先判）；参考/MV 差异 → 1；否则 0。
+    // inter：系数非零 → 2（先判）；参考/MV 差异 → 1（B 帧按两列表
+    // 逐一比对，任一列表差异即 1——spec 8.8.2.4 / FFmpeg 同构；
+    // 未用列表（ref < 0）跳过该列表比对）。
     if p_mb.nnz[p_blk] != 0 || q_mb.nnz[q_blk] != 0 {
         return 2;
     }
-    let dmvx = i32::from(p_mb.mv[p_blk][0]) - i32::from(q_mb.mv[q_blk][0]);
-    let dmvy = i32::from(p_mb.mv[p_blk][1]) - i32::from(q_mb.mv[q_blk][1]);
-    if p_mb.ref_idx[p_blk] != q_mb.ref_idx[q_blk] || dmvx.abs() >= 4 || dmvy.abs() >= 4 {
+    let cmp_list = |pm: &Macroblock, qm: &Macroblock, pb: usize, qb: usize, l1: bool| -> bool {
+        let (pr, qr) = if l1 {
+            (pm.ref_idx_l1[pb], qm.ref_idx_l1[qb])
+        } else {
+            (pm.ref_idx[pb], qm.ref_idx[qb])
+        };
+        if pr < 0 && qr < 0 {
+            return false; // 两侧均未用该列表
+        }
+        if pr != qr {
+            return true;
+        }
+        let (pmv, qmv) = if l1 {
+            (pm.mv_l1[pb], qm.mv_l1[qb])
+        } else {
+            (pm.mv[pb], qm.mv[qb])
+        };
+        let dmvx = i32::from(pmv[0]) - i32::from(qmv[0]);
+        let dmvy = i32::from(pmv[1]) - i32::from(qmv[1]);
+        dmvx.abs() >= 4 || dmvy.abs() >= 4
+    };
+    if cmp_list(p_mb, q_mb, p_blk, q_blk, false)
+        || cmp_list(p_mb, q_mb, p_blk, q_blk, true)
+    {
         return 1;
     }
     0

@@ -28,7 +28,8 @@ use ye_time::Timestamp;
 
 use crate::bitreader::BitReader;
 use crate::error::H264Error;
-use crate::macroblock::{PFrameCtx, Picture};
+use crate::inter::InterCtx;
+use crate::macroblock::Picture;
 use crate::nal::{self, NalHeader};
 use crate::slice::{self, SliceHeader, SliceType};
 use crate::sps::{Pps, Sps};
@@ -53,9 +54,30 @@ pub struct H264Decoder {
     log2_max_frame_num: u8,
     /// 已完成待输出的帧。
     out: VecDeque<Frame>,
+    /// 解码图片缓冲（输出重排；B 帧 POC 序释放）。
+    dpb: Vec<DpbEntry>,
+    /// POC 状态机（spec 8.3.1；JM decode_poc 同构）。
+    poc: PocState,
     /// flush 后排空中暂存的失败（flush 无返回值，经 pull 透出）。
     pending_error: Option<CodecError>,
     flushed: bool,
+}
+
+/// DPB 条目：已完成、待按 POC 序输出的图片。
+struct DpbEntry {
+    pic: Arc<Picture>,
+    pts: Option<Timestamp>,
+    poc: i32,
+    outputted: bool,
+}
+
+/// POC 状态（frame 图；JM VideoParameters 对应字段的子集）。
+struct PocState {
+    prev_lsb: i32,
+    prev_msb: i32,
+    prev_frame_num: u32,
+    prev_frame_num_offset: i32,
+    last_has_mmco_5: bool,
 }
 
 /// 一张图的解码上下文。
@@ -73,6 +95,11 @@ struct PictureCtx {
     decoded_mb_count: usize,
     next_slice_id: u16,
     pts: Option<Timestamp>,
+    /// 本图 POC。
+    poc: i32,
+    /// 本图解码时的参考列表快照（map_col 匹配用）。
+    used_l0: Vec<Arc<Picture>>,
+    used_l1: Vec<Arc<Picture>>,
 }
 
 impl PictureCtx {
@@ -98,6 +125,14 @@ impl H264Decoder {
             prev_frame_num: 0,
             log2_max_frame_num: 4,
             out: VecDeque::new(),
+            dpb: Vec::new(),
+            poc: PocState {
+                prev_lsb: 0,
+                prev_msb: 0,
+                prev_frame_num: 0,
+                prev_frame_num_offset: 0,
+                last_has_mmco_5: false,
+            },
             pending_error: None,
             flushed: false,
         };
@@ -143,7 +178,8 @@ impl H264Decoder {
                 Ok(())
             }
             8 => {
-                let pps = Pps::parse(nal).map_err(codec_err)?;
+                let sps_for_pps = self.sps_list.iter().find_map(|s| s.as_ref());
+                let pps = Pps::parse_with_sps(nal, sps_for_pps).map_err(codec_err)?;
                 let pid = pps.pic_parameter_set_id;
                 self.pps_list[usize::from(pid)] = Some(pps);
                 Ok(())
@@ -219,15 +255,14 @@ impl H264Decoder {
             })?
             .clone();
 
-        // ②a 参数集级门槛
-        if pps.entropy_coding_mode_flag {
+        // 参数集级门槛（M2：CABAC 与 High 档已落地，仅挡真正未实现面）
+        if !matches!(
+            sps.profile_idc,
+            66 | 77 | 88 | 100 | 110 | 118 | 122 | 244 | 44 | 83 | 86 | 128 | 138 | 139
+                | 134 | 135
+        ) {
             return Err(CodecError::UnsupportedStub(
-                "CABAC entropy coding not implemented in this stage",
-            ));
-        }
-        if !matches!(sps.profile_idc, 66 | 77 | 88) {
-            return Err(CodecError::UnsupportedStub(
-                "profile beyond Baseline/Main/Extended not supported in this stage",
+                "profile not supported (accepted: Baseline/Main/Extended/High family)",
             ));
         }
         if sps.chroma_format_idc != 1 || sps.separate_colour_plane_flag {
@@ -245,6 +280,13 @@ impl H264Decoder {
             slice::parse_slice_header(&mut r, &sps, &pps, is_idr, header.nal_ref_idc)
                 .map_err(codec_err)?
         };
+
+        // B 片 CAVLC：如实收紧（x264 的 B 流恒 CABAC；CAVLC-B 后续按需）
+        if sh.slice_type == SliceType::B && !pps.entropy_coding_mode_flag {
+            return Err(CodecError::UnsupportedStub(
+                "B slices with CAVLC entropy coding land in a later stage",
+            ));
+        }
 
         // ---- 访问单元边界（I/P 通用）----
         // IDR 恒为新图；非 IDR 以帧号变化判定。P 帧断号属错误处理（②c），
@@ -282,13 +324,18 @@ impl H264Decoder {
             self.log2_max_frame_num = sps.log2_max_frame_num_minus4 + 4;
             let mb_w = usize::from(sps.pic_width_in_mbs);
             let mb_h = usize::from(sps.pic_height_in_map_units);
+            let mut pic = Arc::new(Picture::new(
+                mb_w,
+                mb_h,
+                sps.width() as usize,
+                sps.height() as usize,
+            ));
+            let poc = self.compute_poc(&sps, &sh, is_idr, header.nal_ref_idc != 0);
+            Arc::get_mut(&mut pic)
+                .expect("sole owner at picture start")
+                .poc = poc;
             self.cur = Some(PictureCtx {
-                pic: Arc::new(Picture::new(
-                    mb_w,
-                    mb_h,
-                    sps.width() as usize,
-                    sps.height() as usize,
-                )),
+                pic,
                 sps_id: sps.seq_parameter_set_id,
                 frame_num: sh.frame_num,
                 idr: is_idr,
@@ -298,6 +345,9 @@ impl H264Decoder {
                 decoded_mb_count: 0,
                 next_slice_id: 0,
                 pts,
+                poc,
+                used_l0: Vec::new(),
+                used_l1: Vec::new(),
             });
         }
         let ctx = self.cur.as_mut().expect("picture ctx just ensured");
@@ -313,12 +363,36 @@ impl H264Decoder {
             .clone()
             .expect("sps active since picture start");
 
-        // ---- P 片：构建 List0（默认序 + 重排）----
-        let list0: Vec<Arc<Picture>> = if sh.slice_type == SliceType::P {
-            self.build_list0(&sh)?
-        } else {
-            Vec::new()
-        };
+        // ---- 参考列表（P：List0；B：双列表 POC 序 + 重排）----
+        let cur_poc = self
+            .cur
+            .as_ref()
+            .map(|c| c.poc)
+            .unwrap_or(0);
+        let (list0, list1): (Vec<Arc<Picture>>, Vec<Arc<Picture>>) =
+            match sh.slice_type {
+                SliceType::P => (self.build_list0(&sh)?, Vec::new()),
+                SliceType::B => {
+                    let (mut l0, mut l1) = crate::inter::build_b_lists(
+                        &self.short_ref_with_poc(),
+                        &self.long_ref,
+                        cur_poc,
+                        sh.num_ref_l0.max(1),
+                    );
+                    // 长窗 POC 由 Picture 自带（build_b_lists 以 pic.poc 读取）
+                    // 长窗补位（build_b_lists 内已含；重排在后）
+                    l0 = self.apply_reorder(l0, &sh.ref_mods, sh.num_ref_l0.max(1))?;
+                    l1 = self.apply_reorder(l1, &sh.ref_mods_l1, sh.num_ref_l1.max(1))?;
+                    (l0, l1)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+        if let Some(c) = self.cur.as_mut() {
+            if !list0.is_empty() || !list1.is_empty() {
+                c.used_l0 = list0.clone();
+                c.used_l1 = list1.clone();
+            }
+        }
         let ctx = self.cur.as_mut().expect("picture ctx just ensured");
         let slice_id = ctx.next_slice_id;
         ctx.next_slice_id = ctx.next_slice_id.saturating_add(1);
@@ -331,17 +405,71 @@ impl H264Decoder {
             let mb_total = ctx.pic.mb_width * ctx.pic.mb_height;
             // 解码期独占持有：参考窗只收已完成的图，get_mut 必得
             let pic_mut = Arc::get_mut(&mut ctx.pic).expect("sole owner during decode");
-            let pctx = if sh.slice_type == SliceType::P {
-                Some(PFrameCtx {
-                    refs: &list0,
+            let pctx = match sh.slice_type {
+                SliceType::I => None,
+                SliceType::P => Some(InterCtx {
+                    l0: &list0,
+                    l1: &[],
                     constrained: pps.constrained_intra_pred_flag,
-                })
-            } else {
-                None
+                    direct_spatial: true,
+                    cur_poc: 0,
+                    colocated: None,
+                    col_is_long: false,
+                    ref_poc: [[0; 32]; 2],
+                    dist_scale: [256; 32],
+                    map_col: [[0; 32]; 2],
+                    direct_8x8_inference: sps_active.direct_8x8_inference_flag,
+                }),
+                SliceType::B => {
+                    let col = list1
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| CodecError::InvalidData("B slice without list1".into()))?;
+                    let mut dist_scale = [256i32; 32];
+                    for (i, r0) in list0.iter().enumerate().take(32) {
+                        dist_scale[i] = crate::inter::scale_factor(
+                            cur_poc,
+                            col.poc,
+                            r0.poc,
+                            r0.is_long_term,
+                        );
+                    }
+                    let mut map_col = [[0usize; 32]; 2];
+                    for list in 0..2usize {
+                        let used = if list == 0 { &col.used_l0 } else { &col.used_l1 };
+                        for (idx, entry) in used.iter().enumerate().take(32) {
+                            if let Some(p) = entry {
+                                map_col[list][idx] = list0
+                                    .iter()
+                                    .position(|q| Arc::ptr_eq(q, p))
+                                    .unwrap_or(0);
+                            }
+                        }
+                    }
+                    let ref_poc = [
+                        list0_poc(&list0),
+                        list0_poc(&list1),
+                    ];
+                    Some(InterCtx {
+                        l0: &list0,
+                        l1: &list1,
+                        constrained: pps.constrained_intra_pred_flag,
+                        direct_spatial: sh.direct_spatial_mv_pred,
+                        cur_poc,
+                        colocated: Some(col.clone()),
+                        col_is_long: col.is_long_term,
+                        ref_poc,
+                        dist_scale,
+                        map_col,
+                        direct_8x8_inference: sps_active.direct_8x8_inference_flag,
+                    })
+                }
+                _ => None,
             };
             slice::decode_slice(
                 &mut r,
                 data_bits,
+                &rbsp,
                 pic_mut,
                 &pps,
                 slice_id,
@@ -355,9 +483,9 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// 完成在途图片：补全检查通过 → 组装 yuv420p 帧入队。
+    /// 完成在途图片：补全检查 → 参考标记 → 入 DPB → 按 POC 序释放。
     fn finish_current_picture(&mut self) -> Result<(), CodecError> {
-        let Some(ctx) = self.cur.take() else {
+        let Some(mut ctx) = self.cur.take() else {
             return Ok(());
         };
         let total = ctx.mb_total();
@@ -367,10 +495,298 @@ impl H264Decoder {
                 ctx.decoded_mb_count
             )));
         }
+        // 长期参考标记预测（与 mark_reference 的落窗决策同源；
+        // 此刻仍独占，可写字段）
+        let to_long = (ctx.idr && ctx.long_term_reference_flag)
+            || ctx.mmco.iter().any(|&(op, _, _)| op == 3 || op == 6);
+        if let Some(pic_mut) = Arc::get_mut(&mut ctx.pic) {
+            pic_mut.is_long_term = to_long;
+            pic_mut.used_l0 = ctx.used_l0.iter().map(|p| Some(p.clone())).collect();
+            pic_mut.used_l1 = ctx.used_l1.iter().map(|p| Some(p.clone())).collect();
+        }
         self.mark_reference(&ctx);
-        let frame = build_frame(&ctx.pic, ctx.pts).map_err(codec_err)?;
-        self.out.push_back(Frame::Video(frame));
+        // mmco5：POC 状态复位标记
+        self.poc.last_has_mmco_5 = ctx.mmco.iter().any(|&(op, _, _)| op == 5);
+        // IDR：POC 归零——先按序清空在途（GOP 尾帧全部先于 IDR 输出），
+        // 再入 DPB；非 IDR 走地平线规则
+        if ctx.idr {
+            self.flush_dpb();
+        }
+        self.dpb.push(DpbEntry {
+            pic: ctx.pic.clone(),
+            pts: ctx.pts,
+            poc: ctx.poc,
+            outputted: false,
+        });
+        if !ctx.idr {
+            self.release_dpb();
+        }
         Ok(())
+    }
+
+    /// DPB 释放（输出重排）：释放 POC 早于「参考窗中最小 POC」的
+    /// 全部待输出图（升序）。参考窗空 → 全放。
+    fn release_dpb(&mut self) {
+        let horizon = {
+            let mut h = i32::MAX;
+            for (p, _) in &self.short_ref {
+                h = h.min(p.poc);
+            }
+            for l in &self.long_ref {
+                if let Some(p) = l {
+                    h = h.min(p.poc);
+                }
+            }
+            h
+        };
+        let mut pending: Vec<usize> = self
+            .dpb
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.outputted)
+            .map(|(i, _)| i)
+            .collect();
+        pending.sort_by_key(|&i| self.dpb[i].poc);
+        for i in pending {
+            if self.dpb[i].poc < horizon {
+                self.dpb[i].outputted = true;
+                let e = &self.dpb[i];
+                if let Ok(frame) = build_frame(&e.pic, e.pts) {
+                    self.out.push_back(Frame::Video(frame));
+                }
+            }
+        }
+        // 安全上限（合规流不触发；超出即按 POC 序强放）
+        if self.dpb.iter().filter(|e| !e.outputted).count() > 16 {
+            self.flush_dpb();
+        }
+        self.dpb.retain(|e| !e.outputted);
+    }
+
+    /// flush：全部待输出图按 POC 序释放（容错：build 失败跳过该帧）。
+    fn flush_dpb(&mut self) {
+        let mut pending: Vec<usize> = self
+            .dpb
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.outputted)
+            .map(|(i, _)| i)
+            .collect();
+        pending.sort_by_key(|&i| self.dpb[i].poc);
+        for i in pending {
+            let e = &self.dpb[i];
+            if let Ok(frame) = build_frame(&e.pic, e.pts) {
+                self.out.push_back(Frame::Video(frame));
+            }
+        }
+        self.dpb.clear();
+    }
+
+    /// POC 计算（spec 8.3.1；JM decode_poc 帧图分支逐字）。
+    fn compute_poc(&mut self, sps: &Sps, sh: &SliceHeader, is_idr: bool, is_ref: bool) -> i32 {
+        match sps.pic_order_cnt_type {
+            0 => {
+                let max_lsb = 1i32 << (i32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4);
+                let lsb = sh.poc_lsb as i32;
+                if is_idr {
+                    self.poc.prev_lsb = 0;
+                    self.poc.prev_msb = 0;
+                } else if self.poc.last_has_mmco_5 {
+                    self.poc.prev_lsb = 0;
+                    self.poc.prev_msb = 0;
+                }
+                let msb = if lsb < self.poc.prev_lsb
+                    && self.poc.prev_lsb - lsb >= max_lsb / 2
+                {
+                    self.poc.prev_msb + max_lsb
+                } else if lsb > self.poc.prev_lsb
+                    && lsb - self.poc.prev_lsb > max_lsb / 2
+                {
+                    self.poc.prev_msb - max_lsb
+                } else {
+                    self.poc.prev_msb
+                };
+                let top = msb + lsb;
+                if is_ref {
+                    self.poc.prev_lsb = lsb;
+                    self.poc.prev_msb = msb;
+                }
+                self.poc.last_has_mmco_5 = false;
+                top
+            }
+            1 => {
+                let max_fn = 1i32 << (i32::from(sps.log2_max_frame_num_minus4) + 4);
+                let frame_num_offset: i32 = if is_idr {
+                    0
+                } else {
+                    if self.poc.last_has_mmco_5 {
+                        self.poc.prev_frame_num_offset = 0;
+                        self.poc.prev_frame_num = 0;
+                    }
+                    if (sh.frame_num as i64) < (self.poc.prev_frame_num as i64) {
+                        self.poc.prev_frame_num_offset + max_fn
+                    } else {
+                        self.poc.prev_frame_num_offset
+                    }
+                };
+                let cycle = sps.offsets_for_ref_frames.len();
+                let mut abs_frame_num = if cycle > 0 {
+                    frame_num_offset + sh.frame_num as i32
+                } else {
+                    0
+                };
+                if !is_ref && abs_frame_num > 0 {
+                    abs_frame_num -= 1;
+                }
+                let mut expected = 0i32;
+                if abs_frame_num > 0 {
+                    let cycle_cnt = (abs_frame_num - 1) / cycle as i32;
+                    let fin = ((abs_frame_num - 1) % cycle as i32) as usize;
+                    let delta_cycle: i32 = sps.offsets_for_ref_frames.iter().sum();
+                    expected = cycle_cnt * delta_cycle;
+                    expected += sps.offsets_for_ref_frames[..=fin].iter().sum::<i32>();
+                }
+                if !is_ref {
+                    expected += sps.offset_for_non_ref_pic;
+                }
+                let top = expected + sh.delta_poc[0];
+                self.poc.prev_frame_num = sh.frame_num;
+                self.poc.prev_frame_num_offset = frame_num_offset;
+                self.poc.last_has_mmco_5 = false;
+                top
+            }
+            _ => {
+                let max_fn = 1i32 << (i32::from(sps.log2_max_frame_num_minus4) + 4);
+                let frame_num_offset: i32 = if is_idr {
+                    0
+                } else {
+                    if self.poc.last_has_mmco_5 {
+                        self.poc.prev_frame_num = 0;
+                        self.poc.prev_frame_num_offset = 0;
+                    }
+                    if (sh.frame_num as i64) < (self.poc.prev_frame_num as i64) {
+                        self.poc.prev_frame_num_offset + max_fn
+                    } else {
+                        self.poc.prev_frame_num_offset
+                    }
+                };
+                let poc = if is_idr {
+                    0
+                } else {
+                    let abs = frame_num_offset + sh.frame_num as i32;
+                    if is_ref {
+                        2 * abs
+                    } else {
+                        2 * abs - 1
+                    }
+                };
+                self.poc.prev_frame_num = sh.frame_num;
+                self.poc.prev_frame_num_offset = frame_num_offset;
+                self.poc.last_has_mmco_5 = false;
+                poc
+            }
+        }
+    }
+
+    /// 短窗带 POC 视图（B 列表构建入参）。
+    fn short_ref_with_poc(&self) -> Vec<(Arc<Picture>, i32)> {
+        self.short_ref
+            .iter()
+            .map(|(p, _)| (p.clone(), p.poc))
+            .collect()
+    }
+
+    /// 列表重排（FFmpeg build_ref_list 语义；B 列表同样适用）。
+    fn apply_reorder(
+        &self,
+        mut list: Vec<Arc<Picture>>,
+        mods: &[(u8, u64)],
+        num_ref: usize,
+    ) -> Result<Vec<Arc<Picture>>, CodecError> {
+        let max_pic_num = 1u32 << u32::from(self.log2_max_frame_num);
+        let mut pred = self
+            .cur
+            .as_ref()
+            .map(|c| c.frame_num)
+            .unwrap_or(0);
+        for (index, &(op, val)) in mods.iter().enumerate() {
+            if index >= num_ref {
+                return Err(CodecError::InvalidData(
+                    "ref list modification count overflow".into(),
+                ));
+            }
+            let (target, is_long, pic_id): (Arc<Picture>, bool, u32) = match op {
+                0 | 1 => {
+                    let abs_diff = val + 1;
+                    if abs_diff > u64::from(max_pic_num) {
+                        return Err(CodecError::InvalidData("abs_diff_pic_num overflow".into()));
+                    }
+                    pred = if op == 0 {
+                        (u64::from(pred) + u64::from(max_pic_num) - abs_diff)
+                            % u64::from(max_pic_num)
+                    } else {
+                        (u64::from(pred) + abs_diff) % u64::from(max_pic_num)
+                    } as u32;
+                    let found = self
+                        .short_ref
+                        .iter()
+                        .rev()
+                        .find(|(_, fn_)| *fn_ == pred)
+                        .map(|(p, _)| (p.clone(), false, pred));
+                    let Some(e) = found else {
+                        return Err(CodecError::InvalidData(
+                            "reference picture missing during reorder".into(),
+                        ));
+                    };
+                    e
+                }
+                _ => {
+                    let li = val as usize;
+                    if li > 31 {
+                        return Err(CodecError::InvalidData("long_term_pic_idx overflow".into()));
+                    }
+                    let found = self
+                        .long_ref
+                        .get(li)
+                        .and_then(|p| p.as_ref())
+                        .map(|p| (p.clone(), true, li as u32));
+                    let Some(e) = found else {
+                        return Err(CodecError::InvalidData(
+                            "reference picture missing during reorder".into(),
+                        ));
+                    };
+                    e
+                }
+            };
+            let mut i = index;
+            while i + 1 < num_ref
+                && i + 1 < list.len()
+                && !(list[i].is_long_term == is_long
+                    && (if is_long {
+                        // 长项按窗口索引匹配（重建 PicNum 映射太绕，
+                        // 直接 Arc 同一性判定槽位——与 FFmpeg 线扫等价：
+                        // 找到同图即停）
+                        Arc::ptr_eq(&list[i], &target)
+                    } else {
+                        // 短项按 frame_num 匹配：从短窗反查
+                        self.short_ref
+                            .iter()
+                            .find(|(p, _)| Arc::ptr_eq(p, &list[i]))
+                            .map(|(_, fn_)| *fn_ == pic_id)
+                            .unwrap_or(false)
+                    }))
+            {
+                i += 1;
+            }
+            while i > index && i < list.len() {
+                list[i] = list[i - 1].clone();
+                i -= 1;
+            }
+            if index < list.len() {
+                list[index] = target;
+            }
+        }
+        Ok(list.into_iter().take(num_ref).collect())
     }
 
     /// 图片完成后的参考帧标记（FFmpeg ff_h264_execute_ref_pic_marking
@@ -589,6 +1005,7 @@ impl Decoder for H264Decoder {
         if let Err(e) = self.finish_current_picture() {
             self.pending_error = Some(e);
         }
+        self.flush_dpb();
         self.flushed = true;
     }
 
@@ -647,6 +1064,15 @@ fn codec_err(e: H264Error) -> CodecError {
         H264Error::InvalidArguments(m) => CodecError::InvalidData(m.to_string()),
         H264Error::Unsupported(m) => CodecError::UnsupportedStub(m),
     }
+}
+
+/// 列表 POC 快照（InterCtx::ref_poc 用；缺项 0）。
+fn list0_poc(list: &[Arc<Picture>]) -> [i32; 32] {
+    let mut a = [0i32; 32];
+    for (i, p) in list.iter().enumerate().take(32) {
+        a[i] = p.poc;
+    }
+    a
 }
 
 /// 工厂：消费 [`CodecParameters`]（extradata 可为 avcC 或 Annex B）。

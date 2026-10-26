@@ -35,6 +35,11 @@
 #![allow(clippy::module_name_repetitions)] // Sps/Pps 与模块名同段是 H.264 术语，保留
 
 mod bitreader;
+mod cabac;
+mod cabac_mb;
+mod cabac_tables;
+mod inter;
+mod intra8x8;
 mod cavlc;
 mod deblock;
 mod decoder;
