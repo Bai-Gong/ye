@@ -194,7 +194,7 @@ sha256 = "074019033e33660d106a38182c86e0b3f3b9e1c9cf37623b92189531a69a00c3"
 name = "aac-48k-st-transient"
 codec = "aac"
 container = "adts"
-generate = "ffmpeg -y -v error -f lavfi -i aevalsrc=0.5*sin(2*PI*1000*t)*abs(sin(2*PI*6*t)):s=48000:d=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_is 0 -aac_tns 0 {OUT}"
+generate = "ffmpeg -y -v error -f lavfi -i aevalsrc='0.5*sin(2*PI*1000*t)*abs(sin(2*PI*6*t))':s=48000:d=3 -ac 2 -c:a aac -b:a 128k -aac_pns 0 -aac_is 0 -aac_tns 0 {OUT}"
 ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
 sha256 = "6401788c21c613a810e695d7e9d623770d2ce5f5d182b47027c0dee6b0aaf62f"
 
