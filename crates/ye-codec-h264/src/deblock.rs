@@ -226,14 +226,15 @@ pub(crate) fn edge_qp_luma(qp_p: u8, qp_q: u8) -> i32 {
     (i32::from(qp_p) + i32::from(qp_q) + 1) >> 1
 }
 
-/// luma QP → 4:2:0 chroma QP。
-pub(crate) fn chroma_qp_of(qp: u8) -> u8 {
-    CHROMA_QP[usize::from(qp)]
+/// luma QP → 4:2:0 chroma QP（含 PPS `chroma_qp_index_offset` 平移，
+/// FFmpeg `get_chroma_qp` 逐字）。
+pub(crate) fn chroma_qp_of(qp: u8, offset: i32) -> u8 {
+    CHROMA_QP[(i32::from(qp) + offset).clamp(0, 51) as usize]
 }
 
 /// 边的 chroma QP：两宏块的 chroma QP（各自查表后）平均。
-pub(crate) fn edge_qp_chroma(qp_p: u8, qp_q: u8) -> i32 {
-    (i32::from(chroma_qp_of(qp_p)) + i32::from(chroma_qp_of(qp_q)) + 1) >> 1
+pub(crate) fn edge_qp_chroma(qp_p: u8, qp_q: u8, offset: i32) -> i32 {
+    (i32::from(chroma_qp_of(qp_p, offset)) + i32::from(chroma_qp_of(qp_q, offset)) + 1) >> 1
 }
 
 /// α：`ALPHA_TABLE[Clip3(0,51, qp + alpha_c0_offset)]`。
@@ -610,12 +611,17 @@ mod tests {
         assert_eq!(edge_qp_luma(10, 11), 11);
         assert_eq!(edge_qp_luma(0, 0), 0);
         assert_eq!(edge_qp_luma(51, 50), 51);
-        assert_eq!(chroma_qp_of(29), 29);
-        assert_eq!(chroma_qp_of(30), 29);
-        assert_eq!(chroma_qp_of(40), 36);
-        assert_eq!(chroma_qp_of(51), 39);
-        assert_eq!(edge_qp_chroma(40, 40), 36);
-        assert_eq!(edge_qp_chroma(51, 51), 39);
+        assert_eq!(chroma_qp_of(29, 0), 29);
+        assert_eq!(chroma_qp_of(30, 0), 29);
+        assert_eq!(chroma_qp_of(40, 0), 36);
+        assert_eq!(chroma_qp_of(51, 0), 39);
+        // PPS 偏移平移（x264 默认 −2）：24−2 → CHROMA_QP[22] = 22
+        assert_eq!(chroma_qp_of(24, -2), 22);
+        assert_eq!(chroma_qp_of(0, -2), 0); // Clip3(0,51)
+        assert_eq!(chroma_qp_of(51, 2), CHROMA_QP[51]);
+        assert_eq!(edge_qp_chroma(40, 40, 0), 36);
+        assert_eq!(edge_qp_chroma(51, 51, 0), 39);
+        assert_eq!(edge_qp_chroma(24, 24, -2), 22);
         assert_eq!(alpha_of(40, 0), 80);
         assert_eq!(beta_of(40, 0), 13);
         assert_eq!(alpha_of(5, -10), 0); // Clip3(0,51) → QP0 → 0

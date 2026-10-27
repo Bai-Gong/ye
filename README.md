@@ -93,7 +93,7 @@ for s in reader.streams() {
 等价，输入经 `ContainerRegistry` auto-probe）——用法与契约见
 [docs/contracts.md](docs/contracts.md)。
 
-## 当前状态（2026-10-24，M1 收口）
+## 当前状态（2026-10-27）
 
 M1 读写闭环并完成合流收口（m1-mp4 分支经 B 案裁决并入 develop）：
 
@@ -106,14 +106,34 @@ M1 读写闭环并完成合流收口（m1-mp4 分支经 B 案裁决并入 develo
   `ye::container::remux` 直通助手、`ye::stubs`（features
   `codec-stubs`/`filter-stubs`，默认关——M2+ 接口桩聚合入口）。
 - `ye-cli`：`ye probe`（流表 + 帧率 + 码率）/ `ye remux`（不转码
-  直通）/ `ye convert`（占位桩，参数形态即锻 M3 接入契约）。
+  直通）/ `ye convert`（M3 起真转码，`--size`）。
 - 接口桩：ye-codec（H.264/AAC × 解码/编码，`feed`/`pull` 即
   `UnsupportedStub`）与 ye-filter（处理图组装可用，`topological_order`
-  即 `Unsupported`）——M2+ 缺口总账见 [docs/waitlist.md](docs/waitlist.md)。
-- 测试 238 项通过（`cargo test --workspace`，默认 feature；另有 2 项
-  桩 feature 测试需 `--features codec-stubs,filter-stubs`），oracle 组
-  以 PATH 上的 ffmpeg/ffprobe 对拍（无工具即跳过），零网络、零第三方
-  依赖、临时文件全在 target/ 下。
+  即 `Unsupported`）——真实现已陆续取代（见下），M2+ 缺口总账见
+  [docs/waitlist.md](docs/waitlist.md)。
+
+M2（解码）与 M3（编码/转码）增量见 [docs/roadmap.md](docs/roadmap.md)
+修订记录。剪的抽帧/波形接线（m2-jian-plan）已交付：`waveform`
+模块（纯核 + `audio_peaks`/`audio_peaks_with_count` 消费助手）与
+`frame_grab` 门面（`decode_frame_rgba`/`grab_frame_png`）；oracle 对拍
+（duan/src-tauri/binaries 或 PATH 的 ffmpeg）：`tests/waveform_oracle.rs`
+正弦/白噪声两条向量逐桶全绿（实测最坏 |Δmax|=5.022e-6 / 8.810e-5，
+容差按实测收紧 2e-4→1.5e-4）；`tests/frame_grab_oracle.rs` 像素 + 解码
+YUV 级对拍与 vec-video-multi 不可解音轨整体 Err 行为锁定全部生效——早班
+发现的去块启用 + 30fps 长链解码分歧（90 帧 max_abs=74~76）同日修复收口
+（去块延后图级 + chroma QP 偏移 + pred_8x16 C→D 回退），像素对拍三点位
+max |Δ|=1、去块配方 90 帧逐位一致，`ip30` 回归集入库（no-deblock 条
+帧 81 起 Cr ±1 余留归档 ffmpeg 舍入边角，容差内——见 ye-codec-h264
+tests/conformance.rs `ip30` 注释）。
+
+- 测试基线（2026-10-27 收口复测）：`cargo test --workspace`（默认
+  feature）**627 项通过**（含 conformance `ip30` 集实跑）；`-p ye
+  --features mp4,aac` 46 项、`mp4,h264,png,aac` 63 项（含
+  frame_grab_oracle 像素/YUV 对拍两条——解码器修复后翻除 `#[ignore]`
+  全数过门）、`codec-stubs,filter-stubs` 41 项。oracle 组定位器落空时
+  打印原因
+  合法跳过（CI 无 ffmpeg 不红门禁）；定位器命中而生成/对拍失败即
+  失败，不许跳过。零网络、零第三方依赖、临时文件全在 target/ 下。
 
 构建与门禁：`cargo test`、`cargo clippy --all-targets -- -D warnings`、
 `cargo fmt --check`（在 `ye/` 下执行）。

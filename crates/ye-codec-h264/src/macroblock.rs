@@ -742,6 +742,8 @@ pub(crate) struct Picture {
     pub cr: Vec<u8>,
     /// 宏块光栅网格。
     pub mbs: Vec<Macroblock>,
+    /// 各片的去块参数（下标 = slice_id；解码期登记，图完成时统一滤波）。
+    pub deblock_params: Vec<crate::slice::DeblockParams>,
     // ---- B 片增补（M2）----
     /// 本图 POC（直接预测缩放与 DPB 重排）。
     pub poc: i32,
@@ -763,6 +765,7 @@ impl Picture {
             cb: vec![0; mb_width * 8 * mb_height * 8],
             cr: vec![0; mb_width * 8 * mb_height * 8],
             mbs: vec![Macroblock::default(); mb_width * mb_height],
+            deblock_params: Vec::new(),
             poc: 0,
             is_long_term: false,
             used_l0: Vec::new(),
@@ -1181,6 +1184,10 @@ pub(crate) fn pred_16x8(g: &MvGrid, by: i32, ref_idx: i8) -> [i16; 2] {
 }
 
 /// P_8x16 分区预测（FFmpeg pred_8x16_motion 逐字）。`bx` = 0 或 2。
+/// n=1 捷径的 C 候选按 spec 8.4.1.3：右上不可用时以左上 D 顶替
+/// （FFmpeg `fetch_diagonal_mv` 的 D 回退），参考帧匹配即取 mvC——
+/// 不落入中值分支。2026-10-27 对拍修复：此前缺 D 回退，右缘 MB 的
+/// n=1 分支落入中值，mvp 偏 1 qpel（§3.1 向量首差帧 36 MB(19,13)）。
 pub(crate) fn pred_8x16(g: &MvGrid, bx: i32, ref_idx: i8) -> [i16; 2] {
     if bx == 0 {
         let a = g.get(-1, 0);
@@ -1188,7 +1195,12 @@ pub(crate) fn pred_8x16(g: &MvGrid, bx: i32, ref_idx: i8) -> [i16; 2] {
             return a.mv;
         }
     } else {
-        let c = g.get(4, -1);
+        let tr = g.get(4, -1);
+        let c = if tr.ref_idx != PART_NOT_AVAILABLE {
+            tr
+        } else {
+            g.get(bx - 1, -1)
+        };
         if c.ref_idx == ref_idx {
             return c.mv;
         }

@@ -31,7 +31,16 @@
 //! 经注入的 [`codec::CodecRegistry`] 取得，泵本体不依赖具体实现
 //! crate，故无 feature 门；像素核缺省桥接 `convert::filter_ops()`）；
 //! [`stubs`] 模块是 M2+ 接口桩的聚合入口（语义边界见
-//! docs/contracts.md「M2+ 接口桩契约」）。
+//! docs/contracts.md「M2+ 接口桩契约」）；[`waveform`] 模块是波形峰值
+//! 出口（剪的波形）：纯核（packed f32 交织样本 → 每桶每声道
+//! min/max/rms）无条件编译，消费助手 [`waveform::audio_peaks`]/
+//! [`waveform::audio_peaks_with_count`]（probe 前置流布局校验 +
+//! `convert_frames` 解码接线）随既有 `mp4`+`aac` feature 组合开启，
+//! 不新增 feature 名；[`frame_grab`] 模块是抽帧门面（剪的缩略图）：
+//! [`frame_grab::decode_frame_rgba`]（`convert_frames` 泵、链
+//! yuv420p→rgba8、取首个 pts ≥ 时点的视频帧即置 cancel）与
+//! [`frame_grab::grab_frame_png`]（组合 [`png::encode_rgba`]）随既有
+//! `mp4`+`h264`+`png` feature 组合开启，不新增 feature 名。
 
 #[cfg(feature = "aac")]
 pub mod codec_aac;
@@ -42,11 +51,16 @@ pub mod codec_h264;
 pub mod container;
 pub mod convert;
 
+#[cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
+pub mod frame_grab;
+
 #[cfg(feature = "png")]
 pub mod png;
 
 #[cfg(any(feature = "codec-stubs", feature = "filter-stubs"))]
 pub mod stubs;
+
+pub mod waveform;
 
 pub use ye_codec as codec;
 pub use ye_device as device;

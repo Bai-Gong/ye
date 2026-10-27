@@ -13,10 +13,12 @@
 //! 默认序（短窗最新在前 + 长窗按索引）与 ref_pic_list_modification
 //! 重排（FFmpeg h264_refs.c 逐字语义）。
 //!
-//! 形态收紧（如实报错，绝不静默错帧）：CABAC、场图/MBAFF、
-//! 4:2:2/4:4:4、高位深、Baseline/Main/Extended 之外 profile、
-//! 去块未禁用、B/SP/SI 片、加权预测、数据分区、frame_num 断号
+//! 形态收紧（如实报错，绝不静默错帧）：场图/MBAFF、4:2:2/4:4:4、
+//! 高位深、Baseline/Main/Extended/High 系之外 profile、CAVLC 的
+//! B 片、SP/SI 片、加权预测、数据分区、frame_num 断号
 //! （错误处理属 ②c）→ `Unsupported`；
+//! 去块滤波全支持（idc 0/1/2：图级统一滤波——帧内预测读滤波前
+//! 样本，图完成后按光栅序滤波，与 FFmpeg 行滞后调度逐位等价）；
 //! 位流畸形 → `InvalidData`。
 
 use std::collections::VecDeque;
@@ -34,7 +36,7 @@ use crate::nal::{self, NalHeader};
 use crate::slice::{self, SliceHeader, SliceType};
 use crate::sps::{Pps, Sps};
 
-/// H.264 解码器（②a：CAVLC、8bit 4:2:0、I 片、去块禁用）。
+/// H.264 解码器（CAVLC/CABAC、8bit 4:2:0、I/P/B 片、图级去块滤波）。
 pub struct H264Decoder {
     sps_list: Vec<Option<Sps>>,
     pps_list: Vec<Option<Pps>>,
@@ -486,6 +488,11 @@ impl H264Decoder {
         let to_long = (ctx.idr && ctx.long_term_reference_flag)
             || ctx.mmco.iter().any(|&(op, _, _)| op == 3 || op == 6);
         if let Some(pic_mut) = Arc::get_mut(&mut ctx.pic) {
+            // 图级去块（2026-10-27 对拍修复）：解码期不滤波（帧内预测读
+            // 滤波前样本），图完成后、入 DPB/参考窗前统一按光栅序滤波
+            // ——参考帧与输出帧均取滤波后结果（与 FFmpeg 行滞后调度
+            // 逐位等价）。
+            slice::deblock_picture(pic_mut);
             pic_mut.is_long_term = to_long;
             pic_mut.used_l0 = ctx.used_l0.iter().map(|p| Some(p.clone())).collect();
             pic_mut.used_l1 = ctx.used_l1.iter().map(|p| Some(p.clone())).collect();

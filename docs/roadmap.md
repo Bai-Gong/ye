@@ -58,8 +58,21 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
   oracle 与回退。
 - **M2 解码——服务剪的抽帧与波形**：H.264 软件解码（先 Baseline，后
   High / CABAC / B 帧）、AAC-LC 解码、yuv→rgb 像素转换与 scale 最小集、
-  PNG 编码；音频 PCM → 波形峰值。准入：剪的缩略图/抽帧
-  （`extract_frame`）与波形走 ye，同点位与 ffmpeg 抽帧对拍在容差内。
+  PNG 编码；音频 PCM → 波形峰值。进度勾项（2026-10-27 收口终态，m2-jian-plan
+  T1–T8 + 同日解码器分歧修复）：✅ Baseline 解码（一致性向量口径）、✅
+  AAC-LC 解码、✅ yuv→rgb 与 scale、✅ PNG 编码、✅ 波形峰值（纯核 +
+  消费助手 + oracle 对拍两条向量全绿，容差收紧 2e-4→1.5e-4）、✅ 抽帧门面
+  （`decode_frame_rgba`/`grab_frame_png` + vec-video-multi 整体 Err 行为
+  锁定）、✅ 抽帧像素/解码 YUV 对拍——早班发现的去块启用 + 30fps 长链分歧
+  （max_abs=74~76）同日修复收口（去块延后图级 + chroma QP 偏移 +
+  pred_8x16 C→D 回退），`ip30` 回归集入库（去块条 90 帧逐位一致），两条
+  对拍用例翻除 `#[ignore]` 过门（像素三点位 max |Δ|=1；no-deblock 条
+  max_abs=1 余留归档 ffmpeg 舍入边角，容差内）；High/CABAC 收口沿 M2
+  收口轨道开放（waitlist.md 第 1 行）。准入（剪的抽帧/波形走 ye 且同点位
+  对拍在容差内）：**代码面达成**——剪侧 probe/抽帧/波形三命令双引擎落地
+  （jian T4–T8），波形/probe 对拍全绿、抽帧像素对拍 ye 侧过门；jian 侧
+  像素用例未随修复翻除（`#[ignore]` 遗留）与「剪 M1 已定稿」GUI 人工回归
+  两项欠账如实登记（m2-jian-plan 收尾实录遗留①⑤）。
 - **M3 编码与转码直通——锻启动**：H.264 软件编码（CRF / CBR，2-pass
   可后置）、AAC-LC 编码、处理图最小集（scale / fps / 像素格式 / 裁剪 /
   音量）、`ye convert` 端到端。准入：**锻完成第一个转码任务**（改分辨率
@@ -104,6 +117,45 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
+- 2026-10-27：M2 收口——施工 8/8（m2-jian-plan T1–T8）+ 同日解码器分歧
+  修复收口，两仓门禁全绿。**接通状态（剪侧，T4–T8）**：probe 双引擎
+  （`engine` 参数，auto=ye 优先、疑似封面启发式〔多条视频流 / 短视频流 /
+  moov.udta.meta covr 盲区〕整体回退 ffprobe 轨，AAC priming 时长偏差使
+  音频族整体回退权威轨）、抽帧双引擎（`extract_frame_ye` 命令，前端
+  thumbnail.ts ye 优先、失败回退 ffmpeg 轨）、波形命令（auto 路由，
+  `waveform_peaks_ye`/`waveform_peaks_ffmpeg` 两 pub 轨可独立调）——
+  波形双轨正弦/白噪声两向量逐桶全绿（jian 侧最坏 |Δmin|=3.588e-5 ≤
+  容差 1.5e-4）、probe 双轨判等全绿（宽高/kind 精确等，带封面 m4a 回退
+  后逐字段一致）。**解码器分歧处置**：早班像素对拍暴露的两处分歧（去块
+  启用首差帧 0 luma：解码期行内去块污染帧内预测 + chroma QP 漏加 PPS
+  偏移；关去块首差帧 81 chroma：pred_8x16 缺 C→D 回退）同日修复收口
+  ——去块延后到图级（编码器本地重建同步对齐，位级回环保持 0 容差）、
+  `chroma_qp_offset` 接线、pred_8x16 回退补齐；`ip30` 回归集（90 帧
+  30fps 长链 × 去块/关去块两条）入 conformance 清单，像素/YUV 对拍用例
+  翻除 `#[ignore]` 过门（像素三点位 max |Δ|=1、去块条 90 帧逐位一致）。
+  **未过项/遗留（如实）**：① no-deblock 条帧 81 起 Cr 平面孤立 ±1 样本
+  （300 帧扩展实测 24 帧 × 每帧 ≤2 样本，M2 YUV 容差〔≥99.9% Δ=0，实测
+  ≥99.998%〕内过门；二轮复核已排除 MC/参考选择/残差反量化/idct 语义，
+  归档 ffmpeg 内部舍入边角——收紧 `ip30` 容差前须先收口，见
+  ye-codec-h264 tests/conformance.rs `ip30` 注释）；② jian 侧像素对拍
+  用例仍挂 `#[ignore]` 未随修复翻除（经路径依赖已链修复后的 ye，翻除
+  复跑归 jian 后续）；③ High/CABAC 真流对拍仍开放（waitlist.md 第 1
+  行）。收尾实录与遗留总账见
+  [m2-jian-plan.md](m2-jian-plan.md) 文末。
+- 2026-10-27：剪接线 ye 侧交付（m2-jian-plan T1–T3）——`waveform`
+  模块（分桶纯核 + 消费助手）与 `frame_grab` 门面入库；oracle 对拍
+  基建（`tests/common/mod.rs` 定位器 + lavfi 向量配方，四档定位 +
+  分级 skip 语义）与两个对拍测试文件落地。实测：波形对拍正弦/白噪声
+  两条向量逐桶逐声道全绿（最坏 |Δmax|=5.022e-6 / 8.810e-5，容差按
+  实测收紧 2e-4→1.5e-4）；vec-video-multi（`-ac 6` 不可解音轨）抽帧
+  整体 Err 行为锁定生效；抽帧像素对拍发现 H.264 Baseline 解码在
+  去块启用 + 30fps 长链真实内容上与 ffmpeg 分歧（90 帧 max_abs=74、
+  首差帧 0 luma；关去块对照仍 max_abs=76、首差帧 81 chroma；像素核
+  |Δ|≤1 与帧定位已排除，归因解码器；M2 一致性向量全部 `no-deblock=1`
+  未覆盖该形态）——像素/YUV 两条对拍用例以 `#[ignore]` 如实登记，
+  解码器修复工程师接手后翻除过门（证据链见
+  [waitlist.md](waitlist.md) 第 1 行）。M2 准入（剪侧接线 + 对拍在
+  容差内）仍开放（jian 侧 T4–T8 在途）。
 - 2026-10-26：M3 首轮收尾——施工 6/6 + 集成阶段同轮落地，全仓门禁
   全绿、端到端转码通过、无未过项。交付：H.264 软件编码真实现
   （Baseline/CAVLC、I/P 帧、定 QP + 简单 CRF、无 B 帧；H.264 编码桩

@@ -157,6 +157,39 @@ generate = "ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=15 -t 3 -
 ffmpeg_version = "ffmpeg version N-123627-g5dfe661f03-20260327 Copyright (c) 2000-2026 the FFmpeg developers"
 sha256 = "38e153cb20ab134085fc2bc1315714b94667420cd2b22201680759d0370cf1c1"
 
+# —— 解码器分歧修复回归集（set=ip30，2026-10-27 施工登记）——
+# 理由：既有 intra/ip 集全部 no-deblock=1、15fps 45 帧（GOP 15），从未
+# 覆盖「去块启用」与「30fps 90 帧单 GOP 长链（ref=3、frame_num 5 次
+# 回绕）」形态——2026-10-27 在 §3.1 冻结配方（m2-jian-plan：testsrc2
+# 320x240@30 baseline 3s）上实测暴露两处独立分歧（去块启用首差帧 0
+# luma：解码期行内去块使帧内预测读到滤波后样本 + chroma QP 漏加
+# PPS 偏移；关去块首差帧 81 chroma：pred_8x16 n=1 捷径缺 C→D 回退），
+# 修复后 deblock 条 90 帧逐位一致（max_abs=0）、nodeblock 条 max_abs=1
+# （帧 81 起 Cr 平面孤立 ±1 样本，300 帧扩展实测 24 帧 × 每帧 ≤2 样本，
+# 施工图②容差内；二轮复核已排除 MC/参考选择/反量化/idct 语义，归档
+# 为 ffmpeg 内部舍入边角——详见 conformance.rs ip30 注释）。两条配方即
+# §3.1 冻结配方与其关去块变体（duan binaries ffmpeg N-127696 生成，
+# sha256 实测）。修复前复测记录：deblock 条 max_abs=74（首差帧 0
+# luma）、nodeblock 条 max_abs=76（首差帧 81 chroma）。
+
+[[vector]]
+name = "h264-ip30-testsrc2-320x240-deblock"
+codec = "h264"
+container = "mp4"
+set = "ip30"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=duration=3:size=320x240:rate=30 -c:v libx264 -profile:v baseline -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-127696-g8b3525e718-20261019 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "45f0664d99ce3f59150a35ad2fc7cdf9dae50f24448c0164a35de45fe24fc8c3"
+
+[[vector]]
+name = "h264-ip30-testsrc2-320x240-nodeblock"
+codec = "h264"
+container = "mp4"
+set = "ip30"
+generate = "ffmpeg -y -v error -f lavfi -i testsrc2=duration=3:size=320x240:rate=30 -c:v libx264 -profile:v baseline -x264-params no-deblock=1 -pix_fmt yuv420p -movflags +faststart {OUT}"
+ffmpeg_version = "ffmpeg version N-127696-g8b3525e718-20261019 Copyright (c) 2000-2026 the FFmpeg developers"
+sha256 = "629b13536d8fa566d580bffd816eb4f38320ff8212a7fd6b0957ebc2d42093b7"
+
 # —— 施工图③ AAC-LC（M2）：三入口 × 工具组合的六条向量 ——
 # 全部由本机 ffmpeg（版本见各条）确定性 lavfi 源生成；对拍口径 =
 # `ffmpeg -f s16le`（mp4 条带 `-ignore_editlist 1`，对齐我方裸码流

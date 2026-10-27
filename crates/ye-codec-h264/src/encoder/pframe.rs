@@ -33,9 +33,9 @@
 //! `add_block` 叠加 → 记录 mv/ref/nnz（下一宏块的预测子与 nC 来源）→
 //! 语法写出（`decode_inter_mb` 解析序镜像：mb_skip_run 由行进中的
 //! `pending_skip` 计数在非 skip 宏块前 flush，帧尾余量补一发）。
-//! 每行完成即 [`deblock_row`]（滞后调度与解码器同构）。参考帧 = 上一帧
-//! 的**完整去块重建**（宏块对齐 `Picture`，与解码器 DPB 里的参考同
-//! 形态）。
+//! 全图完成后统一 [`deblock_row`] 整帧（2026-10-27 与解码器图级滤波
+//! 对齐）。参考帧 = 上一帧的**完整去块重建**（宏块对齐 `Picture`，
+//! 与解码器 DPB 里的参考同形态）。
 
 use std::sync::Arc;
 
@@ -535,7 +535,10 @@ pub(crate) fn encode_p_frame(
                 )?;
             }
         }
-        // 整行完成 → 滤该行（decode_slice 滞后调度同构）
+    }
+    // 全图编码完成后统一去块（2026-10-27 与解码器对齐：帧内预测读
+    // 滤波前样本；参考帧用滤波后的完成帧，二者不冲突）
+    for mby in 0..mb_h {
         deblock_row(&mut pic, mby, 0, mb_w);
     }
     // 帧尾余量 skip run（其后无非 skip 宏块——读侧 run 耗尽即片结束）

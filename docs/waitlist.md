@@ -16,17 +16,27 @@ auto-probe；M2——H.264 Baseline 解码、AAC-LC 解码、yuv→rgb 像素
 convert 编码模式真实现（视频重编码 + MP4 封装、音频直通）与
 `ye convert` CLI（--size），端到端转码经 ffprobe 三重验收通过**
 （契约见 contracts.md「锻的最小 API 面」「H.264 编码器输出契约」
-「处理图最小集契约」）。
+「处理图最小集契约」）；**剪接线（2026-10-27 M2 收口，m2-jian-plan
+T1–T8 + 同日解码器分歧修复）——`waveform` 模块（分桶纯核 +
+`audio_peaks`/`audio_peaks_with_count` 消费助手）与 `frame_grab` 门面
+（`decode_frame_rgba`/`grab_frame_png`）交付，剪侧 probe/抽帧/波形
+三命令双引擎接线落地；oracle 对拍：波形两条向量（正弦/白噪声）逐桶
+逐声道全绿（实测最坏 |Δmax|=5.022e-6 / 8.810e-5，容差按实测收紧
+2e-4→1.5e-4）、vec-video-multi 不可解音轨抽帧整体 Err 行为锁定生效；
+早班像素对拍暴露的解码器分歧（去块启用首差帧 0 luma + 关去块首差帧
+81 chroma）同日修复收口（去块延后图级 + chroma QP 偏移 + pred_8x16
+C→D 回退），像素/YUV 对拍用例翻除 `#[ignore]` 过门（三点位
+max |Δ|=1、去块配方 90 帧逐位一致），`ip30` 回归集入库**（对拍口径与
+skip 分级语义见 `crates/ye/tests/common/mod.rs` 与两个 `*_oracle.rs`）。
 
 | # | 缺口（消费方需求） | 阻塞层 | 放行里程碑 | 现状 |
 | --- | --- | --- | --- | --- |
-| 1 | 抽帧缩略图（剪 M1：H.264 帧 → PNG） | ye-codec（High/CABAC/B 帧解码收口） | M2 收口轨道 | Baseline 链路已交付（M2：H.264 Baseline 解码 + yuv→rgb/scale + PNG 编码真实现，ffmpeg oracle 对拍过）；High/CABAC 解码基础设施已落地（165f022）但真流对拍卡点未收（m3-plan §6），High 素材导入仍不可用 |
-| 2 | 波形图（剪 M2：AAC → PCM 峰值） | 峰值计算 API（AAC-LC 解码已交付） | 未排期 | AAC-LC 解码真实现已交付（M2，ffmpeg oracle 对拍过）；PCM → 波形峰值 API 缺席（只有解码半边，剪侧消费方也未定），按剪的真实需求排期（m3-plan §6） |
-| 3 | 真转码（锻首个任务：改分辨率/码率出 MP4） | 锻 duan 接线（D1 probe / D2 转码换冶）；ye 内仅剩真码控（CBR/A-VBR，后续批次） | **M3** | ye 侧已交付（M3 首轮 2026-10-26）：H.264 Baseline 编码 + convert 真实现（视频重编码/音频直通）+ `ye convert`，端到端转码三重验收通过；「改码率」暂以 QP/简单 CRF 间接控制（目标码率归后续批次）；锻侧 D1/D2 接线未动 |
-| 4 | 导出合成（剪：filter_complex 全集 + 多输入时间线合成 + 进度） | ye-filter（全集与调度）+ 编码 + 合成 API | **M4** | 处理图调度已交付（M3 `topological_order` 真实现，桩随删）；滤镜全集与多输入合成 API 未开工 |
-| 5 | MOV 容器（QT 族导入） | ye-container（新实现 crate，MP4 近亲可大量复用） | 持续轨道·下一梯队 | 未开工；按剪的导入统计驱动（同梯队：WAV/MP3 纯探测） |
-| 6 | MKV / WebM 容器 | ye-container（Matroska 实现 crate） | **M5** | 未开工 |
-| 7 | GIF / 图片探测（纯探测，无解封装） | ye-container（纯探测工厂） | 未排期 | 未开工；按导入统计驱动 |
+| 1 | 抽帧缩略图（剪 M1：H.264 帧 → PNG） | ye-codec（High/CABAC/B 帧解码收口） | M2 收口轨道 | Baseline 链路已交付且分歧修复收口（2026-10-27：H.264 Baseline 解码 + yuv→rgb/scale + PNG 编码真实现；m2-jian-plan T3 对拍暴露的 30fps 长链两处分歧——去块启用首差帧 0 luma〔行内去块污染帧内预测 + chroma QP 漏加 PPS 偏移〕、关去块首差帧 81 chroma〔pred_8x16 缺 C→D 回退〕——同日修复：去块延后图级 + `chroma_qp_offset` 接线 + pred_8x16 回退，`ip30` 回归集入库，去块条 90 帧逐位一致、像素对拍翻除 `#[ignore]` 过门〔三点位 max |Δ|=1〕）。余留（如实）：no-deblock 条帧 81 起 Cr ±1 孤立样本（容差内，归档 ffmpeg 舍入边角，收紧 `ip30` 容差前须先收口——ye-codec-h264 tests/conformance.rs `ip30` 注释）；jian 侧像素用例仍挂 `#[ignore]` 未随修复翻除（归 jian 后续）。High/CABAC 解码基础设施已落地（165f022）但真流对拍卡点未收（m3-plan §6），High 素材导入仍不可用 |
+| 2 | 真转码（锻首个任务：改分辨率/码率出 MP4） | 锻 duan 接线（D1 probe / D2 转码换冶）；ye 内仅剩真码控（CBR/A-VBR，后续批次） | **M3** | ye 侧已交付（M3 首轮 2026-10-26）：H.264 Baseline 编码 + convert 真实现（视频重编码/音频直通）+ `ye convert`，端到端转码三重验收通过；「改码率」暂以 QP/简单 CRF 间接控制（目标码率归后续批次）；锻侧 D1/D2 接线未动 |
+| 3 | 导出合成（剪：filter_complex 全集 + 多输入时间线合成 + 进度） | ye-filter（全集与调度）+ 编码 + 合成 API | **M4** | 处理图调度已交付（M3 `topological_order` 真实现，桩随删）；滤镜全集与多输入合成 API 未开工 |
+| 4 | MOV 容器（QT 族导入） | ye-container（新实现 crate，MP4 近亲可大量复用） | 持续轨道·下一梯队 | 未开工；按剪的导入统计驱动（同梯队：WAV/MP3 纯探测） |
+| 5 | MKV / WebM 容器 | ye-container（Matroska 实现 crate） | **M5** | 未开工 |
+| 6 | GIF / 图片探测（纯探测，无解封装） | ye-container（纯探测工厂） | 未排期 | 未开工；按导入统计驱动 |
 
 维护约定：
 

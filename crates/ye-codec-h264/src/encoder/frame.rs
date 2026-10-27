@@ -3,24 +3,23 @@
 //! `pframe.rs`）复用本模块的 intra 宏块管线（[`encode_intra_mb`] 带
 //! [`SliceKind`] 参数——P 片的 intra 回退 mb_type 一律 +5）、参数集
 //! 写侧（[`write_sps_nal`]/[`write_pps_nal`]）、源面补齐/裁剪
-//! （[`pad_plane`]/[`crop_plane`]）与行粒度去块（[`deblock_row`]）。
+//! （[`pad_plane`]/[`crop_plane`]）与图级去块（[`deblock_row`]）。
 //!
-//! ## 全链结构（宏块行粒度交错去块，与解码器 `decode_slice` 同构）
+//! ## 全链结构（宏块光栅序编码，全图完成后统一去块）
 //!
 //! ```text
 //! for mby:  for mbx:  模式决策 → 预测/残差/变换/量化（level）→
 //!                     本地重建（复用解码侧同一批函数）→
 //!                     语法写出（与 decode_macroblock 解析序互逆）
-//!           去块滤波本行（复用 deblock.rs 滤波核；I 帧边界同样滤）
+//! 全图完成后：去块滤波整帧（复用 deblock.rs 滤波核；I 帧边界同样滤）
 //! ```
 //!
-//! 行粒度去块是位级回环的硬要求：解码器每解完一行宏块即滤该行
-//! （`slice.rs` `decode_slice` 的滞后调度），下一行的帧内预测因此读到
-//! 滤波后的上一行——编码器本地重建必须以同一调度落平面，否则两侧
+//! 图级去块是位级回环的硬要求（2026-10-27 与解码器对齐）：解码侧
+//! 帧内预测读**滤波前**样本、图完成后按光栅序统一滤波（`slice.rs`
+//! `deblock_picture`），编码器本地重建必须以同一调度落平面，否则两侧
 //! 预测边沿必然漂移。边组织循环（[`deblock_row`]/[`deblock_mb`]）镜像
-//! `slice.rs` 的私有实现（该函数不在本任务文件域；滤波核、bS 判定与
-//! α/β/tc 阈值函数全部复用 `deblock.rs` 公有面），一致性由黑盒回环
-//! 测试的 0 容差兜底。
+//! `slice.rs` 的实现（滤波核、bS 判定与 α/β/tc 阈值函数全部复用
+//! `deblock.rs` 公有面），一致性由黑盒回环测试的 0 容差兜底。
 //!
 //! ## 参数集写侧（T5 定形：level 可配、QP 走片头）
 //!
@@ -321,8 +320,11 @@ pub(crate) fn encode_idr_frame(
                 SliceKind::I,
             )?;
         }
-        // 整行编码完成 → 滤该行（decode_slice 滞后调度同构；I 帧边界
-        // 同样滤波）
+    }
+    // 全图编码完成后统一去块（2026-10-27 与解码器对齐：帧内预测读
+    // 滤波前样本，图完成再按光栅序滤波——解码器 decode_slice 同日
+    // 改为同语义，回环才逐位一致）
+    for mby in 0..mb_h {
         deblock_row(&mut pic, mby, 0, mb_w);
     }
     writer.rbsp_trailing_bits();
@@ -1115,9 +1117,9 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize) {
             continue;
         }
         let qp = if e == 0 {
-            deblock::edge_qp_chroma(pic.mbs[mb_xy - 1].qp, cur_qp)
+            deblock::edge_qp_chroma(pic.mbs[mb_xy - 1].qp, cur_qp, dp.chroma_qp_offset)
         } else {
-            i32::from(deblock::chroma_qp_of(cur_qp))
+            i32::from(deblock::chroma_qp_of(cur_qp, dp.chroma_qp_offset))
         };
         let alpha = deblock::alpha_of(qp, dp.alpha_offset);
         let beta = deblock::beta_of(qp, dp.beta_offset);
@@ -1156,9 +1158,9 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize) {
             continue;
         }
         let qp = if e == 0 {
-            deblock::edge_qp_chroma(pic.mbs[mb_xy - w].qp, cur_qp)
+            deblock::edge_qp_chroma(pic.mbs[mb_xy - w].qp, cur_qp, dp.chroma_qp_offset)
         } else {
-            i32::from(deblock::chroma_qp_of(cur_qp))
+            i32::from(deblock::chroma_qp_of(cur_qp, dp.chroma_qp_offset))
         };
         let alpha = deblock::alpha_of(qp, dp.alpha_offset);
         let beta = deblock::beta_of(qp, dp.beta_offset);

@@ -1,15 +1,16 @@
-//! 片层：I 帧片头解析 + 片数据（宏块循环）。
+//! 片层：片头解析 + 片数据（宏块循环）+ 去块主链（图级调度）。
 //!
 //! 片头字段顺序与取值约束逐字对齐 FFmpeg `h264_slice_header_parse`
 //! （first_mb_in_slice → slice_type → pps_id → frame_num → [idr_pic_id]
 //! → [poc] → [redundant_pic_cnt] → dec_ref_pic_marking → slice_qp_delta
-//! → [去块参数]）；片循环对齐 `decode_slice` 的 CAVLC 分支：
+//! → [去块参数]）；片循环对齐 `decode_slice` 的 CAVLC/CABAC 分支：
 //! RBSP 尾随位剥离（`get_bit_length` 语义）后，按"宏块数到界或数据位
 //! 耗尽"终止，越界进入下一片 → Err。
 //!
-//! ②a 形态收紧：仅 I 片（CAVLC）；`disable_deblocking_filter_idc` 必须
-//! 为 2（禁用，②b 落地去块前如实拒绝 0/1）；场图/冗余片/数据分区
-//! 一律 Unsupported 或 Err，绝不输出错帧。
+//! 形态收紧：SP/SI 片、场图、冗余片、数据分区一律 Unsupported 或
+//! Err，绝不输出错帧。去块延后到图级（[`deblock_picture`]）：解码期
+//! 帧内预测读滤波前样本，图完成后统一滤波（2026-10-27 对拍修复，
+//! 见 decode_slice 注释）。
 
 use crate::bitreader::BitReader;
 use crate::deblock;
@@ -97,6 +98,11 @@ pub(crate) struct DeblockParams {
     pub alpha_offset: i32,
     /// slice_beta_offset（除 2 值 ×2）。
     pub beta_offset: i32,
+    /// PPS chroma_qp_index_offset（chroma 边 QP 推导需先平移——
+    /// FFmpeg `get_chroma_qp` 逐字；2026-10-27 对拍修复：此前去块
+    /// chroma QP 漏加该偏移，PPS 带非零偏移的流（如 x264 默认 −2）
+    /// chroma 阈值整档偏移）。
+    pub chroma_qp_offset: i32,
 }
 
 impl Default for DeblockParams {
@@ -107,6 +113,7 @@ impl Default for DeblockParams {
             filter_across_slices: true,
             alpha_offset: 0,
             beta_offset: 0,
+            chroma_qp_offset: 0,
         }
     }
 }
@@ -381,6 +388,7 @@ pub(crate) fn parse_slice_header(
         deblock.enabled = idc != 1;
         deblock.filter_across_slices = idc != 2;
     }
+    deblock.chroma_qp_offset = pps.chroma_qp_index_offset;
 
     Ok(SliceHeader {
         first_mb_in_slice: first_mb_in_slice as usize,
@@ -429,12 +437,13 @@ pub(crate) fn decode_slice(
     }
     let mut qp = header.slice_qp;
     let mut mb_idx = header.first_mb_in_slice;
-    // 去块滞后调度（FFmpeg loop_filter 调用点同构）：每解码完一整行
-    // 宏块即滤波该行 [lf_x_start, 行尾)；下一行的 intra 预测 / MC
-    // 因此读到滤波后的上一行（逐位对拍锁定语义）。片尾再把半行余段
-    // 滤掉（多片图中余段归本片，FFmpeg lf_x_start 同构）。
-    let w = pic.mb_width;
-    let mut lf_x_start = header.first_mb_in_slice % w;
+    // 去块延后调度（2026-10-27 对拍修复）：解码期一律不滤波——帧内
+    // 预测读**滤波前**样本（spec 8.4.4：JM 全图解码后才去块；FFmpeg
+    // 的行滞后调度经对拍锁定与「图完成时统一滤波」逐位等价，其依据
+    // 是 y+1 行顶边 bS 依赖 y+1 行块数据、任何实现都无法提前滤）。
+    // 本片参数登记到 pic.deblock_params，由 deblock_picture 在图完成
+    // 时按光栅序统一执行。
+    register_deblock_params(pic, slice_id, &header.deblock);
     // P 片 mb_skip_run（FFmpeg decode_mb_cavlc 语义：−1 = 待读；
     // 读到的 run 覆盖随后若干 P_Skip 宏块，耗尽后下一个非 skip 宏块
     // 解析前重读）
@@ -467,12 +476,6 @@ pub(crate) fn decode_slice(
                 decode_skip_mb(pic, mbx, mby, p, slice_id, qp)
                     .map_err(|e| H264Error::InvalidData(format!("skip mb ({mbx},{mby}): {e}")))?;
                 mb_idx += 1;
-                if mb_idx.is_multiple_of(w) {
-                    if header.deblock.enabled {
-                        deblock_row(pic, (mb_idx - 1) / w, lf_x_start, w, &header.deblock);
-                    }
-                    lf_x_start = 0;
-                }
                 continue;
             }
             skip_run -= 1; // 0 → −1：本 MB 非 skip，之后重读 run
@@ -480,21 +483,11 @@ pub(crate) fn decode_slice(
         decode_macroblock(r, pic, mbx, mby, pps, slice_id, &mut qp, pctx)
             .map_err(|e| H264Error::InvalidData(format!("mb ({mbx},{mby}): {e}")))?;
         mb_idx += 1;
-        if mb_idx.is_multiple_of(w) {
-            if header.deblock.enabled {
-                deblock_row(pic, (mb_idx - 1) / w, lf_x_start, w, &header.deblock);
-            }
-            lf_x_start = 0;
-        }
     }
     if mb_idx > slice_end_mb {
         return Err(H264Error::InvalidData(
             "slice overlaps with next slice boundary".into(),
         ));
-    }
-    // 片尾余段（未满一行）：滤 [lf_x_start, mb_idx)（行对齐时 no-op）
-    if header.deblock.enabled && mb_idx % w > lf_x_start {
-        deblock_row(pic, mb_idx / w, lf_x_start, mb_idx % w, &header.deblock);
     }
     Ok(mb_idx)
 }
@@ -504,7 +497,7 @@ pub(crate) fn decode_slice(
 // ---------------------------------------------------------------------------
 
 /// CABAC 片循环：逐 MB 解码，`end_of_slice_flag`（terminate bin）收尾；
-/// 去块滞后调度与 CAVLC 路径同构（整行滤波）。
+/// 去块延后调度与 CAVLC 路径同构（图完成时统一滤波，见 decode_slice）。
 #[allow(clippy::too_many_arguments)]
 fn decode_slice_cabac(
     r: &mut BitReader<'_>,
@@ -529,8 +522,7 @@ fn decode_slice_cabac(
     let mut qp = header.slice_qp;
     let mut last_qscale_diff = 0i32;
     let mut mb_idx = header.first_mb_in_slice;
-    let w = pic.mb_width;
-    let mut lf_x_start = header.first_mb_in_slice % w;
+    register_deblock_params(pic, slice_id, &header.deblock);
     loop {
         if mb_idx >= slice_end_mb {
             return Err(H264Error::InvalidData(
@@ -558,27 +550,14 @@ fn decode_slice_cabac(
         )
         .map_err(|e| H264Error::InvalidData(format!("cabac mb ({mbx},{mby}): {e}")))?;
         mb_idx += 1;
-        if mb_idx.is_multiple_of(w) {
-            if header.deblock.enabled {
-                deblock_row(pic, (mb_idx - 1) / w, lf_x_start, w, &header.deblock);
-            }
-            lf_x_start = 0;
-        }
         if reader.cabac.terminate() {
             break; // end_of_slice_flag = 1
-        }
-        if std::env::var_os("YE_DBG_FORCE_END").is_some() && mb_idx + 1 >= slice_end_mb {
-            eprintln!("DBG force end at mb {mb_idx} (terminate=false)");
-            break;
         }
     }
     if mb_idx > slice_end_mb {
         return Err(H264Error::InvalidData(
             "slice overlaps with next slice boundary".into(),
         ));
-    }
-    if header.deblock.enabled && mb_idx % w > lf_x_start {
-        deblock_row(pic, mb_idx / w, lf_x_start, mb_idx % w, &header.deblock);
     }
     Ok(mb_idx)
 }
@@ -592,10 +571,40 @@ fn decode_slice_cabac(
 // （deblock::boundary_strength_gated）。
 // ---------------------------------------------------------------------------
 
-/// 滤一行宏块 [x0, x1) 的全部去块边（含它们与上一行/左邻 MB 的边界）。
-fn deblock_row(pic: &mut Picture, y: usize, x0: usize, x1: usize, dp: &DeblockParams) {
-    for x in x0..x1 {
-        deblock_mb(pic, x, y, dp);
+/// 登记本片的去块参数（`pic.deblock_params[slice_id]`；解码期调用，
+/// 滤波延后到 [`deblock_picture`]）。
+fn register_deblock_params(pic: &mut Picture, slice_id: u16, dp: &DeblockParams) {
+    let id = usize::from(slice_id);
+    if pic.deblock_params.len() <= id {
+        pic.deblock_params.resize(id + 1, DeblockParams::default());
+    }
+    pic.deblock_params[id] = dp.clone();
+}
+
+/// 图级去块入口：图解码完成后按光栅序统一滤波（decoder.rs
+/// `finish_current_picture` 在图入 DPB/参考窗前调用）。
+///
+/// 顺序语义（与 FFmpeg 行滞后调度逐位等价，见 decode_slice 注）：
+/// 逐 MB 光栅序，先垂直边后水平边；MB (x,y) 的左/顶边读到的邻块
+/// （(x−1,y)/(x,y−1)）已完成滤波。每 MB 取其所属片的参数（多片图
+/// 中片级 idc/offset 差异按 MB 归属生效；跨片边经
+/// [`deblock::boundary_strength_gated`] 门控）。
+pub(crate) fn deblock_picture(pic: &mut Picture) {
+    for mby in 0..pic.mb_height {
+        for mbx in 0..pic.mb_width {
+            let mb_xy = mby * pic.mb_width + mbx;
+            let Some(dp) = pic
+                .deblock_params
+                .get(usize::from(pic.mbs[mb_xy].slice_id))
+                .cloned()
+            else {
+                continue;
+            };
+            if !dp.enabled || !pic.mbs[mb_xy].decoded {
+                continue;
+            }
+            deblock_mb(pic, mbx, mby, &dp);
+        }
     }
 }
 
@@ -608,9 +617,6 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize, dp: &DeblockParams) {
     // constrained_intra_pred 无关）
     let left_ok = mbx > 0 && pic.mbs[mb_xy - 1].decoded;
     let top_ok = mby > 0 && pic.mbs[mb_xy - w].decoded;
-    if !pic.mbs[mb_xy].decoded {
-        return;
-    }
 
     let ls = pic.luma_stride();
     let cs = pic.chroma_stride();
@@ -731,9 +737,9 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize, dp: &DeblockParams) {
         }
         let qp = if e == 0 {
             let l = pic.mbs[mb_xy - 1].qp;
-            deblock::edge_qp_chroma(l, cur_qp)
+            deblock::edge_qp_chroma(l, cur_qp, dp.chroma_qp_offset)
         } else {
-            i32::from(deblock::chroma_qp_of(cur_qp))
+            i32::from(deblock::chroma_qp_of(cur_qp, dp.chroma_qp_offset))
         };
         let alpha = deblock::alpha_of(qp, dp.alpha_offset);
         let beta = deblock::beta_of(qp, dp.beta_offset);
@@ -773,9 +779,9 @@ fn deblock_mb(pic: &mut Picture, mbx: usize, mby: usize, dp: &DeblockParams) {
         }
         let qp = if e == 0 {
             let t = pic.mbs[mb_xy - w].qp;
-            deblock::edge_qp_chroma(t, cur_qp)
+            deblock::edge_qp_chroma(t, cur_qp, dp.chroma_qp_offset)
         } else {
-            i32::from(deblock::chroma_qp_of(cur_qp))
+            i32::from(deblock::chroma_qp_of(cur_qp, dp.chroma_qp_offset))
         };
         let alpha = deblock::alpha_of(qp, dp.alpha_offset);
         let beta = deblock::beta_of(qp, dp.beta_offset);
