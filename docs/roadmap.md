@@ -104,6 +104,20 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
+- 2026-10-26：M3 首轮收尾——施工 6/6 + 集成阶段同轮落地，全仓门禁
+  全绿、端到端转码通过、无未过项。交付：H.264 软件编码真实现
+  （Baseline/CAVLC、I/P 帧、定 QP + 简单 CRF、无 B 帧；H.264 编码桩
+  随删）、处理图最小集（`topological_order` 真实现、`FilterParams`、
+  crop/fps/volume、fps API 改 `Timestamp` 入参）、convert 编码模式
+  真实现（视频重编码 + MP4 封装、音频直通）+ `ye convert` CLI
+  （--size）。对拍：编码器位级回环 0 容差 + ffmpeg 双解码 + Y-PSNR
+  门槛（QP20≥36dB / QP32≥28dB）全过；端到端经 ffprobe 三重验收
+  （解码无错 / 流参数 / 时长与帧数一致）。施工图与逐任务实录见
+  [m3-plan.md](m3-plan.md)。范围外如实登记：AAC-LC 编码、真码控
+  （CBR/A-VBR、2-pass、完整 CRF）、B 帧/CABAC/High 编码、分块 inter
+  模式归后续批次（m3-plan §7）；CABAC 解码真流对拍卡点沿 M2 收口
+  轨道开放（m3-plan §6）；锻 duan 接线（D1/D2）未动——M3 准入
+  （锻完成第一个转码任务）仍开放，[waitlist.md](waitlist.md) 已同步。
 - 2026-10-24：M1 冶侧收口——m1-mp4 合流（B 案）+ 移植挂 develop
   契约类型 + `Demuxer`/`Muxer` trait 接线 + 门面 `remux` 助手 +
   `convert` 占位（锻 M3 接入契约定形）+ ye-codec/ye-filter 接口桩；

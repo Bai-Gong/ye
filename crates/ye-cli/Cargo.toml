@@ -6,10 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# default-features = false + 显式 mp4：与 contracts.md「门面与 feature
-# 接线」第 3 条的声明一致——不被动继承门面未来新增的 default feature
-# （当前 default 恰为 ["mp4"]，行为与此前等效）。
-ye = { path = "../ye", default-features = false, features = ["mp4"] }
+# default-features = false + 显式 mp4/h264：与 contracts.md「门面与 feature
+# 接线」第 3 条的声明一致——不被动继承门面未来新增的 default feature。
+# h264（2026-10-27 M3 集成阶段增补）：convert 真转码需要 H.264 解码 +
+# 编码真工厂（音频直通不重编码，无需 aac）。
+ye = { path = "../ye", default-features = false, features = ["mp4", "h264"] }
 
 [lib]
 name = "ye_cli"

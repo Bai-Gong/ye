@@ -37,14 +37,23 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Ok(ye_cli::Command::Convert { input, output }) => {
-            // CLI 形态即接入契约示范：进度回调（桩内不会触发）+ 取消旗标。
-            // 命令行无交互取消入口，旗标恒 false；真转码落地后进度改打 stderr。
+        Ok(ye_cli::Command::Convert {
+            input,
+            output,
+            size,
+        }) => {
+            // CLI 形态即接入契约示范：进度回调（逐输出包触发）+ 取消
+            // 旗标。命令行无交互取消入口，旗标恒 false；进度打 stderr，
+            // 首报后每推进 ≥1s 打一行（避免长转码刷屏）。
+            let last = std::cell::Cell::new(i64::MIN);
             let progress = |processed_us: i64, total_us: i64| {
-                eprintln!("ye: 转码进度 {processed_us}/{total_us} µs");
+                if last.get() == i64::MIN || processed_us - last.get() >= 1_000_000 {
+                    last.set(processed_us);
+                    eprintln!("ye: 转码进度 {processed_us}/{total_us} µs");
+                }
             };
             let cancel = AtomicBool::new(false);
-            match ye_cli::convert(&input, &output, &progress, &cancel) {
+            match ye_cli::convert(&input, &output, size, &progress, &cancel) {
                 Ok(report) => {
                     print!("{report}");
                     ExitCode::SUCCESS

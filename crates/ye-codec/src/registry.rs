@@ -421,6 +421,8 @@ mod tests {
                 height: 360,
                 format: PixelFormat::Yuv420p,
                 frame_rate: Rational::RATE_25,
+                gop: 50,
+                quality: crate::codec::QualityMode::Qp(24),
             }),
             audio: None,
         };

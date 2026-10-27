@@ -1,11 +1,12 @@
 //! `ye` 命令行的可测试主体：参数解析、`probe` 报告、`remux` 直通与
-//! `convert` 占位桩。
+//! `convert` 转码。
 //!
 //! 对标 ffprobe 的最小子集（探查素材信息）、`ffmpeg -c copy` 的最小
-//! 子集（重封装直通）；`convert`（真转码）在 M3 落地，本阶段只占
-//! 参数形态（锻 D2 接入约定：进度回调 + AtomicBool 取消）。
-//! 参数解析手写，不引第三方库——命令面还很小，等 M3 `convert`
-//! 带来成体系的选项后再评估 clap。
+//! 子集（重封装直通）；`convert`（M3 集成阶段落地）走门面
+//! [`ye::convert::convert`]：视频链 解码 → 处理链（缩放/像素格式）→
+//! H.264 编码 → MP4 封装，音频包直通（`ffmpeg -c:v libx264 -c:a copy`
+//! 的对位）。参数解析手写，不引第三方库——命令面还很小，选项成体系
+//! 后再评估 clap。
 //!
 //! probe/remux 全部走 [`ContainerRegistry`]（显式构造、注册 MP4 工厂，
 //! 输入 auto-probe ftyp/box 嗅探），不再直连具体容器类型——M2 接线后
@@ -22,6 +23,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use ye::codec::CodecRegistry;
 use ye::container::mp4::register_mp4;
 use ye::container::{ContainerRegistry, MediaHeader};
 
@@ -32,16 +34,14 @@ ye — 百工·冶命令行（媒体探查 / 转码）
 用法:
   ye probe <FILE>        探查媒体文件：每路流的编解码、宽高/采样率、时基、时长、帧率、码率
   ye remux <IN> <OUT>    重封装直通（解封装→封装，不转码；输入格式自动探测，输出 MP4）
-  ye convert <IN> <OUT>  转码（占位桩：真转码 M3 落地，当前调用即返回不支持的特性）
+  ye convert <IN> <OUT> [--size 宽x高]
+                         转码：视频重编码为 H.264 Baseline（--size 如 320x240 控制缩放），
+                         音频直通不重编码；输出 MP4
   ye --help              显示本帮助
   ye --version           显示版本
 
-当前支持: MP4 解封装与封装（progressive 与 fMP4 读写），probe/remux 可用。
-convert 为占位桩——参数形态即锻（duan）的进程内接入契约。";
-
-/// convert 占位桩的固定错误文案（`Unsupported` 语义，真转码 M3 落地）。
-pub const CONVERT_STUB_ERROR: &str = "不支持的特性：convert 真转码在 M3 落地，当前为占位桩\
-（参数形态已定：进度回调 (processed_us, total_us) 微秒 + AtomicBool 取消）";
+当前支持: MP4 解封装与封装（progressive 与 fMP4 读写），probe/remux/convert 可用。
+convert 的参数形态即锻（duan）的进程内接入契约（进度回调 + AtomicBool 取消）。";
 
 /// 解析后的子命令。
 #[derive(Debug, PartialEq, Eq)]
@@ -50,8 +50,13 @@ pub enum Command {
     Probe { path: PathBuf },
     /// `ye remux <IN> <OUT>`。
     Remux { input: PathBuf, output: PathBuf },
-    /// `ye convert <IN> <OUT>`。
-    Convert { input: PathBuf, output: PathBuf },
+    /// `ye convert <IN> <OUT> [--size 宽x高]`。
+    Convert {
+        input: PathBuf,
+        output: PathBuf,
+        /// 目标尺寸 `(宽, 高)`（`--size`；`None` = 保持原尺寸）。
+        size: Option<(u32, u32)>,
+    },
     /// `ye --help` / `ye -h`。
     Help,
     /// `ye --version` / `ye -V`。
@@ -70,8 +75,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
         Some("probe") => parse_probe(&args[1..]),
         Some("remux") => parse_two_paths("remux", &args[1..])
             .map(|(input, output)| Command::Remux { input, output }),
-        Some("convert") => parse_two_paths("convert", &args[1..])
-            .map(|(input, output)| Command::Convert { input, output }),
+        Some("convert") => parse_convert(&args[1..]),
         Some("--help") | Some("-h") => Ok(Command::Help),
         Some("--version") | Some("-V") => Ok(Command::Version),
         other => Err(format!(
@@ -107,11 +111,80 @@ fn parse_two_paths(name: &str, rest: &[OsString]) -> Result<(PathBuf, PathBuf), 
     }
 }
 
+/// `ye convert <IN> <OUT> [--size 宽x高]`：两个位置路径 + 可选 `--size`。
+fn parse_convert(rest: &[OsString]) -> Result<Command, String> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut size: Option<(u32, u32)> = None;
+    let mut i = 0usize;
+    while i < rest.len() {
+        if rest[i].to_str() == Some("--size") {
+            let Some(value) = rest.get(i + 1) else {
+                return Err(format!(
+                    "`--size` 需要一个 `宽x高` 值（如 320x240）。\n\n{USAGE}"
+                ));
+            };
+            if size.is_some() {
+                return Err(format!("`--size` 只能出现一次。\n\n{USAGE}"));
+            }
+            size = Some(parse_size(value)?);
+            i += 2;
+            continue;
+        }
+        if paths.len() == 2 {
+            return Err(format!(
+                "`convert` 只接受输入与输出两个文件参数。\n\n{USAGE}"
+            ));
+        }
+        paths.push(PathBuf::from(&rest[i]));
+        i += 1;
+    }
+    match paths.len() {
+        2 => Ok(Command::Convert {
+            input: paths[0].clone(),
+            output: paths[1].clone(),
+            size,
+        }),
+        0 => Err(format!("`convert` 需要输入与输出两个文件参数。\n\n{USAGE}")),
+        _ => Err(format!(
+            "`convert` 需要输入与输出两个文件参数（缺输出）。\n\n{USAGE}"
+        )),
+    }
+}
+
+/// `--size` 值解析：`宽x高`（十进制、非零偶数——yuv420p 平面几何与
+/// H.264 编码器的共同要求）。
+fn parse_size(value: &OsString) -> Result<(u32, u32), String> {
+    let text = value.to_string_lossy();
+    let bad = || {
+        format!(
+            "`--size` 的值须为 `宽x高`（十进制、非零偶数，如 320x240），收到 {text}。\n\n{USAGE}"
+        )
+    };
+    let (w, h) = text.split_once('x').ok_or_else(bad)?;
+    let (w, h) = (
+        w.parse::<u32>().map_err(|_| bad())?,
+        h.parse::<u32>().map_err(|_| bad())?,
+    );
+    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+        return Err(bad());
+    }
+    Ok((w, h))
+}
+
 /// 命令行自用的容器注册表：MP4 demuxer/muxer 已注册（显式构造、
 /// 显式传递——注册表无全局单例，见 ye-container 契约）。
 pub fn registry() -> ContainerRegistry {
     let mut reg = ContainerRegistry::new();
     register_mp4(&mut reg);
+    reg
+}
+
+/// 命令行自用的编解码注册表：H.264 解码 + 编码真工厂已注册（音频
+/// 直通不重编码、无需 AAC 解码器；显式构造、显式传递）。
+pub fn codec_registry() -> CodecRegistry {
+    let mut reg = CodecRegistry::new();
+    ye::codec_h264::register_h264(&mut reg);
+    ye::codec_h264::register_h264_encoder(&mut reg);
     reg
 }
 
@@ -270,7 +343,7 @@ pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
     ))
 }
 
-// —— convert（M3 占位桩）——
+// —— convert（M3 集成：视频重编码 + 音频直通）——
 
 /// 转码进度回调的参数形态（锻 D2 接入约定）：
 /// `(processed_us, total_us)` —— 已处理/总时长，微秒（参数名以文档
@@ -281,25 +354,75 @@ pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
 /// （Tauri 事件层），ye 只提供进程内的每任务回调。
 pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);
 
-/// `ye convert <IN> <OUT>`：转码占位桩（真转码 M3 落地）。
+/// `ye convert <IN> <OUT> [--size 宽x高]`：视频重编码为 H.264
+/// （可选缩放），音频直通（不重编码），输出 MP4。
 ///
-/// 参数形态即锻的进程内接入契约，现在定形：
-/// - `progress`：进度回调 [`ConvertProgress`]（已处理/总时长，微秒；
-///   M3 的转码循环逐包/逐帧上报）；
-/// - `cancel`：取消旗标 `&AtomicBool`——锻侧置位即请求取消，M3 的
-///   转码循环逐包检查、及时退出并清理半成品（进程内等价于旧方案的
-///   kill 子进程）。
+/// 接线门面 [`ye::convert::convert`]（锻接入契约的命令行形态）：
+/// - `size`：`--size` 目标尺寸（`None` = 保持原尺寸）；
+/// - `progress`：进度回调（逐输出包上报，`processed_us` 单调不减）；
+/// - `cancel`：取消旗标 `&AtomicBool`——置位即请求取消，泵每包检查、
+///   及时退出。
 ///
-/// 本桩调用即返回 [`CONVERT_STUB_ERROR`]（不触碰输入输出文件）。
+/// 失败即清理半成品（删除已创建的输出文件）——泵持有 `WriteSeek`
+/// 抽象、无路径概念，删除归本层。
 pub fn convert(
     input: &Path,
     output: &Path,
-    _progress: ConvertProgress<'_>,
-    _cancel: &AtomicBool,
+    size: Option<(u32, u32)>,
+    progress: ConvertProgress<'_>,
+    cancel: &AtomicBool,
 ) -> Result<String, String> {
-    Err(format!(
-        "{} → {}: {CONVERT_STUB_ERROR}",
-        input.display(),
-        output.display()
-    ))
+    let ctx = || format!("{} → {}", input.display(), output.display());
+    let result = run_convert(input, output, size, progress, cancel);
+    if result.is_err() {
+        // 半成品清理：泵已随错误丢弃输出 writer（文件句柄关闭），
+        // 这里删除残留文件（不存在时忽略）。
+        let _ = std::fs::remove_file(output);
+    }
+    result
+        .map(|stats| {
+            let target = match size {
+                Some((w, h)) => format!("（H.264 {w}x{h}）"),
+                None => "（H.264）".to_string(),
+            };
+            format!(
+                "{} → {}: MP4, {} 路流, 视频 {} 帧重编码{}, 音频 {} 包直通\n",
+                input.display(),
+                output.display(),
+                stats.streams,
+                stats.video_frames,
+                target,
+                stats.audio_frames
+            )
+        })
+        .map_err(|e| format!("{}: {e}", ctx()))
+}
+
+/// `convert` 的主体（打开文件 → 门面泵 → 统计），错误带路径上下文
+/// 由外层统一包装。
+fn run_convert(
+    input: &Path,
+    output: &Path,
+    size: Option<(u32, u32)>,
+    progress: ConvertProgress<'_>,
+    cancel: &AtomicBool,
+) -> Result<ye::convert::ConvertStats, String> {
+    let in_file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let out_file = File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let settings = ye::convert::VideoEncodeSettings {
+        chain: ye::convert::VideoChain { format: None, size },
+        ..Default::default()
+    };
+    ye::convert::convert(
+        &registry(),
+        &codec_registry(),
+        Box::new(BufReader::new(in_file)),
+        "mp4",
+        Box::new(BufWriter::new(out_file)),
+        &settings,
+        ye::convert::filter_ops(),
+        progress,
+        cancel,
+    )
+    .map_err(|e| e.to_string())
 }

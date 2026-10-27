@@ -431,12 +431,35 @@ fn binary_exit_codes() {
     assert!(String::from_utf8(bad.stderr).unwrap().contains("未知命令"));
 }
 
-// —— convert 占位桩（真转码 M3；参数形态即锻接入契约）——
+// —— convert（M3 集成：真转码；e2e 对拍在 tests/convert_e2e.rs）——
 
-/// 真二进制调用 `ye convert`：固定返回不支持的特性（退出码 1），
-/// 且不产出输出文件。
+/// lib 层直调：输入打不开时报错含路径前缀，进度回调不触发、不产出
+/// 输出文件（真转码的失败面；ffmpeg oracle 侧的端到端在
+/// `convert_e2e.rs`）。
 #[test]
-fn binary_convert_stub_returns_unsupported() {
+fn convert_reports_open_failure_with_path() {
+    use std::sync::atomic::AtomicBool;
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("no-such-convert-input.mp4");
+    let out = dir.join("no-such-convert-output.mp4");
+    let cancel = AtomicBool::new(false);
+    let called = std::cell::Cell::new(false);
+    let progress = |_, _| called.set(true);
+    let err = ye_cli::convert(&missing, &out, None, &progress, &cancel)
+        .expect_err("打开不存在的文件应失败");
+    assert!(
+        err.contains(missing.display().to_string().as_str()),
+        "错误信息应含输入路径，实际: {err}"
+    );
+    assert!(!called.get(), "打不开输入不得触发进度回调");
+    assert!(!out.exists(), "失败不得产出输出文件");
+}
+
+/// 真二进制调用 `ye convert`：坏尺寸参数报用法错误（退出码 2）。
+#[test]
+fn binary_convert_rejects_bad_size() {
     let src = temp_mp4(&two_track_mp4());
     let _guard = scopeguard(&src);
     let unique = SystemTime::now()
@@ -444,50 +467,23 @@ fn binary_convert_stub_returns_unsupported() {
         .unwrap()
         .as_nanos();
     let dst = std::env::temp_dir().join(format!(
-        "ye-cli-convert-stub-{}-{unique}.mp4",
+        "ye-cli-convert-badsize-{}-{unique}.mp4",
         std::process::id()
     ));
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ye"))
         .arg("convert")
         .arg(&src)
         .arg(&dst)
+        .arg("--size")
+        .arg("321x240") // 奇数宽：yuv420p 平面几何拒绝
         .output()
         .expect("启动 ye 二进制失败");
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "convert 桩应以退出码 1 报不支持的特性"
+        Some(2),
+        "坏 --size 应以退出码 2 报用法错误"
     );
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(
-        stderr.contains("不支持的特性") && stderr.contains("M3"),
-        "stderr 应明确 Unsupported 桩语义，实际:\n{stderr}"
-    );
-    assert!(!dst.exists(), "占位桩不应产出输出文件: {}", dst.display());
-}
-
-/// lib 层直调：convert 收到进度回调与取消旗标后仍返回桩错误
-/// （回调不被触发），错误信息含两个路径。
-#[test]
-fn convert_stub_signature_and_error() {
-    use std::cell::Cell;
-    use std::sync::atomic::AtomicBool;
-
-    let cancel = AtomicBool::new(false);
-    let called = Cell::new(false);
-    let progress = |_, _| called.set(true);
-    let err = ye_cli::convert(
-        std::path::Path::new("in.mp4"),
-        std::path::Path::new("out.mp4"),
-        &progress,
-        &cancel,
-    )
-    .expect_err("占位桩应返回 Err");
-    assert!(!called.get(), "桩不触发进度回调");
-    assert!(
-        err.contains("in.mp4") && err.contains("out.mp4") && err.contains("不支持的特性"),
-        "错误应含路径与 Unsupported 语义，实际: {err}"
-    );
+    assert!(!dst.exists(), "用法错误不产出输出文件");
 }
 
 // —— 参数解析 ——
@@ -538,6 +534,7 @@ fn parse_args_rejects_bad_usage() {
 
 #[test]
 fn parse_args_accepts_convert() {
+    // 裸双路径（size = None）。
     let case = parse_args(&[
         OsString::from("convert"),
         OsString::from("in.mp4"),
@@ -547,7 +544,84 @@ fn parse_args_accepts_convert() {
         case,
         Ok(Command::Convert {
             input: PathBuf::from("in.mp4"),
-            output: PathBuf::from("out.mp4")
+            output: PathBuf::from("out.mp4"),
+            size: None
         })
+    );
+    // --size 在路径后。
+    let case = parse_args(&[
+        OsString::from("convert"),
+        OsString::from("in.mp4"),
+        OsString::from("out.mp4"),
+        OsString::from("--size"),
+        OsString::from("320x240"),
+    ]);
+    assert_eq!(
+        case,
+        Ok(Command::Convert {
+            input: PathBuf::from("in.mp4"),
+            output: PathBuf::from("out.mp4"),
+            size: Some((320, 240))
+        })
+    );
+    // --size 在路径间（选项与位置参数可混排）。
+    let case = parse_args(&[
+        OsString::from("convert"),
+        OsString::from("--size"),
+        OsString::from("320x240"),
+        OsString::from("in.mp4"),
+        OsString::from("out.mp4"),
+    ]);
+    assert!(matches!(
+        case,
+        Ok(Command::Convert {
+            size: Some((320, 240)),
+            ..
+        })
+    ));
+    // 坏形态：奇数尺寸 / 缺值 / 重复。
+    assert!(
+        parse_args(&[
+            OsString::from("convert"),
+            OsString::from("in.mp4"),
+            OsString::from("out.mp4"),
+            OsString::from("--size"),
+            OsString::from("321x240")
+        ])
+        .is_err(),
+        "奇数宽应报用法错误"
+    );
+    assert!(
+        parse_args(&[
+            OsString::from("convert"),
+            OsString::from("in.mp4"),
+            OsString::from("out.mp4"),
+            OsString::from("--size")
+        ])
+        .is_err(),
+        "--size 缺值应报用法错误"
+    );
+    assert!(
+        parse_args(&[
+            OsString::from("convert"),
+            OsString::from("in.mp4"),
+            OsString::from("out.mp4"),
+            OsString::from("--size"),
+            OsString::from("320x240"),
+            OsString::from("--size"),
+            OsString::from("320x240"),
+        ])
+        .is_err(),
+        "重复 --size 应报用法错误"
+    );
+    assert!(
+        parse_args(&[
+            OsString::from("convert"),
+            OsString::from("in.mp4"),
+            OsString::from("out.mp4"),
+            OsString::from("extra.mp4"),
+        ])
+        .is_err(),
+        "多余路径应报用法错误"
     );
 }

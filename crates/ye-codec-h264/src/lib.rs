@@ -24,6 +24,15 @@
 //! - [`Sps`]/[`Pps`]/[`Profile`]：参数集解析（`sps` 模块，含
 //!   Baseline 边界判定 [`Sps::is_baseline`]——④/⑨ 的 profile 门槛
 //!   消费点）。
+//! - `encoder` 目录：编码写侧（M3 施工图 T2–T5）——`BitWriter`
+//!   （u(1)/u(n)/ue/se 写、rbsp trailing bits、防竞争写侧 escape）、
+//!   CAVLC 写侧（与 `cavlc` 读侧互为镜像）、I 帧编码全链（参数集写侧、
+//!   宏块循环与本地解码环）、运动估计（整像素 SAD 加半像素细化，候选
+//!   预测块经 `mc.rs` 冻结核生成）、P 帧编码全链（P_Skip / P_L0_16x16 /
+//!   宏块级 intra 回退三模式决策、MVD 中值预测编码、Baseline 单参考
+//!   帧会话）、参数集定形（level 查表与 avcC 写侧）、[`Encoder`] trait
+//!   接线（[`H264Encoder`]/[`encoder_factory`]：输出 AVCC 与 avcC
+//!   extradata、按 `EncoderConfig.time_base` 打戳、GOP 与质量模式）。
 //!
 //! ## 设计要点
 //!
@@ -41,6 +50,7 @@ mod cabac_tables;
 mod cavlc;
 mod deblock;
 mod decoder;
+mod encoder;
 mod error;
 mod inter;
 mod intra8x8;
@@ -52,6 +62,7 @@ mod sps;
 
 pub use bitreader::BitReader;
 pub use decoder::{H264Decoder, decoder_factory};
+pub use encoder::{H264Encoder, ReconFrame, encoder_factory, level_for};
 pub use error::H264Error;
 pub use nal::{
     AvcConfigRecord, NalCategory, NalHeader, annexb_to_avcc, avcc_to_annexb,

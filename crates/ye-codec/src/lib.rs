@@ -14,12 +14,12 @@
 //! - [`VideoParams`]/[`AudioParams`]/[`CodecParameters`]：编解码参数
 //!   （`params` 模块）；
 //! - [`Decoder`]/[`Encoder`]/[`DecoderFactory`]/[`EncoderFactory`]/
-//!   [`VideoEncoderConfig`]/[`AudioEncoderConfig`]/[`EncoderConfig`]：
-//!   trait、工厂与编码配置（`codec` 模块）；
+//!   [`VideoEncoderConfig`]/[`QualityMode`]/[`AudioEncoderConfig`]/
+//!   [`EncoderConfig`]：trait、工厂与编码配置（`codec` 模块）；
 //! - [`CodecRegistry`]：显式注册表（`registry` 模块）；
-//! - [`register_stubs`]/[`h264_decoder_factory`]/[`h264_encoder_factory`]/
-//!   [`aac_decoder_factory`]/[`aac_encoder_factory`]：M2+ 接口桩的注册
-//!   与工厂（`stubs` 模块）；
+//! - [`register_stubs`]/[`h264_decoder_factory`]/[`aac_decoder_factory`]/
+//!   [`aac_encoder_factory`]：M2+ 接口桩的注册与工厂（`stubs` 模块；
+//!   H.264 编码桩已随 M3 真实现删除，见该模块文档）；
 //! - [`CodecError`]：本 crate 错误枚举（`error` 模块，包装
 //!   `ye_time::TimeError` 与 `ye_pixfmt::PixfmtError`）。
 //!
@@ -31,10 +31,11 @@
 //! - 时戳自描述（[`ye_time::Timestamp`] 内含时基），缺时戳一律
 //!   `Option::None`，无 `AV_NOPTS_VALUE` 等价物；
 //! - 注册表是显式构造、显式传递的对象，无全局单例；
-//! - **桩的语义边界**（`stubs` 模块，M2/M3 交付前）：可注册——注册项
-//!   经 `supports_*`/`*_ids` 可查；可构造——`create_*`/工厂一律成功；
+//! - **桩的语义边界**（`stubs` 模块）：可注册——注册项经
+//!   `supports_*`/`*_ids` 可查；可构造——`create_*`/工厂一律成功；
 //!   不可用——`feed`/`pull` 调用即返回 [`CodecError::UnsupportedStub`]，
-//!   文案注明交付里程碑（解码 → M2、编码 → M3），`flush` 无操作；
+//!   文案注明交付去向（H.264/AAC 解码真实现已随 M2 交付；AAC 编码 →
+//!   后续批次；H.264 编码桩已随 M3 真实现删除），`flush` 无操作；
 //! - 本 crate 零第三方依赖（仅 std + ye-time + ye-pixfmt）、不含 unsafe；
 //!   panic 仅一处文档写明的编程错误：[`VideoFrame::plane`] 的平面索引
 //!   越界（全库五处中的第⑤处），数据驱动失败一律 `Result`。
@@ -50,7 +51,7 @@ mod stubs;
 
 pub use codec::{
     AudioEncoderConfig, Decoder, DecoderFactory, Encoder, EncoderConfig, EncoderFactory,
-    VideoEncoderConfig,
+    QualityMode, VideoEncoderConfig,
 };
 pub use error::CodecError;
 pub use frame::{AudioFrame, Decoded, Encoded, Frame, VideoFrame};
@@ -58,7 +59,4 @@ pub use media::{CodecId, MediaType};
 pub use packet::{Packet, PacketFlags};
 pub use params::{AudioParams, CodecParameters, VideoParams};
 pub use registry::CodecRegistry;
-pub use stubs::{
-    aac_decoder_factory, aac_encoder_factory, h264_decoder_factory, h264_encoder_factory,
-    register_stubs,
-};
+pub use stubs::{aac_decoder_factory, aac_encoder_factory, h264_decoder_factory, register_stubs};

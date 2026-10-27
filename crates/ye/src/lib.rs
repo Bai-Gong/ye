@@ -24,11 +24,12 @@
 //! `container.rs` 头注）。
 //!
 //! 此外 [`container`] 模块提供跨容器 [`remux`](container::remux) 助手
-//! （`ffmpeg -c copy` 等价，不转码）；[`convert`] 模块是转码泵骨架
-//! （施工图④：固定链序 解码→像素转换→scale→编码槽，µs 进度 +
-//! `AtomicBool` 取消；编码槽 M2 为 Unsupported 桩，解码器经注入的
-//! [`codec::CodecRegistry`] 取得——`h264`/`aac` feature 开启后可注册
-//! 真解码器，泵本体不依赖具体实现 crate，故无 feature 门）；
+//! （`ffmpeg -c copy` 等价，不转码）；[`convert`] 模块是转码泵（固定
+//! 链序 解码→像素转换→scale→编码，µs 进度 + `AtomicBool` 取消）——
+//! M3 集成阶段起两条路径均真实现：`convert_frames`（帧消费）与
+//! `convert`（视频重编码 H.264 + MP4 封装、音频包直通，解码/编码器
+//! 经注入的 [`codec::CodecRegistry`] 取得，泵本体不依赖具体实现
+//! crate，故无 feature 门；像素核缺省桥接 `convert::filter_ops()`）；
 //! [`stubs`] 模块是 M2+ 接口桩的聚合入口（语义边界见
 //! docs/contracts.md「M2+ 接口桩契约」）。
 

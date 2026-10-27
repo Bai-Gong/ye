@@ -88,7 +88,35 @@ pub type DecoderFactory = fn(&CodecParameters) -> Result<Box<dyn Decoder>, Codec
 /// 编码器工厂：普通 `fn` 指针，语义同 [`DecoderFactory`]，消费 [`EncoderConfig`]。
 pub type EncoderFactory = fn(&EncoderConfig) -> Result<Box<dyn Encoder>, CodecError>;
 
-/// 视频编码参数（公有字段、无不变式）。
+/// 视频编码质量模式（公有载荷，值域校验归具体编码器工厂——2026-10-26
+/// M3 编码收口随 `VideoEncoderConfig` 扩质量字段引入）。
+///
+/// - [`QualityMode::Qp`]：恒定量化参数（H.264 QP 语义，**1–51**；0 显式
+///   拒绝——无缩放语义边缘、消费方无用例，形态收紧一律 `Err` 的库风）；
+/// - [`QualityMode::Crf`]：简单 CRF（值域同 1–51，具体编码器以值映射
+///   基 QP 并按帧内复杂度自适应 ΔQP——启发式近似，**不是**真码控；
+///   CBR/2-pass/完整 CRF 归后续批次，见 ye/docs/m3-plan.md §5 裁决 5）。
+///
+/// derive 清单：`Debug, Clone, Copy, PartialEq, Eq`（纯值载荷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityMode {
+    /// 恒定 QP（H.264 语义 1–51）。
+    Qp(u8),
+    /// 简单 CRF（1–51，编码器按实现定义的映射落到逐帧 QP）。
+    Crf(u8),
+}
+
+impl QualityMode {
+    /// 质量值（`Qp`/`Crf` 的载荷，语义见变体文档）。
+    pub fn value(self) -> u8 {
+        match self {
+            QualityMode::Qp(v) | QualityMode::Crf(v) => v,
+        }
+    }
+}
+
+/// 视频编码参数（公有字段、无不变式；值域校验归具体编码器工厂——
+/// 真工厂交付即校验，桩不校验）。
 ///
 /// derive 清单：`Debug, Clone, PartialEq, Eq`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,8 +127,12 @@ pub struct VideoEncoderConfig {
     pub height: u32,
     /// 输入帧的像素格式（编码器按此解析送入的帧）。
     pub format: PixelFormat,
-    /// 目标帧率（每秒次数）。
+    /// 目标帧率（每秒次数；输出时戳按 帧号 × 帧率 递推的依据）。
     pub frame_rate: Rational,
+    /// GOP（IDR 间隔，帧数）：1 = 全 I 帧，0 非法（工厂校验）。
+    pub gop: u32,
+    /// 质量模式（恒定 QP / 简单 CRF，值域 1–51）。
+    pub quality: QualityMode,
 }
 
 /// 音频编码参数（公有字段、无不变式）。
@@ -151,6 +183,8 @@ mod tests {
                 height: 1080,
                 format: PixelFormat::Yuv420p,
                 frame_rate: Rational::RATE_25,
+                gop: 25,
+                quality: QualityMode::Qp(20),
             }),
             audio: None,
         };

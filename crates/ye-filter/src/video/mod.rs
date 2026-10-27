@@ -1,4 +1,5 @@
-//! 像素核（M2）：像素格式转换与缩放/裁剪/fps/音量的**纯函数内核**。
+//! 像素核（M2 起持续扩展）：像素格式转换与缩放/裁剪/fps/音量的
+//! **纯函数内核**。
 //!
 //! 施工图④分工 (b)：本目录是纯函数层——无状态、无 I/O、无 panic 数据路径，
 //! 全部失败走 `Result`。convert 泵（固定链序 decode→convert→scale→encode
@@ -23,16 +24,23 @@
 //! pub fn scale_rgba(rgba: &[u8], w, h, dst_w, dst_h) -> Result<Vec<u8>, FilterError>
 //!                                                // 教科书双线性；泵的 scale 槽（RGBA 域）
 //! pub fn crop_rgba(rgba: &[u8], w, h, x, y, cw, ch) -> Result<Vec<u8>, FilterError>
-//! pub fn fps_nearest_frame_indices(pts_us: &[i64], fps_num: u32, fps_den: u32)
-//!     -> Result<Vec<usize>, FilterError>         // 时基重采样按最近帧（返回输入下标序列）
+//! pub fn crop_yuv420p(src: &Yuv420pView, w, h, x, y, cw, ch)
+//!     -> Result<Yuv420pBuffer, FilterError>      // 平面域裁剪；x/y/cw/ch 全偶校验（M3）
+//! pub fn fps_nearest_frame_indices(pts: &[Timestamp], fps_num: u32, fps_den: u32)
+//!     -> Result<Vec<usize>, FilterError>         // 时基重采样按最近帧（返回输入下标序列）；
+//!                                                // 时戳自描述（M3 起入参为 ye-time Timestamp，
+//!                                                // 跨时基比较只走 Timestamp::compare）
 //! pub fn volume_f32(samples: &[f32], gain: f32) -> Result<Vec<f32>, FilterError>
 //!                                                // 增益乘法 + [−1,1] 削波（音频链）
+//! pub fn volume_gain_from_db(db: f32) -> Result<f32, FilterError>
+//!                                                // dB → 线性增益：10^(dB/20)（M3）
 //! ```
 //!
 //! 泵的接线形态（M2 剪抽帧）：`decode 帧 → Yuv420pView（frame.plane(i) +
 //! frame.layout().plane(i).stride）→ yuv420p_to_rgba（range 取流参数，缺省
 //! Limited）→ [crop_rgba] → scale_rgba → PNG/编码槽`；音频链 `AAC 解码 f32
-//! → volume_f32 → 峰值/波形`。
+//! → volume_f32 → 峰值/波形`。滤镜图参数承载（crop 的 x/y/w/h、fps 的
+//! num/den、volume 的 gain）见 `crate::descriptor::FilterParams`（M3 定形）。
 //!
 //! ## 对拍口径与容差（写死，**只准收紧**）
 //!
@@ -43,6 +51,9 @@
 //! | 转换核（同尺寸 yuv420p→rgba/rgb24） | `-sws_flags bilinear` + `-pix_fmt` 直转 | 1 | 有限范围 1（约 0.2% 像素 ±1）、全程范围 0 |
 //! | 平面缩放（yuv420p→yuv420p） | `-sws_flags bilinear -vf scale=WxH:flags=bilinear` | 2 | ≤2（多为 1） |
 //! | 缩放+转换链 | `scale=WxH:flags=bilinear,format=yuv420p,format=rgba`（两段式） | 4 | ≤4 |
+//! | 平面域裁剪（M3） | `-vf crop=CW:CH:X:Y` | 0 | 0（纯字节搬运） |
+//! | fps 最近帧选择（M3） | `-vf fps=N:round=near` | 选择序全等（0） | 全等（冻结几何族：24→24 / 24→12 / 25→30 / 单帧 24→30，见用例头注的结构性差异登记） |
+//! | volume 增益乘法（M3） | `-af volume=G:precision=float`（f32le） | 1 ULP | 0 ULP |
 //!
 //! 容差是入库资产：向更严方向修改免评审；任何放宽须回施工图重新定口径
 //! （对齐 `tests/conformance/src/tolerance.rs` 的 POLICY_NOTE）。已知结构性
@@ -56,7 +67,10 @@ pub use convert::{
     Yuv420pBuffer, Yuv420pView, YuvRange, rgb24_to_yuv420p, rgba_to_yuv420p, yuv420p_to_rgb24,
     yuv420p_to_rgba,
 };
-pub use scale::{crop_rgba, fps_nearest_frame_indices, scale_rgba, scale_yuv420p, volume_f32};
+pub use scale::{
+    crop_rgba, crop_yuv420p, fps_nearest_frame_indices, scale_rgba, scale_yuv420p, volume_f32,
+    volume_gain_from_db,
+};
 
 /// ffmpeg oracle 对拍的测试公用件（仅测试编译）。
 ///
@@ -164,5 +178,33 @@ pub(crate) mod testutil {
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
         buf
+    }
+
+    /// 运行 ffmpeg f32le 单声道音频滤镜（`-af`），读回输出 f32 样本；
+    /// 失败 panic（测试环境契约）。视频版见 [`run_ffmpeg_raw`]。
+    pub fn run_ffmpeg_f32(input: &[f32], af_args: &[&str]) -> Vec<f32> {
+        let inp = tmp_path("in", "f32");
+        let outp = tmp_path("out", "f32");
+        let bytes: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(&inp, bytes).expect("写 oracle 输入");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-v", "error"])
+            .args(["-f", "f32le", "-ar", "48000", "-ac", "1"])
+            .arg("-i")
+            .arg(&inp)
+            .args(["-af"])
+            .args(af_args)
+            .args(["-f", "f32le"])
+            .arg(&outp)
+            .status()
+            .expect("启动 ffmpeg（PATH 需有 ffmpeg）");
+        assert!(status.success(), "ffmpeg oracle 运行失败: {af_args:?}");
+        let buf = std::fs::read(&outp).expect("读 oracle 输出");
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+        assert_eq!(buf.len() % 4, 0, "f32 输出字节长须为 4 的倍数");
+        let (chunks, rest) = buf.as_chunks::<4>();
+        assert!(rest.is_empty(), "f32 输出字节长须为 4 的倍数");
+        chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
     }
 }
