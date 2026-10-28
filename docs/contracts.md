@@ -14,7 +14,8 @@
 **M3 补齐（2026-10-26 晚）**：真码控（`EncoderConfig.bit_rate` 由
 H.264 编码器消费，CBR/A-VBR）+ AAC-LC 编码器（`register_aac_encoder`，
 AAC 编码桩随交付删除）+ convert 音频三态与剥视频（见「锻的最小
-API 面」签名块）。
+API 面」签名块）。**M4 首轮（2026-10-26 深夜）**：新增「合成导出
+最小集契约」——`ye::compose` 顺序拼接泵，剪导出接管的纯剪辑子集。
 
 > 2026-10-24 合流后：本文 m1 侧各节（`ye-time` / `ye-pixfmt` /
 > `ye-container-mp4` / `ye-cli` / `Mp4Writer` 及 feature 链）描述的是
@@ -758,6 +759,53 @@ M-S/短块（absence 位合法流）。
   （实测 +0.5%/+0.2%）。工具缺席分级 skip（`tests/common` 三档
   定位器），在场失败不许 skip。回归
   `crates/ye-codec-aac/tests/encode_oracle.rs`。
+
+## 合成导出最小集契约（M4 首轮，2026-10-26）
+
+门面 `ye::compose`（`crates/ye/src/compose.rs`）：剪（jian）导出
+接管的第一轨——**顺序拼接**。消费方接线：jian
+`run_export_ye`/`export_ye_impl`（`src-tauri/src/export_ye.rs`，
+双引擎之一；纯函数翻译层 `buildYeExportParams` 把「纯剪辑」时间线
+翻成片段列表，带任何变换的时间线明确拒绝并指路 ffmpeg 引擎）。
+
+```rust
+pub struct ComposeSegment { pub input: Box<dyn ReadSeek>,
+                            pub trim_in_us: i64, pub trim_out_us: i64 }
+    // 源内裁剪窗口（µs，含头不含尾）
+pub struct ComposeSettings { pub width: u32, pub height: u32,
+                             pub frame_rate: Rational,       // 输出 CFR
+                             pub gop: u32, pub quality: QualityMode,
+                             pub bit_rate: Option<u64>,
+                             pub audio: AudioEncodeSettings } // Aac/Drop（Copy 拒绝）
+pub fn compose(containers: &ContainerRegistry, codecs: &CodecRegistry,
+               segments: Vec<ComposeSegment>, output_format: &str,
+               output: Box<dyn WriteSeek>, settings: &ComposeSettings,
+               pixels: PixelOps, progress: ConvertProgress<'_>, cancel: &AtomicBool)
+    -> Result<ConvertStats, ConvertError>;
+```
+
+行为契约（细节以 `compose.rs` 模块文档为正本）：
+
+- **逐段校验**：恰一路视频流；`Aac` 时恰一路音频流且各段采样率/声道
+  一致、在 AAC 能力面内；`Copy` 拒绝；违者 `InvalidArguments` 指明
+  1 起段号（不做重采样/混音——归后续批次）。
+- **视频 CFR 桶采样**（`CfrSampler`）：tick 数 = ⌈窗口×帧率⌉（i128
+  精确有理数），每 tick 取 pts ≤ tick 时刻的最近帧（hold-last、段首
+  无帧取首帧），全局唯一 H.264 编码器、输出 pts 全局连续从 0 起；
+  窗口内零帧显式拒绝。
+- **音频跨段连续累积** f32（窗口逐采样过滤），凑 1024 出帧喂全局
+  唯一 AAC 编码器，末段补零；esds 复用 `convert::aac_esds`。
+- **avcC 封装头延迟**：复用 convert 的 `HeaderState` 套路
+  （`convert::avcc_from_idr` 回收，输出流号恒定 视频 0/音频 1）。
+- **进度/取消/统计**：与 convert 完全同契约（逐输出包上报 µs 单调
+  不减、total = Σ窗口；每输入包取消检查点；`ConvertStats` 口径）。
+- **首轮取舍（登记归后续）**：无 seek 快进（窗口外帧解码后丢弃）、
+  发射帧一次克隆、无段级静音填充、段间无转场。
+
+对拍：`crates/ye/tests/compose.rs` 9 项（conformance 向量，缺席即
+失败）+ jian `tests/export_ye_e2e.rs`（两段 3s 源各裁 2s →
+320x240@15：ffmpeg 无错解码、时长/帧数形态、与 ffmpeg concat filter
+对照五点位灰度帧平均 |Δ| 实测 0.75–1.62、容差 3.0 只准收紧）。
 
 ## 处理图最小集契约（M3 T6，2026-10-26）
 

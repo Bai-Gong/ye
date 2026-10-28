@@ -30,6 +30,9 @@
 //! `convert`（视频重编码 H.264 + MP4 封装、音频包直通，解码/编码器
 //! 经注入的 [`codec::CodecRegistry`] 取得，泵本体不依赖具体实现
 //! crate，故无 feature 门；像素核缺省桥接 `convert::filter_ops()`）；
+//! [`compose`] 模块是合成泵（M4 首轮：顺序拼接——多段 MP4 各带源内
+//! 裁剪窗口 → 单个 MP4，视频 H.264 重编码（CFR 桶采样）+ 音频 AAC-LC
+//! 重编码跨段连续累积，注册表注入与进度/取消契约同 convert）；
 //! [`stubs`] 模块是 M2+ 接口桩的聚合入口（语义边界见
 //! docs/contracts.md「M2+ 接口桩契约」）；[`waveform`] 模块是波形峰值
 //! 出口（剪的波形）：纯核（packed f32 交织样本 → 每桶每声道
@@ -48,6 +51,7 @@ pub mod codec_aac;
 #[cfg(feature = "h264")]
 pub mod codec_h264;
 
+pub mod compose;
 pub mod container;
 pub mod convert;
 

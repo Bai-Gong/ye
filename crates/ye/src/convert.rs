@@ -579,7 +579,8 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
 }
 
 /// 由 IDR 包的带内 SPS/PPS 构造 avcC 记录（模块文档「avcC 的取得」）。
-fn avcc_from_idr(packet: &Packet) -> Result<Vec<u8>, ConvertError> {
+/// `pub(crate)`：compose 合成泵（M4）复用同一构造。
+pub(crate) fn avcc_from_idr(packet: &Packet) -> Result<Vec<u8>, ConvertError> {
     let data = &packet.data[..];
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
@@ -741,8 +742,9 @@ fn build_audio_encode_lane(
 /// AAC-LC 的 esds 载荷（MP4 `mp4a` stsd 直填形态，含 4 字节
 /// version/flags）。构造正本在 `ye-codec-aac`（AudioSpecificConfig 的
 /// 编解码器侧知识）；采样率/声道超出能力面 → `InvalidArguments`。
+/// `pub(crate)`：compose 合成泵（M4）复用同一构造。
 #[cfg(feature = "aac")]
-fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
+pub(crate) fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
     ye_codec_aac::esds_extradata(sample_rate, channels).ok_or_else(|| {
         ConvertError::InvalidArguments(format!(
             "AAC-LC 能力面不含 采样率 {sample_rate}Hz × {channels} 声道（标准 13 档采样率 × 单/双声道）"
@@ -751,8 +753,9 @@ fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
 }
 
 /// 无 `aac` feature：AAC 重编码显式不可用（不静默降级成直通）。
+/// `pub(crate)`：compose 合成泵（M4）复用。
 #[cfg(not(feature = "aac"))]
-fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
+pub(crate) fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
     let _ = (sample_rate, channels);
     Err(ConvertError::InvalidArguments(
         "AAC-LC 重编码需启用 ye 的 aac feature".into(),

@@ -117,6 +117,23 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
+- 2026-10-26（深夜）：M4 首轮——剪导出接管的纯剪辑子集，两仓门禁
+  全绿（施工代理交付、主线复核）。**ye 侧**：新门面 `ye::compose`
+  （顺序拼接泵：多段 MP4 裁剪窗口 → 单 MP4，视频 H.264 重编码 +
+  音频 AAC-LC 重编码/剥轨；CFR 桶采样 hold-last〔i128 精确有理数〕、
+  音频 f32 跨段连续累积、avcC 封装头延迟复用 convert 套路、进度/
+  取消/统计与 convert 同契约；逐段校验错误面指明段号，无重采样/
+  混音/静音填充——登记归后续）。**剪侧（jian）**：导出双引擎——
+  `run_export_ye` 命令（复用 export-progress 事件契约 + 取消表）+
+  `buildYeExportParams` 纯函数翻译层（纯剪辑时间线〔视频层首尾
+  相接、无变速/变换/效果/转场、伴音参数一致〕→ 片段列表；其余
+  明确拒绝指路 ffmpeg 引擎，3 接受 + 24 拒绝矩阵锁定）+ 顶栏引擎
+  切换（duan 同款）+ probe 双轨增 videoCodec/audioCodec/
+  sampleRate/channels。**e2e 对拍**：两段 3s 源各裁 2s → 320x240
+  @15，与 ffmpeg concat filter 对照五点位灰度帧平均 |Δ| 实测
+  0.75–1.62、容差 3.0（只准收紧）；帧数/时长/双轨形态全对齐。
+  时间线合成全集（叠加/变速/旋转/混音/转场）与 seek 快进归 M4
+  后续批次。
 - 2026-10-26（晚）：M3 补齐——真码控 + AAC-LC 编码 + convert 音频
   三态/剥视频，两仓门禁全绿。**真码控**（`ye-codec-h264`
   `encoder/rate.rs`）：`EncoderConfig.bit_rate`（既有字段）由编码器
