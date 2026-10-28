@@ -12,7 +12,7 @@
 //! |---------|------|----------|
 //! | `mp4`   | 是   | MP4 容器读写（`ye::container::mp4`，即 `ye-container-mp4`：解封装 + 封装，progressive 与 fMP4；含 `Demuxer`/`Muxer` trait 接线与 `register_mp4` 注册） |
 //! | `h264` | 否 | H.264 解码主链（`ye::codec_h264`，即 `ye-codec-h264`：Annex B/AVCC 输入，I 帧 CAVLC 闭环至 yuv420p `VideoFrame`；含 `register_h264` 注册——取代 `codec-stubs` 中 H.264 解码桩的位置） |
-//! | `aac` | 否 | AAC-LC 解码主链（`ye::codec_aac`，即 `ye-codec-aac`：ADTS/LOAS/esds 输入，noiseless 码表 + 重量化 + M/S 强度 + TNS + IMDCT 至 packed f32 `AudioFrame`，时戳透传；含 `register_aac` 注册——取代 `codec-stubs` 中 AAC 解码桩的位置） |
+//! | `aac` | 否 | AAC-LC 解码+编码（`ye::codec_aac`，即 `ye-codec-aac`：解码——ADTS/LOAS/esds 输入，noiseless 码表 + 重量化 + M/S 强度 + TNS + IMDCT 至 packed f32 `AudioFrame`，时戳透传；编码——packed f32 输入，心理声学 + 前向 MDCT + 码率环/FIL 填充的恒定码率 → ADTS 包体（长窗 SCE/CPE），带外参数 `AacEncoder::audio_specific_config`/`esds_extradata` 与自由函数 `esds_extradata`；含 `register_aac`/`register_aac_encoder` 注册——解码侧取代 `codec-stubs` 中 AAC 解码桩的位置，编码侧接管 AAC 编码位） |
 //! | `png` | 否 | PNG 编码（`ye::png`，即 `ye-png`：encode-only，RGBA8 → PNG，自实现 deflate（stored/fixed-Huffman）+ CRC32 + zlib 包装 + None/Sub 自适应行过滤，零第三方依赖；无损性经 ffmpeg oracle 逐字节 0 容差对拍——剪的抽帧缩略图出口） |
 //! | `codec-stubs` | 否 | M2+ 编解码桩的聚合入口 `ye::stubs::codec`（H.264/AAC × 解码/编码；注册可查、可构造，`feed`/`pull` 即 `UnsupportedStub`——桩本体在 `ye-codec` 恒编译，本 feature 把「依赖桩」记进依赖声明） |
 //! | `filter-stubs` | 否 | M2+ 处理图桩的聚合入口 `ye::stubs::filter`（`FilterGraph` 组装真实生效，`topological_order` 即 `Unsupported`——语义同上） |

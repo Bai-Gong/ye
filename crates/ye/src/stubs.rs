@@ -11,18 +11,17 @@
 //! 桩的语义边界（可构造 / 可查询 / 调用即 Unsupported）、里程碑文案
 //! 与替换路径见 docs/contracts.md「M2+ 接口桩契约」一节。
 
-/// 编解码桩（`ye-codec` 根级 re-export 的桩面）：H.264/AAC 解码 +
-/// AAC 编码（H.264 编码桩已随 M3 真实现删除——2026-10-26，
-/// `register_h264_encoder` 接管其注册位，见 [`crate::codec_h264`]）。
+/// 编解码桩（`ye-codec` 根级 re-export 的桩面）：H.264/AAC 解码占位
+/// （编码桩已全部随真实现删除——H.264 2026-10-26 M3、AAC-LC 2026-10-26
+/// M3 补齐，`register_h264_encoder`/`register_aac_encoder` 接管编码
+/// 注册位，见 [`crate::codec_h264`]/[`crate::codec_aac`]）。
 ///
-/// 注册后 `supports_*`/`*_ids` 可查，`create_*` 一律成功；
+/// 注册后 `supports_*`/`decoder_ids` 可查，`create_decoder` 一律成功；
 /// `feed`/`pull` 调用即 [`ye::codec::CodecError::UnsupportedStub`]
 /// （文案含交付去向标注），`flush` 无操作。
 #[cfg(feature = "codec-stubs")]
 pub mod codec {
-    pub use ye_codec::{
-        aac_decoder_factory, aac_encoder_factory, h264_decoder_factory, register_stubs,
-    };
+    pub use ye_codec::{aac_decoder_factory, h264_decoder_factory, register_stubs};
 }
 
 /// 处理图（`ye-filter`）：图组装与拓扑排序真实生效（M3 处理图最小集

@@ -22,8 +22,8 @@ use ye::codec::{
 };
 use ye::container::ContainerRegistry;
 use ye::convert::{
-    ConvertError, ConvertProgress, PixelOps, VideoChain, VideoEncodeSettings, convert,
-    convert_frames, filter_ops,
+    AudioEncodeSettings, ConvertError, ConvertProgress, PixelOps, VideoChain, VideoEncodeSettings,
+    convert, convert_frames, filter_ops,
 };
 use ye::pixfmt::PixelFormat;
 use ye::time::{Rational, Timestamp};
@@ -490,6 +490,7 @@ fn encode_mode_reencodes_and_scales() {
         },
         gop: 12,
         quality: QualityMode::Qp(24),
+        bit_rate: None,
     };
     let progress_log = std::sync::Mutex::new(Vec::new());
     let progress: ConvertProgress<'_> = &|p, t| progress_log.lock().unwrap().push((p, t));
@@ -501,7 +502,8 @@ fn encode_mode_reencodes_and_scales() {
         open_vector(&vector("h264-ip-testsrc2-176x144.mp4")),
         "mp4",
         Box::new(std::io::BufWriter::new(out_file)),
-        &settings,
+        Some(&settings),
+        &AudioEncodeSettings::Copy,
         filter_ops(),
         progress,
         &cancel,
@@ -605,7 +607,8 @@ fn encode_mode_audio_passthrough() {
         open_vector(&vector("aac-44k1-st-m4a.mp4")),
         "mp4",
         Box::new(std::io::BufWriter::new(out_file)),
-        &settings,
+        Some(&settings),
+        &AudioEncodeSettings::Copy,
         filter_ops(),
         &|_, _| {},
         &AtomicBool::new(false),
@@ -667,7 +670,8 @@ fn encode_mode_cancel_before_start() {
         input,
         "mp4",
         Box::new(std::io::BufWriter::new(out_file)),
-        &VideoEncodeSettings::default(),
+        Some(&VideoEncodeSettings::default()),
+        &AudioEncodeSettings::Copy,
         filter_ops(),
         progress,
         &cancel,
@@ -692,7 +696,8 @@ fn encode_mode_encoder_not_registered() {
         open_vector(&vector("h264-ip-testsrc2-176x144.mp4")),
         "mp4",
         Box::new(Cursor::new(Vec::new())),
-        &VideoEncodeSettings::default(),
+        Some(&VideoEncodeSettings::default()),
+        &AudioEncodeSettings::Copy,
         filter_ops(),
         &|_, _| {},
         &AtomicBool::new(false),

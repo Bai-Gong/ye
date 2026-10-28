@@ -6,12 +6,12 @@
 //! （不属 `cargo test --workspace` 的默认门槛，见 docs/contracts.md
 //! 「M2+ 接口桩契约」）。
 //!
-//! 2026-10-26 随 M3 编码收口更新：**H.264 编码桩已删除**
-//! （`register_stubs` 收窄为 解码×2 + AAC 编码，H.264 编码经真工厂
-//! `ye_codec_h264::encoder_factory` 注册）；**处理图桩已由
-//! `topological_order` 真实现取代**（M3 处理图最小集，`Unsupported`
-//! 变体随之删除）——两 feature 的聚合入口保留为「本构建依赖桩面/
-//! 处理图最小面」的显式标记，语义断言随实际面同步。
+//! 2026-10-26 随 M3 编码收口更新：**H.264 编码桩已删除**；同日 M3 补齐
+//! **AAC-LC 编码桩删除**（`register_stubs` 收窄为 解码×2，编码位分别经
+//! 真工厂 `ye_codec_h264::encoder_factory` / `ye_codec_aac::encoder_factory`
+//! 注册）；**处理图桩已由 `topological_order` 真实现取代**（M3 处理图
+//! 最小集，`Unsupported` 变体随之删除）——两 feature 的聚合入口保留为
+//! 「本构建依赖桩面/处理图最小面」的显式标记，语义断言随实际面同步。
 
 #![cfg(any(feature = "codec-stubs", feature = "filter-stubs"))]
 #![forbid(unsafe_code)]
@@ -30,13 +30,17 @@ mod codec_stubs {
         // 可查询：注册项经 supports_* / *_ids 可见
         assert!(reg.supports_decoder(CodecId::H264));
         assert!(reg.supports_decoder(CodecId::Aac));
-        assert!(reg.supports_encoder(CodecId::Aac));
-        // H.264 编码桩已删（M3 真实现接管）：桩注册表不再提供该位
+        // 编码桩已全部删除（H.264：M3 真实现接管；AAC-LC：M3 补齐真
+        // 实现接管）：桩注册表不再提供任何编码位
         assert!(
             !reg.supports_encoder(CodecId::H264),
             "H.264 编码桩已随真实现删除，桩注册表不得再提供"
         );
-        assert_eq!(reg.encoder_ids().collect::<Vec<_>>(), vec![CodecId::Aac]);
+        assert!(
+            !reg.supports_encoder(CodecId::Aac),
+            "AAC 编码桩已随真实现删除，桩注册表不得再提供"
+        );
+        assert_eq!(reg.encoder_ids().collect::<Vec<_>>(), Vec::new());
         // 可构造：任意参数一律成功，codec_id() 可查
         let mut dec = reg
             .create_decoder(&CodecParameters::new(CodecId::H264, MediaType::Video))

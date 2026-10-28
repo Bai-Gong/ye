@@ -24,6 +24,9 @@
 //! - [`params`]：参数集定形（T5）——level 查表（H.264 表 A-1/A-3
 //!   子集取最小满足项）与 avcC 写侧构造（`AvcConfigRecord::parse`
 //!   的写侧对偶）；
+//! - [`rate`]：单程码控（虚拟缓冲反馈，M3 后续批次）——CBR（`Qp`
+//!   模式 QP 游走追目标）/ A-VBR（`Crf` 模式上限封顶）的纯整数
+//!   控制器，`adapter` 逐帧接线（基 QP 调制 + 包位数回灌）；
 //! - [`adapter`]：`ye_codec::Encoder` 接线（T5）——[`H264Encoder`]
 //!   （AVCC + avcC extradata 输出、按 `EncoderConfig.time_base` 打戳、
 //!   GOP/质量模式）与 [`encoder_factory`]。
@@ -44,6 +47,7 @@ pub(crate) mod mb;
 pub(crate) mod motion;
 pub(crate) mod params;
 pub(crate) mod pframe;
+pub(crate) mod rate;
 pub(crate) mod transform;
 
 pub use adapter::{H264Encoder, ReconFrame, encoder_factory};

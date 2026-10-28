@@ -364,6 +364,14 @@ pub fn scalefactor_huff() -> &'static HuffTable {
     })
 }
 
+/// scalefactor 差分码表（编码向）：`(codes, bits)`，下标 = Huffman
+/// 符号 = **差分值 + 60**（差分 ∈ −60..=60 → 符号 0..=120）。
+/// 编码 = 按符号取 code/len（与 [`codebook_codes`]/[`codebook_bits`]
+/// 同口径），解码向检索走 [`scalefactor_huff`]。
+pub fn scalefactor_codes() -> (&'static [u32], &'static [u8]) {
+    (&d::SCALEFACTOR_CODE, &d::SCALEFACTOR_BITS)
+}
+
 // ---------------------------------------------------------------------------
 // 运行时生成表
 // ---------------------------------------------------------------------------

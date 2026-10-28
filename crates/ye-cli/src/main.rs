@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         Ok(ye_cli::Command::Convert {
             input,
             output,
-            size,
+            options,
         }) => {
             // CLI 形态即接入契约示范：进度回调（逐输出包触发）+ 取消
             // 旗标。命令行无交互取消入口，旗标恒 false；进度打 stderr，
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
                 }
             };
             let cancel = AtomicBool::new(false);
-            match ye_cli::convert(&input, &output, size, &progress, &cancel) {
+            match ye_cli::convert(&input, &output, &options, &progress, &cancel) {
                 Ok(report) => {
                     print!("{report}");
                     ExitCode::SUCCESS

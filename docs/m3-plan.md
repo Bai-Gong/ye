@@ -389,8 +389,19 @@ avcC 写侧构造，经 `Sps`/`AvcConfigRecord::parse` 回环）；门面
 
 ## 7. 后续批次（不施工，只登记）
 
+> **M3 补齐实录（2026-10-26 晚）**：本节第 1 条（AAC-LC 编码）与
+> 第 2 条的单程部分（CBR 风味/A-VBR）、第 4 条的拒绝面收窄增量已随
+> M3 补齐交付——AAC 编码桩删除、convert 音频三态/剥视频/`bit_rate`
+> 接线、`ye convert` 增 `--vb/--audio/--no-video`、锻 probe 增
+> sampleRate/channels，两仓门禁全绿（详见 roadmap.md 修订记录与
+> contracts.md「AAC-LC 编码器输出契约」「锻的最小 API 面」）。
+> **仍未施工**：2-pass、完整 CRF、分块 inter 模式与多参考帧（第 2
+> 条余量）、B 帧/CABAC/High 编码（第 3 条，前置 CABAC 解码真流对拍
+> 收口未变）、改帧率（fps 参数未接）。
+
 1. **AAC-LC 编码器**（ye-codec-aac 编码侧；届时删 AAC 编码桩，
-   convert 音频编码槽解锁；T5 裁决 10 的文案届时再随交付更新）；
+   convert 音频编码槽解锁；T5 裁决 10 的文案届时再随交付更新）——
+   **已随 M3 补齐交付（2026-10-26）**；
 2. **H.264 真码控**：CBR/A-VBR、2-pass、完整 CRF；分块 inter 模式
    （16x8/8x16/8x8）与多参考帧；
 3. **B 帧 / CABAC / High Profile 编码**（前置：CABAC 解码真流对拍

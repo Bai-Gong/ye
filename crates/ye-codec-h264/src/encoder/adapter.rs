@@ -20,12 +20,18 @@
 //!   位级回环验证（`tests/encode_h264.rs`）与消费方预览共用；长编码
 //!   的内存代价由调用方自理（逐帧消费后 [`clear_recon`]）。
 //!
-//! ## 质量模式
+//! ## 质量模式与码控
 //!
 //! [`QualityMode::Qp`] 透传恒定 QP；[`QualityMode::Crf`] 为**启发式**
 //! 简单 CRF——基 QP = crf 值，按帧内活动度（luma 相邻差均值）加
-//! 0..=4 的 ΔQP（复杂帧更粗，对齐 x264「复杂度升 QP」的方向性）；
-//! 无码控闭环，真 CRF/CBR/2-pass 归后续批次（m3-plan §5 裁决 5）。
+//! 0..=4 的 ΔQP（复杂帧更粗，对齐 x264「复杂度升 QP」的方向性）。
+//!
+//! [`EncoderConfig::bit_rate`] 接单程码控（`encoder::rate`，m3-plan
+//! §7.2 批次）：`None` 时码控缺席、行为与首轮逐字节一致；`Some(bps)` +
+//! `Qp` → CBR 风味（QP 自基值受虚拟缓冲反馈游走、平均码率趋近 bps）；
+//! `Some(bps)` + `Crf` → A-VBR（基 QP 走活动度启发式，码控只作上限
+//! 约束，对标 ffmpeg `-crf c -maxrate b -bufsize 2b`）。2-pass/完整
+//! CRF 仍归后续批次。
 //!
 //! ## 状态机（trait 契约）
 //!
@@ -45,6 +51,7 @@ use ye_time::{Rational, Timestamp};
 use crate::encoder::frame::YuvSource;
 use crate::encoder::params::{build_avcc, level_for};
 use crate::encoder::pframe::BaselineSession;
+use crate::encoder::rate::RateController;
 use crate::error::H264Error;
 
 /// 运动估计搜索范围（像素，双侧）。Baseline 首轮固定值——配置面归
@@ -82,6 +89,8 @@ pub struct H264Encoder {
     frame_rate: Rational,
     frame_index: u64,
     flushed: bool,
+    /// 单程码控（`bit_rate = Some` 时在场；见模块文档「质量模式与码控」）。
+    rate: Option<RateController>,
 }
 
 impl H264Encoder {
@@ -90,8 +99,9 @@ impl H264Encoder {
     /// # Errors
     /// 配置非法（codec 非本实现/缺视频参数/格式非 yuv420p/宽高 0 或
     /// 奇数/`gop` 为 0/质量值越界（QP、CRF 均 1..=51——0 显式拒绝，
-    /// 形态收紧一律 `Err` 的库风）/帧率非正/时基非正/尺寸×帧率超出
-    /// level 5.2 限额）→ [`CodecError::InvalidArguments`]。
+    /// 形态收紧一律 `Err` 的库风）/帧率非正/时基非正/`bit_rate` 为 0
+    /// 或超出虚拟缓冲算术界/尺寸×帧率超出 level 5.2 限额）→
+    /// [`CodecError::InvalidArguments`]。
     pub fn new(config: &EncoderConfig) -> Result<Self, CodecError> {
         if config.codec != CodecId::H264 {
             return Err(CodecError::InvalidArguments(
@@ -137,6 +147,20 @@ impl H264Encoder {
                 "h264 encoder needs a positive time base",
             ));
         }
+        // 码控（bit_rate）：0/越界值在此拒收（口径见 encoder::rate）。
+        // 帧率与质量模式已在上方校验，控制器构造只剩算术溢出类失败。
+        let rate = match config.bit_rate {
+            None => None,
+            Some(0) => {
+                return Err(CodecError::InvalidArguments(
+                    "h264 encoder needs a positive bit rate (0 rejected)",
+                ));
+            }
+            Some(bps) => Some(
+                RateController::new(bps, video.frame_rate, video.quality)
+                    .map_err(CodecError::InvalidArguments)?,
+            ),
+        };
         let Some(level) = level_for(video.width, video.height, video.frame_rate) else {
             return Err(CodecError::InvalidArguments(
                 "frame size x frame rate exceeds level 5.2 limits",
@@ -161,6 +185,7 @@ impl H264Encoder {
             frame_rate: video.frame_rate,
             frame_index: 0,
             flushed: false,
+            rate,
         })
     }
 
@@ -221,8 +246,9 @@ impl H264Encoder {
         }
     }
 
-    /// 一帧的编码主链：GOP 判定 → 会话编码 → AVCC 包体 → 打戳入队 →
-    /// 重建快照。
+    /// 一帧的编码主链：基 QP（恒定 QP/活动度启发式）→ 码控调制 →
+    /// GOP 判定 → 会话编码 → AVCC 包体 → 打戳入队 → 重建快照 →
+    /// 包位数回灌码控。
     fn encode_frame(&mut self, video: &ye_codec::VideoFrame) -> Result<(), CodecError> {
         let layout = video.layout();
         let (ls, cs) = (layout.plane(0).stride, layout.plane(1).stride);
@@ -233,7 +259,14 @@ impl H264Encoder {
             cr: video.plane(2),
             chroma_stride: cs,
         };
-        let qp = self.qp_for(video.plane(0), ls);
+        // 基 QP 先走恒定 QP / 活动度启发式（&self 借用），码控在场时
+        // 再做虚拟缓冲调制（CBR 游走 / A-VBR 封顶取大）——随后才动
+        // &mut session，借用序天然成立
+        let base_qp = self.qp_for(video.plane(0), ls);
+        let qp = match &self.rate {
+            Some(rc) => rc.next_qp(base_qp),
+            None => base_qp,
+        };
         let idr = self.frame_index.is_multiple_of(u64::from(self.gop));
         let encoded = if idr {
             self.session.encode_idr(&yuv, qp).map_err(codec_err)?
@@ -249,6 +282,12 @@ impl H264Encoder {
             push_avcc_nal(&mut data, pps);
         }
         push_avcc_nal(&mut data, &encoded.nal);
+        // 包体位数（含 IDR 带内参数集——容器/网络侧的真实传输位数），
+        // 出包后回灌码控的虚拟缓冲
+        let frame_bits = i64::try_from(data.len())
+            .ok()
+            .and_then(|len| len.checked_mul(8))
+            .ok_or_else(|| CodecError::InvalidData("packet size exceeds i64 bit count".into()))?;
 
         // 打戳：帧号 × 帧率倒数 重标度到输出时基（无 B 帧 → dts = pts）
         let idx = i64::try_from(self.frame_index)
@@ -269,6 +308,9 @@ impl H264Encoder {
             cb: encoded.recon_cb,
             cr: encoded.recon_cr,
         });
+        if let Some(rc) = self.rate.as_mut() {
+            rc.report_frame(frame_bits, qp);
+        }
         self.frame_index += 1;
         Ok(())
     }
@@ -477,6 +519,24 @@ mod tests {
 
         let mut bad = base_config();
         bad.time_base = Rational::new(0, 1);
+        assert!(matches!(
+            H264Encoder::new(&bad),
+            Err(CodecError::InvalidArguments(_))
+        ));
+
+        // 码控参数：bit_rate = 0 拒收；有效值可构造；越界（虚拟缓冲
+        // 2×bps 溢出 i64）拒收
+        let mut bad = base_config();
+        bad.bit_rate = Some(0);
+        assert!(matches!(
+            H264Encoder::new(&bad),
+            Err(CodecError::InvalidArguments(_))
+        ));
+        let mut ok = base_config();
+        ok.bit_rate = Some(300_000);
+        assert!(H264Encoder::new(&ok).is_ok());
+        let mut bad = base_config();
+        bad.bit_rate = Some(u64::MAX);
         assert!(matches!(
             H264Encoder::new(&bad),
             Err(CodecError::InvalidArguments(_))

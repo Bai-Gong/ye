@@ -11,9 +11,11 @@
 //!   调用方回调（剪的抽帧/波形、单测断言均走这里），不落盘；
 //! - [`convert`]：**编码模式**（锻接入契约的库层形态，M3 集成阶段
 //!   落地）——视频链 `解码 → 处理链（缩放/像素格式）→ H.264 编码
-//!   → MP4 封装`，音频包**直通**（重封装，不重编码；对标
-//!   `ffmpeg -c:v libx264 -c:a copy`）。编码器/封装器均经注入的
-//!   注册表取得，泵本体不依赖具体实现 crate。
+//!   → MP4 封装`，音频三态（[`AudioEncodeSettings`]）：直通（对标
+//!   `-c:a copy`）/ AAC-LC 重编码（对标 `-c:a aac -b:a`）/ 剥轨
+//!   （对标 `-an`）；视频亦可剥轨（`video = None`，对标 `-vn` 的
+//!   纯音频输出）。编码器/封装器均经注入的注册表取得，泵本体不
+//!   依赖具体实现 crate。
 //!
 //! ## 编码模式的轨道策略
 //!
@@ -23,9 +25,15 @@
 //!   帧率分母 tick，整数无舍入——NTSC 等分数帧率下打戳与 muxer 衔接
 //!   校验均精确）；输出包时戳由编码器按帧号重排（输入帧 pts 被忽略，
 //!   见「H.264 编码器输出契约」），首包恒 0；
-//! - **音频轨**（任意路）：包数据/关键帧/时戳原样直通，每轨整体平移
-//!   到首包 dts = 0（progressive MP4 的 stts 从 0 起算，与
-//!   [`remux`](crate::container::remux) 同法）；
+//! - **音频轨**（任意路）按 [`AudioEncodeSettings`] 三态：
+//!   - **直通**：包数据/关键帧/时戳原样，每轨整体平移到首包 dts = 0
+//!     （progressive MP4 的 stts 从 0 起算，与
+//!     [`remux`](crate::container::remux) 同法）；
+//!   - **AAC-LC 重编码**：解码（packed f32）→ 采样累积凑 1024 →
+//!     AAC 编码器 → 原始访问单元写 MP4（esds 模板）；末帧补零到
+//!     1024；输出时戳由编码器按帧号重排（时间线从 0 起算，无平移）；
+//!     采样率/声道沿用源流（无重采样器，改采样率归后续批次）；
+//!   - **剥轨**：不进输出容器；
 //! - **字幕等轨道**：丢弃（不进输出容器）。
 //!
 //! ## avcC 的取得（`Encoder` trait 无配置回读面）
@@ -64,14 +72,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ye_codec::{
-    CodecId, CodecParameters, CodecRegistry, Decoded, Decoder, Encoded, Encoder, EncoderConfig,
-    Frame, MediaType, Packet, QualityMode, VideoEncoderConfig, VideoFrame, VideoParams,
+    AudioEncoderConfig, AudioFrame, AudioParams, CodecId, CodecParameters, CodecRegistry, Decoded,
+    Decoder, Encoded, Encoder, EncoderConfig, Frame, MediaType, Packet, QualityMode,
+    VideoEncoderConfig, VideoFrame, VideoParams,
 };
 use ye_container::{
     ContainerError, ContainerRegistry, Metadata, Muxer, ReadSeek, Stream, StreamTemplate, WriteSeek,
 };
 use ye_filter::{FilterError as FilterKernelError, Yuv420pBuffer, Yuv420pView, YuvRange};
-use ye_pixfmt::{ColorRange, PixelFormat};
+use ye_pixfmt::{ChannelLayout, ColorRange, PixelFormat, SampleFormat};
 use ye_time::{Rational, TimeError, Timestamp};
 
 /// 微秒时基（进度的报告域）。
@@ -134,12 +143,16 @@ pub struct VideoEncodeSettings {
     pub chain: VideoChain,
     /// GOP（IDR 间隔，帧数）：1 = 全 I 帧，0 非法（编码器工厂拒收）。
     pub gop: u32,
-    /// 质量模式（恒定 QP / 简单 CRF，值域 1..=51）。
+    /// 质量模式（恒定 QP / 简单 CRF，值域 1–51）。
     pub quality: QualityMode,
+    /// 目标码率（bit/s；`None` = 纯质量模式）。`Some` 时编码器启用真码控
+    /// （M3 补齐）：`Qp` 基准 → CBR 风味（QP 受虚拟缓冲反馈调制，平均
+    /// 码率趋近目标）；`Crf` 基准 → A-VBR（CRF 起步、目标码率作封顶）。
+    pub bit_rate: Option<u64>,
 }
 
 impl Default for VideoEncodeSettings {
-    /// 缺省：no-op 链 + GOP 250（对齐 x264 缺省）+ 简单 CRF 23。
+    /// 缺省：no-op 链 + GOP 250（对齐 x264 缺省）+ 简单 CRF 23（无码控）。
     fn default() -> Self {
         VideoEncodeSettings {
             chain: VideoChain {
@@ -148,8 +161,27 @@ impl Default for VideoEncodeSettings {
             },
             gop: 250,
             quality: QualityMode::Crf(23),
+            bit_rate: None,
         }
     }
+}
+
+/// 编码模式（[`convert`]）的音频设置：直通 / AAC-LC 重编码 / 剥轨。
+///
+/// derive 清单：`Debug, Clone, Copy, PartialEq, Eq`（纯值载荷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioEncodeSettings {
+    /// 直通（重封装不重编码；缺省行为，对标 `-c:a copy`）。
+    #[default]
+    Copy,
+    /// AAC-LC 重编码（对标 `-c:a aac -b:a`）：目标码率 bit/s（>0，
+    /// 编码器工厂校验）；采样率/声道沿用源流。
+    Aac {
+        /// 目标码率（bit/s）。
+        bitrate_bps: u32,
+    },
+    /// 剥音轨（输出容器不含音频，对标 `-an`）。
+    Drop,
 }
 
 /// 帧消费回调：过链后的帧（视频已转换/缩放，音频直通）逐帧送达。
@@ -161,7 +193,8 @@ pub type FrameSink<'a> = &'a mut dyn FnMut(Frame) -> Result<(), ConvertError>;
 ///
 /// 帧模式：`streams` = 参与解码的流数、`video_frames`/`audio_frames` =
 /// 出链送达消费方的帧数；编码模式：`streams` = 输出容器的流数、
-/// `video_frames` = 重编码帧数、`audio_frames` = 直通包数。
+/// `video_frames` = 重编码帧数、`audio_frames` = 直通包数或重编码
+/// 输出包数。
 ///
 /// derive 清单：`Debug, Clone, Copy, PartialEq, Eq`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,20 +347,24 @@ pub fn convert_frames(
     })
 }
 
-/// 编码转码：视频链 `解码 → 处理链 → H.264 编码 → MP4 封装`，音频包
-/// 直通（重封装，不重编码）——锻接入契约的库层形态。
+/// 编码转码：视频链 `解码 → 处理链 → H.264 编码 → MP4 封装`，音频按
+/// [`AudioEncodeSettings`] 三态（直通/AAC-LC 重编码/剥轨）——锻接入
+/// 契约的库层形态。
 ///
 /// 行为契约（轨道策略与 avcC 取得见模块文档）：
 ///
-/// - **输入**：`containers` auto-probe 打开 `input`；视频流至多一路
-///   （多路 → [`ConvertError::InvalidArguments`]），视频解码器与 H.264
-///   编码器经 `codecs` 取得（未注册 → `NotRegistered` 透传）；
+/// - **输入**：`containers` auto-probe 打开 `input`；`video = Some(..)` 时
+///   视频流至多一路（多路 → [`ConvertError::InvalidArguments`]），视频
+///   解码器与 H.264 编码器经 `codecs` 取得（未注册 → `NotRegistered`
+///   透传）；`video = None` 剥视频（纯音频输出，对标 `-vn`）；
 /// - **视频链**：解码帧 → [`VideoChain`]（转换槽 → scale 槽，no-op
 ///   跳过）→ 强制 yuv420p（非 yuv420p 再过转换槽）→ H.264 编码；
 ///   输出帧率/时基见模块文档，输出包时戳由编码器按帧号重排；
-/// - **音频**：任意路直通（每轨平移到首包 dts = 0，包数据/关键帧/
-///   pts−dts 偏移原样）；音频包缺 dts → [`ConvertError::InvalidData`]
-///   （无法平移时间线）；
+/// - **音频**：`Copy` 任意路直通（每轨平移到首包 dts = 0，包数据/
+///   关键帧/pts−dts 偏移原样）；音频包缺 dts →
+///   [`ConvertError::InvalidData`]（无法平移时间线）；`Aac` 重编码
+///   （采样率/声道沿用源流，采样累积凑 1024、末帧补零）；`Drop`
+///   剥轨；
 /// - **封装**：`output_format` 点名 muxer（如 `"mp4"`）；封装头延迟到
 ///   首个视频包（avcC 就绪）或 EOF（纯音频）；字幕轨丢弃；
 /// - **进度/取消**：逐输出包上报、每包检查点（见模块文档）；
@@ -338,10 +375,11 @@ pub fn convert_frames(
 ///
 /// 见 [`ConvertError`] 各变体；下层解封装/解码/编码/封装失败原样包装
 /// 透出。
-// 9 个参数（超 clippy 默认上限）：与 `convert_frames` 同理——注册表 ×2 /
-// 输入 / 输出格式名 / 输出 / 视频设置 / 像素槽 / 进度 / 取消各占一席
-// 即锻契约的参数形态；输出格式名单列（非硬编码 "mp4"）保持泵对容器
-// 注册表中立，编码槽当前固定 H.264（参数面随真编码配置演进）。
+// 10 个参数（超 clippy 默认上限）：与 `convert_frames` 同理——注册表 ×2 /
+// 输入 / 输出格式名 / 输出 / 视频设置 / 音频设置 / 像素槽 / 进度 / 取消
+// 各占一席即锻契约的参数形态；输出格式名单列（非硬编码 "mp4"）保持泵
+// 对容器注册表中立，编码槽当前固定 H.264 视频 + AAC-LC 音频（参数面随
+// 真编码配置演进）。
 #[allow(clippy::too_many_arguments)]
 pub fn convert(
     containers: &ContainerRegistry,
@@ -349,7 +387,8 @@ pub fn convert(
     input: Box<dyn ReadSeek>,
     output_format: &str,
     output: Box<dyn WriteSeek>,
-    video: &VideoEncodeSettings,
+    video: Option<&VideoEncodeSettings>,
+    audio: &AudioEncodeSettings,
     pixels: PixelOps,
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
@@ -360,16 +399,19 @@ pub fn convert(
     let (_in_format, mut demuxer) = containers.open_demuxer(input)?;
     let header = demuxer.read_header()?;
 
-    // 编码模式单视频轨：多视频流的模板/extradata 编排归后续批次。
-    let video_count = header
-        .streams
-        .iter()
-        .filter(|s| s.media_type == MediaType::Video)
-        .count();
-    if video_count > 1 {
-        return Err(ConvertError::InvalidArguments(format!(
-            "编码模式暂只支持单视频流输入（检测到 {video_count} 路），多视频流归后续批次"
-        )));
+    // 编码模式单视频轨（视频剥轨时无此约束——全部剥掉无从冲突）：
+    // 多视频流的模板/extradata 编排归后续批次。
+    if video.is_some() {
+        let video_count = header
+            .streams
+            .iter()
+            .filter(|s| s.media_type == MediaType::Video)
+            .count();
+        if video_count > 1 {
+            return Err(ConvertError::InvalidArguments(format!(
+                "编码模式暂只支持单视频流输入（检测到 {video_count} 路），多视频流归后续批次"
+            )));
+        }
     }
 
     // total_us = 各流时长（µs）最大值；缺时长贡献 0。
@@ -385,29 +427,57 @@ pub fn convert(
     let mut lanes = Vec::with_capacity(header.streams.len());
     for stream in &header.streams {
         let lane = match stream.media_type {
-            MediaType::Video => Lane::Video(build_video_lane(codecs, stream, video)?),
-            MediaType::Audio => Lane::Audio(AudioLane {
-                template: StreamTemplate {
-                    media_type: MediaType::Audio,
-                    codec: stream.codec.clone(),
-                    time_base: stream.time_base,
-                    frame_rate: None,
-                    metadata: stream.metadata.clone(),
-                },
-                shift: None,
-                out_index: 0,
-            }),
+            // video = None：剥视频（纯音频输出，对标 -vn）。
+            MediaType::Video => match video {
+                Some(settings) => Lane::Video(build_video_lane(codecs, stream, settings)?),
+                None => Lane::Dropped,
+            },
+            MediaType::Audio => match *audio {
+                AudioEncodeSettings::Copy => Lane::Audio(AudioLane::Copy {
+                    template: StreamTemplate {
+                        media_type: MediaType::Audio,
+                        codec: stream.codec.clone(),
+                        time_base: stream.time_base,
+                        frame_rate: None,
+                        metadata: stream.metadata.clone(),
+                    },
+                    shift: None,
+                    out_index: 0,
+                }),
+                AudioEncodeSettings::Aac { bitrate_bps } => Lane::Audio(AudioLane::Encode(
+                    build_audio_encode_lane(codecs, stream, bitrate_bps)?,
+                )),
+                AudioEncodeSettings::Drop => Lane::Dropped,
+            },
             MediaType::Subtitle => Lane::Dropped,
         };
         lanes.push(lane);
     }
 
+    // 剥轨守卫：视频剥除且音频全剥（或无轨）→ 拒绝产出零轨容器
+    // （对标 ffmpeg「输出不含任何流」的失败语义，不静默产空文件）。
+    if !lanes
+        .iter()
+        .any(|lane| matches!(lane, Lane::Video(_) | Lane::Audio(_)))
+    {
+        return Err(ConvertError::InvalidArguments(
+            "剥轨后无输出轨（视频剥除且音频全剥或无音轨），拒绝产出零轨容器".into(),
+        ));
+    }
+
     let muxer = containers.create_muxer(output_format, output)?;
+    let chain = video.map_or(
+        VideoChain {
+            format: None,
+            size: None,
+        },
+        |settings| settings.chain,
+    );
     let mut run = EncodeRun {
         lanes,
         muxer,
         header: HeaderState::Pending(Vec::new()),
-        chain: video.chain,
+        chain,
         pixels,
         processed_us: 0,
         total_us,
@@ -454,7 +524,7 @@ fn build_video_lane(
     let config = EncoderConfig {
         codec: CodecId::H264,
         time_base,
-        bit_rate: None,
+        bit_rate: video.bit_rate,
         video: Some(VideoEncoderConfig {
             width,
             height,
@@ -587,13 +657,148 @@ struct VideoLane {
     out_index: u32,
 }
 
-/// 音频轨状态（直通模板 + 时间线平移量）。
-struct AudioLane {
-    /// 直通模板（源流编解码参数原样、时基沿用源流——同容器直通时
-    /// muxer 重标度恒等）。
+/// AAC-LC 每帧样本数（长窗；编码轨的成帧粒度）。
+const AAC_FRAME_SAMPLES: usize = 1024;
+
+/// 建音频重编码轨（解码器 + AAC 编码器 + esds 模板）。
+///
+/// 采样率/声道沿用源流——无重采样器/混音器（改采样率/声道归后续
+/// 批次）；源流缺采样率/声道参数或超出 AAC 能力面（标准 13 档采样率
+/// × 单/双声道）→ [`ConvertError::InvalidArguments`]。
+fn build_audio_encode_lane(
+    codecs: &CodecRegistry,
+    stream: &Stream,
+    bitrate_bps: u32,
+) -> Result<EncodeAudioLane, ConvertError> {
+    let audio = stream.codec.audio.as_ref().ok_or_else(|| {
+        ConvertError::InvalidArguments(format!(
+            "音频流 #{} 缺采样率/声道参数（容器未携带），无法配置 AAC 编码器",
+            stream.index
+        ))
+    })?;
+    let sample_rate = audio.sample_rate;
+    if sample_rate == 0 {
+        return Err(ConvertError::InvalidArguments(format!(
+            "音频流 #{} 采样率为 0，无法配置 AAC 编码器",
+            stream.index
+        )));
+    }
+    let Some(layout) = audio.channel_layout else {
+        return Err(ConvertError::InvalidArguments(format!(
+            "音频流 #{} 缺声道布局（容器未携带），无法配置 AAC 编码器",
+            stream.index
+        )));
+    };
+    // ChannelLayout 的声道数（u32 → usize 在本库目标平台恒无损；0 声道
+    // 由类型不变式排除）。
+    let channels = layout.channels() as usize;
+    // AAC 访问单元无带内参数集（与视频轨的 avcC 从首 IDR 回收不同），
+    // esds 只能按流参数构造（正本归 ye-codec-aac）。
+    let channels_u8 = u8::try_from(layout.channels())
+        .map_err(|_| ConvertError::InvalidArguments("AAC 声道数超 u8".into()))?;
+    let extradata = aac_esds(sample_rate, channels_u8)?;
+    // 时基 = 1/采样率：1024 样本帧的时戳整数无舍入。
+    let rate = i32::try_from(sample_rate).map_err(|_| {
+        ConvertError::InvalidArguments(format!("音频流 #{} 采样率超 i32 时基域", stream.index))
+    })?;
+    let time_base = Rational::new(1, rate);
+    let config = EncoderConfig {
+        codec: CodecId::Aac,
+        time_base,
+        bit_rate: Some(u64::from(bitrate_bps)),
+        video: None,
+        audio: Some(AudioEncoderConfig {
+            sample_rate,
+            channel_layout: layout,
+            format: SampleFormat::F32,
+        }),
+    };
+    let mut params = CodecParameters::new(CodecId::Aac, MediaType::Audio);
+    params.extradata = Some(extradata);
+    params.audio = Some(AudioParams {
+        sample_rate,
+        channel_layout: Some(layout),
+        sample_format: None,
+    });
+    Ok(EncodeAudioLane {
+        decoder: codecs.create_decoder(&stream.codec)?,
+        encoder: codecs.create_encoder(&config)?,
+        template: StreamTemplate {
+            media_type: MediaType::Audio,
+            codec: params,
+            time_base,
+            frame_rate: None,
+            metadata: Metadata::new(),
+        },
+        samples: Vec::new(),
+        sample_rate,
+        layout,
+        channels,
+        out_index: 0,
+    })
+}
+
+/// AAC-LC 的 esds 载荷（MP4 `mp4a` stsd 直填形态，含 4 字节
+/// version/flags）。构造正本在 `ye-codec-aac`（AudioSpecificConfig 的
+/// 编解码器侧知识）；采样率/声道超出能力面 → `InvalidArguments`。
+#[cfg(feature = "aac")]
+fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
+    ye_codec_aac::esds_extradata(sample_rate, channels).ok_or_else(|| {
+        ConvertError::InvalidArguments(format!(
+            "AAC-LC 能力面不含 采样率 {sample_rate}Hz × {channels} 声道（标准 13 档采样率 × 单/双声道）"
+        ))
+    })
+}
+
+/// 无 `aac` feature：AAC 重编码显式不可用（不静默降级成直通）。
+#[cfg(not(feature = "aac"))]
+fn aac_esds(sample_rate: u32, channels: u8) -> Result<Vec<u8>, ConvertError> {
+    let _ = (sample_rate, channels);
+    Err(ConvertError::InvalidArguments(
+        "AAC-LC 重编码需启用 ye 的 aac feature".into(),
+    ))
+}
+
+/// 音频轨状态：直通（模板 + 平移）或 AAC-LC 重编码（解码 → 编码链）。
+enum AudioLane {
+    /// 直通：源流编解码参数原样、时基沿用源流（同容器直通时 muxer
+    /// 重标度恒等）。
+    Copy {
+        /// 直通模板。
+        template: StreamTemplate,
+        /// 该轨整体平移量（首包 dts；`None` = 未遇首包）。
+        shift: Option<Timestamp>,
+        /// 输出流号（`write_header` 时分配）。
+        out_index: u32,
+    },
+    /// AAC-LC 重编码（解码 packed f32 → 采样累积凑 1024 → 编码）。
+    Encode(EncodeAudioLane),
+}
+
+/// 音频轨的输出流号（直通/编码两态共用的读取面）。
+fn audio_out_index(lane: &AudioLane) -> u32 {
+    match lane {
+        AudioLane::Copy { out_index, .. } => *out_index,
+        AudioLane::Encode(lane) => lane.out_index,
+    }
+}
+
+/// AAC-LC 重编码轨状态。
+struct EncodeAudioLane {
+    /// 源流解码器（输入压缩包 → packed f32 音频帧）。
+    decoder: Box<dyn Decoder>,
+    /// AAC 编码器（1024 样本帧 → 原始访问单元）。
+    encoder: Box<dyn Encoder>,
+    /// 输出模板（esds extradata 构造即可用；时间线从 0 起算无平移）。
     template: StreamTemplate,
-    /// 该轨整体平移量（首包 dts；`None` = 未遇首包）。
-    shift: Option<Timestamp>,
+    /// 采样累积缓冲（packed f32 交错；凑满 `AAC_FRAME_SAMPLES` 帧出一帧）。
+    samples: Vec<f32>,
+    /// 采样率（成帧 `AudioFrame` 的参数面）。
+    sample_rate: u32,
+    /// 声道布局（成帧 `AudioFrame` 的参数面）。
+    layout: ChannelLayout,
+    /// 声道数（一帧 = `AAC_FRAME_SAMPLES × channels` 个采样）。
+    channels: usize,
     /// 输出流号（`write_header` 时分配）。
     out_index: u32,
 }
@@ -624,7 +829,7 @@ struct EncodeRun<'a> {
 }
 
 impl EncodeRun<'_> {
-    /// 主循环分流：视频轨喂解码器并排空，音频轨直通，其余丢弃。
+    /// 主循环分流：视频轨喂解码器并排空，音频轨直通或重编码，其余丢弃。
     fn handle_packet(&mut self, packet: Packet) -> Result<(), ConvertError> {
         let index = usize::try_from(packet.stream_index).unwrap_or(usize::MAX);
         if matches!(self.lanes.get(index), Some(Lane::Video(_))) {
@@ -632,8 +837,13 @@ impl EncodeRun<'_> {
                 lane.decoder.feed(&packet)?;
             }
             self.drain_video_decoder(index)?;
+        } else if matches!(
+            self.lanes.get(index),
+            Some(Lane::Audio(AudioLane::Encode(_)))
+        ) {
+            self.push_audio_encode(index, packet)?;
         } else if matches!(self.lanes.get(index), Some(Lane::Audio(_))) {
-            self.push_audio(index, packet)?;
+            self.push_audio_copy(index, packet)?;
         } // 字幕等未接轨道：丢弃。
         Ok(())
     }
@@ -707,30 +917,146 @@ impl EncodeRun<'_> {
         Ok(())
     }
 
-    /// 音频包直通：平移到首包 dts = 0 → 缓冲（头未落）或直写 → 进度。
-    fn push_audio(&mut self, index: usize, mut packet: Packet) -> Result<(), ConvertError> {
+    /// 音频包直通：平移到首包 dts = 0 → 落包（计数/进度/缓冲或直写）。
+    fn push_audio_copy(&mut self, index: usize, mut packet: Packet) -> Result<(), ConvertError> {
         let Some(dts) = packet.dts else {
             return Err(ConvertError::InvalidData(format!(
                 "音频流原索引 {index} 的包缺 dts，直通封装需要它定时间线"
             )));
         };
         let shift = match self.lanes.get_mut(index) {
-            Some(Lane::Audio(lane)) => *lane.shift.get_or_insert(dts),
+            Some(Lane::Audio(AudioLane::Copy { shift, .. })) => *shift.get_or_insert(dts),
             _ => return Ok(()),
         };
         packet.dts = Some(dts.checked_sub(shift)?);
         if let Some(pts) = packet.pts {
             packet.pts = Some(pts.checked_sub(shift)?);
         }
+        let report_at = packet.dts;
+        self.emit_audio_packet(index, packet, report_at)
+    }
+
+    /// 音频重编码：包喂解码器 → 排空解码出的音频帧入累积缓冲。
+    fn push_audio_encode(&mut self, index: usize, packet: Packet) -> Result<(), ConvertError> {
+        if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) {
+            lane.decoder.feed(&packet)?;
+        }
+        self.drain_audio_decoder(index)
+    }
+
+    /// 排空音频解码器：拉出的帧采样并入累积缓冲（凑满即成帧编码）。
+    fn drain_audio_decoder(&mut self, index: usize) -> Result<(), ConvertError> {
+        loop {
+            let pulled = match self.lanes.get_mut(index) {
+                Some(Lane::Audio(AudioLane::Encode(lane))) => lane.decoder.pull()?,
+                _ => return Ok(()),
+            };
+            match pulled {
+                Decoded::Frame(Frame::Audio(frame)) => self.accumulate_audio(index, frame)?,
+                // 音频解码器出视频帧是实现违约：容忍忽略（视频轨同款态度）。
+                Decoded::Frame(Frame::Video(_)) => {}
+                Decoded::NeedInput | Decoded::Finished => return Ok(()),
+            }
+        }
+    }
+
+    /// 解码帧的采样并入累积缓冲（packed f32 交错 → f32 流）。
+    fn accumulate_audio(&mut self, index: usize, frame: AudioFrame) -> Result<(), ConvertError> {
+        if frame.format() != SampleFormat::F32 {
+            return Err(ConvertError::InvalidData(format!(
+                "音频解码帧须为 packed f32（AAC 重编码链的输入面），收到 {:?}",
+                frame.format()
+            )));
+        }
+        let bytes = frame.data();
+        if !bytes.len().is_multiple_of(4) {
+            return Err(ConvertError::InvalidData(
+                "音频解码帧字节数非 4 的倍数（packed f32 破损）".into(),
+            ));
+        }
+        if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) {
+            lane.samples.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
+        }
+        self.flush_audio_chunks(index)
+    }
+
+    /// 累积缓冲凑满 1024 样本即成帧喂编码器并排空输出（可能多帧）。
+    fn flush_audio_chunks(&mut self, index: usize) -> Result<(), ConvertError> {
+        loop {
+            let frame = {
+                let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) else {
+                    return Ok(());
+                };
+                let need = AAC_FRAME_SAMPLES * lane.channels;
+                if lane.samples.len() < need {
+                    return Ok(());
+                }
+                let mut frame = AudioFrame::new(
+                    SampleFormat::F32,
+                    lane.layout,
+                    lane.sample_rate,
+                    AAC_FRAME_SAMPLES,
+                    None,
+                )?;
+                let data = frame.data_mut();
+                for (i, sample) in lane.samples.drain(..need).enumerate() {
+                    data[i * 4..i * 4 + 4].copy_from_slice(&sample.to_le_bytes());
+                }
+                Frame::Audio(frame)
+            };
+            if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) {
+                lane.encoder.feed(&frame)?;
+            }
+            self.drain_audio_encoder(index)?;
+        }
+    }
+
+    /// 排空音频编码器输出队列（编码逐帧同步，常态一帧一包）。
+    fn drain_audio_encoder(&mut self, index: usize) -> Result<(), ConvertError> {
+        loop {
+            let packet = match self.lanes.get_mut(index) {
+                Some(Lane::Audio(AudioLane::Encode(lane))) => match lane.encoder.pull()? {
+                    Encoded::Packet(p) => Some(p),
+                    Encoded::NeedInput | Encoded::Finished => None,
+                },
+                _ => None,
+            };
+            let Some(packet) = packet else { return Ok(()) };
+            let pts = packet.pts;
+            self.emit_audio_packet(index, packet, pts)?;
+        }
+    }
+
+    /// 落一个音频输出包：计数 → 进度 → 缓冲（头未落；按**输入流索引**
+    /// 入缓冲，输出流号在落头冲出时才分配改写）或直写。
+    fn emit_audio_packet(
+        &mut self,
+        index: usize,
+        mut packet: Packet,
+        report_at: Option<Timestamp>,
+    ) -> Result<(), ConvertError> {
         self.audio_frames += 1;
-        self.report(packet.dts)?;
+        self.report(report_at)?;
         if let HeaderState::Pending(buffer) = &mut self.header {
-            // 头未落（视频首包未到）：缓冲，落头后原序冲出。
+            // 头未落（视频首包未到）：缓冲，落头后原序冲出。缓冲包统一带
+            // **输入流索引**——直通包天然如此；编码包自带 0（Encoder 契约
+            // stream_index 恒 0），须改写回输入轨位，否则剥视频（音轨输入
+            // 索引 ≠ 0）时冲出循环按 0 回查会命中被剥轨、静默丢包
+            // （2026-10-26 M3 补齐 e2e 实测回归）。
+            if let Ok(input_index) = u32::try_from(index) {
+                packet.stream_index = input_index;
+            }
             buffer.push(packet);
             return Ok(());
         }
         let out_index = match self.lanes.get(index) {
-            Some(Lane::Audio(lane)) => lane.out_index,
+            Some(Lane::Audio(lane)) => audio_out_index(lane),
             _ => return Ok(()),
         };
         packet.stream_index = out_index;
@@ -771,9 +1097,22 @@ impl EncodeRun<'_> {
                     });
                 }
                 Lane::Audio(lane) => {
-                    lane.out_index = next_index;
+                    let template = match lane {
+                        AudioLane::Copy {
+                            template,
+                            out_index,
+                            ..
+                        } => {
+                            *out_index = next_index;
+                            template.clone()
+                        }
+                        AudioLane::Encode(encode) => {
+                            encode.out_index = next_index;
+                            encode.template.clone()
+                        }
+                    };
                     next_index += 1;
-                    templates.push(lane.template.clone());
+                    templates.push(template);
                 }
                 Lane::Video(_) | Lane::Dropped => {}
             }
@@ -784,25 +1123,34 @@ impl EncodeRun<'_> {
             // 缓冲包的 stream_index 还是输入流索引：改写到该轨的输出流号。
             let index = usize::try_from(packet.stream_index).unwrap_or(usize::MAX);
             if let Some(Lane::Audio(lane)) = self.lanes.get(index) {
-                packet.stream_index = lane.out_index;
+                packet.stream_index = audio_out_index(lane);
                 self.muxer.write_packet(&packet)?;
             }
         }
         Ok(())
     }
 
-    /// 收尾：逐视频轨排空（解码器 flush → 帧过链编码 → 编码器 flush）、
-    /// 头仍未落则按音频-only 落头、写容器尾、汇总统计。
+    /// 收尾：逐轨排空（视频/音频解码器 flush → 帧过链编码 → 编码器
+    /// flush；音频重编码轨先补零成帧）、头仍未落则按音频-only 落头、
+    /// 写容器尾、汇总统计。
     fn finish(&mut self) -> Result<ConvertStats, ConvertError> {
         for index in 0..self.lanes.len() {
-            if let Some(Lane::Video(lane)) = self.lanes.get_mut(index) {
-                lane.decoder.flush();
+            match self.lanes.get_mut(index) {
+                Some(Lane::Video(lane)) => lane.decoder.flush(),
+                Some(Lane::Audio(AudioLane::Encode(lane))) => lane.decoder.flush(),
+                _ => {}
             }
             self.drain_video_decoder(index)?;
+            self.drain_audio_decoder(index)?;
+            self.flush_audio_padding(index)?;
             if let Some(Lane::Video(lane)) = self.lanes.get_mut(index) {
                 lane.encoder.flush();
             }
+            if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) {
+                lane.encoder.flush();
+            }
             self.drain_encoder(index)?;
+            self.drain_audio_encoder(index)?;
         }
         // 无视频输出包（纯音频输入或零帧视频轨）：音频-only 模板落头。
         if matches!(self.header, HeaderState::Pending(_)) {
@@ -816,6 +1164,27 @@ impl EncodeRun<'_> {
             processed_us: self.processed_us,
             total_us: self.total_us,
         })
+    }
+
+    /// 末尾补帧：重编码轨累积缓冲有余量采样（< 1024×channels）→ 补零
+    /// 到一帧出包（时长对齐源流的最后一拍；空缓冲不动）。
+    fn flush_audio_padding(&mut self, index: usize) -> Result<(), ConvertError> {
+        let padded = match self.lanes.get_mut(index) {
+            Some(Lane::Audio(AudioLane::Encode(lane))) => {
+                let need = AAC_FRAME_SAMPLES * lane.channels;
+                if lane.samples.is_empty() {
+                    false
+                } else {
+                    lane.samples.resize(need, 0.0);
+                    true
+                }
+            }
+            _ => false,
+        };
+        if padded {
+            self.flush_audio_chunks(index)?;
+        }
+        Ok(())
     }
 
     /// 进度上报：时戳（自带时基）换 µs 取单调最大值后回调。
@@ -1168,7 +1537,7 @@ mod tests {
     use ye_codec::PacketFlags;
     use ye_pixfmt::ColorDesc;
 
-    /// 缺省设置：no-op 链 + GOP 250 + 简单 CRF 23。
+    /// 缺省设置：no-op 链 + GOP 250 + 简单 CRF 23（无码控）。
     #[test]
     fn encode_settings_default() {
         let s = VideoEncodeSettings::default();
@@ -1181,6 +1550,13 @@ mod tests {
         );
         assert_eq!(s.gop, 250);
         assert_eq!(s.quality, QualityMode::Crf(23));
+        assert_eq!(s.bit_rate, None, "缺省无码控（纯质量模式）");
+    }
+
+    /// 音频设置缺省：直通（重封装不重编码）。
+    #[test]
+    fn audio_settings_default_is_copy() {
+        assert_eq!(AudioEncodeSettings::default(), AudioEncodeSettings::Copy);
     }
 
     /// 帧率推导：标称值优先；缺则 样例数÷时长 精确归约；劣化输入 None。

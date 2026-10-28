@@ -34,14 +34,46 @@ ye — 百工·冶命令行（媒体探查 / 转码）
 用法:
   ye probe <FILE>        探查媒体文件：每路流的编解码、宽高/采样率、时基、时长、帧率、码率
   ye remux <IN> <OUT>    重封装直通（解封装→封装，不转码；输入格式自动探测，输出 MP4）
-  ye convert <IN> <OUT> [--size 宽x高]
-                         转码：视频重编码为 H.264 Baseline（--size 如 320x240 控制缩放），
-                         音频直通不重编码；输出 MP4
+  ye convert <IN> <OUT> [选项]
+                         转码输出 MP4：视频 H.264 Baseline 重编码（--size 320x240 缩放、
+                         --vb 800 视频码率封顶 kbps、--no-video 剥视频），
+                         音频 --audio copy 直通 / --audio aac:128 AAC-LC 重编码（kbps）
   ye --help              显示本帮助
   ye --version           显示版本
 
 当前支持: MP4 解封装与封装（progressive 与 fMP4 读写），probe/remux/convert 可用。
 convert 的参数形态即锻（duan）的进程内接入契约（进度回调 + AtomicBool 取消）。";
+
+/// `convert` 的转码选项（解析层定形，`--vb`/`--audio`/`--no-video`）。
+///
+/// derive 清单：`Debug, Clone, Copy, PartialEq, Eq, Default`（纯值载荷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConvertOptions {
+    /// 目标尺寸 `--size 宽x高`（`None` = 保持原尺寸）。
+    pub size: Option<(u32, u32)>,
+    /// 视频码率封顶 `--vb kbps`（`None` = 纯质量模式简单 CRF 23；
+    /// `Some` = A-VBR：CRF 23 基准 + 目标码率封顶）。
+    pub video_bitrate_kbps: Option<u32>,
+    /// 音频设置 `--audio`（缺省直通）。
+    pub audio: ConvertAudio,
+    /// `--no-video`：剥视频（纯音频输出）。
+    pub no_video: bool,
+}
+
+/// `--audio` 的值域（copy / aac:kbps）。
+///
+/// derive 清单：`Debug, Clone, Copy, PartialEq, Eq, Default`（纯值载荷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvertAudio {
+    /// 直通（重封装不重编码）。
+    #[default]
+    Copy,
+    /// AAC-LC 重编码（目标码率 kbps）。
+    Aac {
+        /// 目标码率（kbps）。
+        kbps: u32,
+    },
+}
 
 /// 解析后的子命令。
 #[derive(Debug, PartialEq, Eq)]
@@ -50,12 +82,12 @@ pub enum Command {
     Probe { path: PathBuf },
     /// `ye remux <IN> <OUT>`。
     Remux { input: PathBuf, output: PathBuf },
-    /// `ye convert <IN> <OUT> [--size 宽x高]`。
+    /// `ye convert <IN> <OUT> [选项]`。
     Convert {
         input: PathBuf,
         output: PathBuf,
-        /// 目标尺寸 `(宽, 高)`（`--size`；`None` = 保持原尺寸）。
-        size: Option<(u32, u32)>,
+        /// 转码选项（尺寸/码率/音频/剥视频）。
+        options: ConvertOptions,
     },
     /// `ye --help` / `ye -h`。
     Help,
@@ -111,10 +143,13 @@ fn parse_two_paths(name: &str, rest: &[OsString]) -> Result<(PathBuf, PathBuf), 
     }
 }
 
-/// `ye convert <IN> <OUT> [--size 宽x高]`：两个位置路径 + 可选 `--size`。
+/// `ye convert <IN> <OUT> [选项]`：两个位置路径 + 可选
+/// `--size`/`--vb`/`--audio`/`--no-video`。
 fn parse_convert(rest: &[OsString]) -> Result<Command, String> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    let mut size: Option<(u32, u32)> = None;
+    let mut options = ConvertOptions::default();
+    let mut audio_seen = false;
+    let mut no_video_seen = false;
     let mut i = 0usize;
     while i < rest.len() {
         if rest[i].to_str() == Some("--size") {
@@ -123,11 +158,45 @@ fn parse_convert(rest: &[OsString]) -> Result<Command, String> {
                     "`--size` 需要一个 `宽x高` 值（如 320x240）。\n\n{USAGE}"
                 ));
             };
-            if size.is_some() {
+            if options.size.is_some() {
                 return Err(format!("`--size` 只能出现一次。\n\n{USAGE}"));
             }
-            size = Some(parse_size(value)?);
+            options.size = Some(parse_size(value)?);
             i += 2;
+            continue;
+        }
+        if rest[i].to_str() == Some("--vb") {
+            let Some(value) = rest.get(i + 1) else {
+                return Err(format!("`--vb` 需要一个 kbps 数值（如 800）。\n\n{USAGE}"));
+            };
+            if options.video_bitrate_kbps.is_some() {
+                return Err(format!("`--vb` 只能出现一次。\n\n{USAGE}"));
+            }
+            options.video_bitrate_kbps = Some(parse_kbps(&value.to_string_lossy(), "--vb")?);
+            i += 2;
+            continue;
+        }
+        if rest[i].to_str() == Some("--audio") {
+            let Some(value) = rest.get(i + 1) else {
+                return Err(format!(
+                    "`--audio` 需要一个值：copy 或 aac:kbps（如 aac:128）。\n\n{USAGE}"
+                ));
+            };
+            if audio_seen {
+                return Err(format!("`--audio` 只能出现一次。\n\n{USAGE}"));
+            }
+            options.audio = parse_audio(value)?;
+            audio_seen = true;
+            i += 2;
+            continue;
+        }
+        if rest[i].to_str() == Some("--no-video") {
+            if no_video_seen {
+                return Err(format!("`--no-video` 只能出现一次。\n\n{USAGE}"));
+            }
+            options.no_video = true;
+            no_video_seen = true;
+            i += 1;
             continue;
         }
         if paths.len() == 2 {
@@ -142,7 +211,7 @@ fn parse_convert(rest: &[OsString]) -> Result<Command, String> {
         2 => Ok(Command::Convert {
             input: paths[0].clone(),
             output: paths[1].clone(),
-            size,
+            options,
         }),
         0 => Err(format!("`convert` 需要输入与输出两个文件参数。\n\n{USAGE}")),
         _ => Err(format!(
@@ -171,6 +240,35 @@ fn parse_size(value: &OsString) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+/// `--vb`/`--audio aac:` 的 kbps 值解析（十进制、1..=4_000_000）。
+fn parse_kbps(text: &str, flag: &str) -> Result<u32, String> {
+    let bad =
+        |range: String| format!("`{flag}` 的值须为 kbps 数值（{range}），收到 {text}。\n\n{USAGE}");
+    let Ok(kbps) = text.parse::<u32>() else {
+        return Err(bad("十进制".into()));
+    };
+    if kbps == 0 || kbps > 4_000_000 {
+        return Err(bad("1..=4000000".into()));
+    }
+    Ok(kbps)
+}
+
+/// `--audio` 值解析：`copy` 直通 / `aac:kbps` 重编码。
+fn parse_audio(value: &OsString) -> Result<ConvertAudio, String> {
+    let text = value.to_string_lossy();
+    if text == "copy" {
+        return Ok(ConvertAudio::Copy);
+    }
+    if let Some(kbps) = text.strip_prefix("aac:") {
+        return Ok(ConvertAudio::Aac {
+            kbps: parse_kbps(kbps, "--audio aac:")?,
+        });
+    }
+    Err(format!(
+        "`--audio` 的值须为 copy 或 aac:kbps（如 aac:128），收到 {text}。\n\n{USAGE}"
+    ))
+}
+
 /// 命令行自用的容器注册表：MP4 demuxer/muxer 已注册（显式构造、
 /// 显式传递——注册表无全局单例，见 ye-container 契约）。
 pub fn registry() -> ContainerRegistry {
@@ -179,12 +277,15 @@ pub fn registry() -> ContainerRegistry {
     reg
 }
 
-/// 命令行自用的编解码注册表：H.264 解码 + 编码真工厂已注册（音频
-/// 直通不重编码、无需 AAC 解码器；显式构造、显式传递）。
+/// 命令行自用的编解码注册表：H.264 解码/编码 + AAC 解码/编码真工厂
+/// 已注册（直通路径用不到 AAC，`--audio aac` 重编码需要；显式构造、
+/// 显式传递）。
 pub fn codec_registry() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
     ye::codec_h264::register_h264(&mut reg);
     ye::codec_h264::register_h264_encoder(&mut reg);
+    ye::codec_aac::register_aac(&mut reg);
+    ye::codec_aac::register_aac_encoder(&mut reg);
     reg
 }
 
@@ -354,11 +455,15 @@ pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
 /// （Tauri 事件层），ye 只提供进程内的每任务回调。
 pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);
 
-/// `ye convert <IN> <OUT> [--size 宽x高]`：视频重编码为 H.264
-/// （可选缩放），音频直通（不重编码），输出 MP4。
+/// `ye convert <IN> <OUT> [选项]`：视频重编码为 H.264（可选缩放/码率
+/// 封顶/剥视频），音频直通或 AAC-LC 重编码（`--audio`），输出 MP4。
 ///
 /// 接线门面 [`ye::convert::convert`]（锻接入契约的命令行形态）：
-/// - `size`：`--size` 目标尺寸（`None` = 保持原尺寸）；
+/// - `options.size`：`--size` 目标尺寸（`None` = 保持原尺寸）；
+/// - `options.video_bitrate_kbps`：`--vb` 视频码率封顶（`None` = 纯
+///   质量模式简单 CRF 23）；
+/// - `options.audio`：`--audio copy|aac:kbps`；
+/// - `options.no_video`：`--no-video` 剥视频（纯音频输出）；
 /// - `progress`：进度回调（逐输出包上报，`processed_us` 单调不减）；
 /// - `cancel`：取消旗标 `&AtomicBool`——置位即请求取消，泵每包检查、
 ///   及时退出。
@@ -368,12 +473,12 @@ pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);
 pub fn convert(
     input: &Path,
     output: &Path,
-    size: Option<(u32, u32)>,
+    options: &ConvertOptions,
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let ctx = || format!("{} → {}", input.display(), output.display());
-    let result = run_convert(input, output, size, progress, cancel);
+    let result = run_convert(input, output, options, progress, cancel);
     if result.is_err() {
         // 半成品清理：泵已随错误丢弃输出 writer（文件句柄关闭），
         // 这里删除残留文件（不存在时忽略）。
@@ -381,21 +486,39 @@ pub fn convert(
     }
     result
         .map(|stats| {
-            let target = match size {
-                Some((w, h)) => format!("（H.264 {w}x{h}）"),
-                None => "（H.264）".to_string(),
+            let video_desc = match (options.no_video, options.size) {
+                (true, _) => "，视频剥除".to_string(),
+                (false, Some((w, h))) => {
+                    format!("（H.264 {w}x{h}{}）", vb_desc(options))
+                }
+                (false, None) => format!("（H.264{}）", vb_desc(options)),
+            };
+            let audio_desc = match options.audio {
+                ConvertAudio::Copy => "直通".to_string(),
+                ConvertAudio::Aac { kbps } => {
+                    format!("AAC-LC 重编码（目标 {kbps}kbps）")
+                }
             };
             format!(
-                "{} → {}: MP4, {} 路流, 视频 {} 帧重编码{}, 音频 {} 包直通\n",
+                "{} → {}: MP4, {} 路流, 视频 {} 帧重编码{}, 音频 {} 包{}\n",
                 input.display(),
                 output.display(),
                 stats.streams,
                 stats.video_frames,
-                target,
-                stats.audio_frames
+                video_desc,
+                stats.audio_frames,
+                audio_desc
             )
         })
         .map_err(|e| format!("{}: {e}", ctx()))
+}
+
+/// `--vb` 的报告后缀（空 = 纯质量模式）。
+fn vb_desc(options: &ConvertOptions) -> String {
+    match options.video_bitrate_kbps {
+        Some(kbps) => format!("，码率封顶 {kbps}kbps"),
+        None => String::new(),
+    }
 }
 
 /// `convert` 的主体（打开文件 → 门面泵 → 统计），错误带路径上下文
@@ -403,15 +526,32 @@ pub fn convert(
 fn run_convert(
     input: &Path,
     output: &Path,
-    size: Option<(u32, u32)>,
+    options: &ConvertOptions,
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
 ) -> Result<ye::convert::ConvertStats, String> {
     let in_file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let out_file = File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
     let settings = ye::convert::VideoEncodeSettings {
-        chain: ye::convert::VideoChain { format: None, size },
+        chain: ye::convert::VideoChain {
+            format: None,
+            size: options.size,
+        },
+        bit_rate: options
+            .video_bitrate_kbps
+            .map(|kbps| u64::from(kbps) * 1_000),
         ..Default::default()
+    };
+    let video = if options.no_video {
+        None
+    } else {
+        Some(&settings)
+    };
+    let audio = match options.audio {
+        ConvertAudio::Copy => ye::convert::AudioEncodeSettings::Copy,
+        ConvertAudio::Aac { kbps } => ye::convert::AudioEncodeSettings::Aac {
+            bitrate_bps: kbps.saturating_mul(1_000),
+        },
     };
     ye::convert::convert(
         &registry(),
@@ -419,7 +559,8 @@ fn run_convert(
         Box::new(BufReader::new(in_file)),
         "mp4",
         Box::new(BufWriter::new(out_file)),
-        &settings,
+        video,
+        &audio,
         ye::convert::filter_ops(),
         progress,
         cancel,

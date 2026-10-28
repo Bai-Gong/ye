@@ -227,6 +227,78 @@ fn convert_end_to_end() {
     let _ = std::fs::remove_file(&dst);
 }
 
+/// `--no-video --audio aac:96`：纯音频输出——单 aac 轨、参数与源一致、
+/// 时长一致、ffmpeg 无错解码、实测码率落在目标容差内（M3 补齐）。
+#[test]
+fn convert_audio_reencode_end_to_end() {
+    if !tools_ok() {
+        eprintln!("跳过：PATH 无 ffmpeg/ffprobe（convert_audio_reencode_end_to_end）");
+        return;
+    }
+    let dir = tmp("convert_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("src-audio.mp4");
+    let dst = dir.join("out-audio-96k.mp4");
+    gen_source(&src);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_ye"))
+        .arg("convert")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--no-video")
+        .arg("--audio")
+        .arg("aac:96")
+        .output()
+        .expect("启动 ye 二进制失败");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        run.status.success(),
+        "`ye convert --no-video --audio aac:96` 应以 0 退出，stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 路流") && stdout.contains("剥除") && stdout.contains("96kbps"),
+        "stdout 应含纯音频转码摘要，实际:\n{stdout}"
+    );
+    eprintln!("---- ye convert（纯音频）实际输出 ----\n{stdout}---------------------------");
+
+    // ffmpeg 解码无错。
+    let decode = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&dst)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("启动 ffmpeg 失败");
+    assert!(
+        decode.status.success() && decode.stderr.is_empty(),
+        "输出应可被 ffmpeg 无错解码：{}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+
+    // 流参数：单 aac 轨、44.1kHz、声道随源（lavfi sine 默认单声道 → SCE）。
+    let jb = ffprobe_streams_json(&dst);
+    assert_eq!(json_fields(&jb, "codec_name"), vec!["aac"]);
+    assert_eq!(json_fields(&jb, "sample_rate"), vec!["44100"]);
+    assert_eq!(json_fields(&jb, "channels"), vec!["1"]);
+    let (da, db) = (container_duration(&src), container_duration(&dst));
+    assert!((da - db).abs() <= 0.1, "时长应一致：源 {da}s vs 输出 {db}s");
+    let bit_rate: f64 = json_fields(&jb, "bit_rate")
+        .first()
+        .expect("aac 流应带 bit_rate")
+        .parse()
+        .expect("bit_rate 应为数值");
+    // 帧内码率环从细侧向预算收敛：简单内容（正弦）常落在预算下方，
+    // 容差取 [0.5, 1.4]×96k（按实测记录收紧的依据见 ye-codec-aac
+    // oracle 测试——那边才是收敛性的正本）。
+    assert!(
+        (48_000.0..=134_400.0).contains(&bit_rate),
+        "实测码率 {bit_rate} 应落在 96k×[0.5,1.4] 容差内"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
 // —— 参数解析（不需要 ffmpeg）——
 
 /// 坏尺寸报用法错误（lib 层直调解析）。
@@ -259,4 +331,52 @@ fn parse_args_rejects_bad_convert_usage() {
         .is_err(),
         "--size 非数字应报用法错误"
     );
+    assert!(
+        ye_cli::parse_args(&[
+            OsString::from("convert"),
+            OsString::from("a.mp4"),
+            OsString::from("b.mp4"),
+            OsString::from("--audio"),
+            OsString::from("mp3:128"),
+        ])
+        .is_err(),
+        "--audio 非 copy/aac 值应报用法错误"
+    );
+    assert!(
+        ye_cli::parse_args(&[
+            OsString::from("convert"),
+            OsString::from("a.mp4"),
+            OsString::from("b.mp4"),
+            OsString::from("--vb"),
+            OsString::from("0"),
+        ])
+        .is_err(),
+        "--vb 0 应报用法错误"
+    );
+}
+
+/// M3 补齐旗标面：--vb/--audio/--no-video 解析成功且落位。
+#[test]
+fn parse_args_accepts_m3_completion_flags() {
+    use std::ffi::OsString;
+    let cmd = ye_cli::parse_args(&[
+        OsString::from("convert"),
+        OsString::from("a.mp4"),
+        OsString::from("b.mp4"),
+        OsString::from("--size"),
+        OsString::from("320x240"),
+        OsString::from("--vb"),
+        OsString::from("800"),
+        OsString::from("--audio"),
+        OsString::from("aac:128"),
+        OsString::from("--no-video"),
+    ])
+    .expect("合法旗标组合应解析成功");
+    let ye_cli::Command::Convert { options, .. } = cmd else {
+        panic!("应解析为 Convert：{cmd:?}");
+    };
+    assert_eq!(options.size, Some((320, 240)));
+    assert_eq!(options.video_bitrate_kbps, Some(800));
+    assert_eq!(options.audio, ye_cli::ConvertAudio::Aac { kbps: 128 });
+    assert!(options.no_video);
 }

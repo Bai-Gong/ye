@@ -11,6 +11,10 @@
 「H.264 编码器输出契约」与「处理图最小集契约」两节，并同步收窄
 桩契约（H.264 编码桩删除、AAC 编码桩文案改后续批次）。M3 集成阶段
 （2026-10-27）convert 编码槽从桩换真实现（见「锻的最小 API 面」）。
+**M3 补齐（2026-10-26 晚）**：真码控（`EncoderConfig.bit_rate` 由
+H.264 编码器消费，CBR/A-VBR）+ AAC-LC 编码器（`register_aac_encoder`，
+AAC 编码桩随交付删除）+ convert 音频三态与剥视频（见「锻的最小
+API 面」签名块）。
 
 > 2026-10-24 合流后：本文 m1 侧各节（`ye-time` / `ye-pixfmt` /
 > `ye-container-mp4` / `ye-cli` / `Mp4Writer` 及 feature 链）描述的是
@@ -219,10 +223,11 @@ ye/png          →  dep:ye-png            →  ye::png               （默认�
 「M2+ 接口桩契约」）：显式开启即把「本构建依赖桩」记进依赖声明。
 `h264` feature 同时汇总**编码器**
 （`register_h264_encoder`/`H264Encoder`/`encoder_factory`）与解码器
-（`register_h264`）；`aac`/`png` 语义不变（AAC 编码桩保留至
-`ye-codec-aac` 编码侧交付，见「M2+ 接口桩契约」）。**ye-cli 的
-feature 声明 2026-10-27 起为 `["mp4", "h264"]`**（convert 真转码需要
-H.264 解码 + 编码真工厂；音频直通不重编码，无需 `aac`）。
+（`register_h264`）；`aac` 同构汇总**编码器**
+（`register_aac_encoder`，2026-10-26 M3 补齐）与解码器
+（`register_aac`）；`png` 语义不变。**ye-cli 的 feature 声明 2026-10-26
+M3 补齐起为 `["mp4", "h264", "aac"]`**（`--audio aac` 重编码需要
+AAC 解码 + 编码真工厂；直通路径用不到）。
 
 ## ye-time（基础类型层）
 
@@ -506,20 +511,26 @@ ffmpeg 造 3s 176x144 H.264(Baseline)+AAC 双轨源 → 真二进制
 （视频 320x240、音频与源一致）+ 时长（±0.1s）与帧数（逐帧相等）
 对拍；PATH 无工具即整组跳过，临时文件全落 `CARGO_TARGET_TMPDIR`。
 
-## 锻的最小 API 面（M3 接入契约，2026-10-24 定形；convert 2026-10-27 集成阶段真实现）
+## 锻的最小 API 面（M3 接入契约，2026-10-24 定形；convert 2026-10-27 集成阶段真实现，2026-10-26 M3 补齐增音频三态/剥视频/码率）
 
 锻（duan）以 Tauri 后端 cargo 依赖接入，最小面 = `probe`（M1 已
 可用）/ `remux`（M1 已可用）/ `convert`（**M3 集成阶段已真实现**：
-视频重编码 H.264 + MP4 封装、音频包直通）。调用形态三层：`probe`
+视频重编码 H.264 + MP4 封装；音频三态——直通 / AAC-LC 重编码 /
+剥轨；视频可剥〔`video = None`，纯音频输出〕）。调用形态三层：`probe`
 在 `ye_cli` lib（`ye-cli/src/lib.rs`）；`remux` 在门面
 `ye::container::remux`；convert 泵在门面 `ye::convert`
 （`crates/ye/src/convert.rs`）——CLI 子命令即同一契约的命令行形态
-（`ye convert <IN> <OUT> [--size 宽x高]`）。
+（`ye convert <IN> <OUT> [--size 宽x高] [--vb kbps]
+[--audio copy|aac:kbps] [--no-video]`）。
 
 ```rust
 // ye_cli lib（ye-cli/src/lib.rs）
 pub fn probe(path: &Path) -> Result<String, String>;    // 报告文本（含末尾换行）
-pub fn convert(input: &Path, output: &Path, size: Option<(u32, u32)>,
+pub struct ConvertOptions { pub size: Option<(u32, u32)>,
+                            pub video_bitrate_kbps: Option<u32>,
+                            pub audio: ConvertAudio, pub no_video: bool }
+pub enum ConvertAudio { Copy, Aac { kbps: u32 } }        // --audio 的值域
+pub fn convert(input: &Path, output: &Path, options: &ConvertOptions,
                progress: ConvertProgress<'_>, cancel: &AtomicBool)
     -> Result<String, String>;   // 失败即删半成品输出文件
 pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);    // (processed_us, total_us)
@@ -538,8 +549,15 @@ pub type ScaleFn = fn(&VideoFrame, u32, u32) -> Result<VideoFrame, ConvertError>
 pub struct PixelOps { pub convert: PixelConvertFn, pub scale: ScaleFn }  // 像素核槽（注入）
 pub struct VideoChain { pub format: Option<PixelFormat>, pub size: Option<(u32, u32)> }
 pub struct VideoEncodeSettings { pub chain: VideoChain, pub gop: u32,
-                                 pub quality: QualityMode }
-    // Default：no-op 链 + GOP 250 + Crf(23)；编码槽固定 H.264
+                                 pub quality: QualityMode,
+                                 pub bit_rate: Option<u64> }
+    // Default：no-op 链 + GOP 250 + Crf(23) + 无码控；编码槽固定 H.264。
+    // bit_rate = Some → 真码控（M3 补齐）：Qp 基准 → CBR 风味、
+    // Crf 基准 → A-VBR（-crf c -maxrate b 对标），见 H.264 编码器
+    // 输出契约
+pub enum AudioEncodeSettings { Copy, Aac { bitrate_bps: u32 }, Drop }
+    // 音频三态（M3 补齐）：直通（Default）/ AAC-LC 重编码（采样率/
+    // 声道沿用源流，无重采样器）/ 剥轨
 pub fn convert_frames(containers: &ContainerRegistry, codecs: &CodecRegistry,
                       input: Box<dyn ReadSeek>, chain: VideoChain, pixels: PixelOps,
                       sink: &mut dyn FnMut(Frame) -> Result<(), ConvertError>,
@@ -548,12 +566,16 @@ pub fn convert_frames(containers: &ContainerRegistry, codecs: &CodecRegistry,
     // 帧消费模式（M2 主路径）：固定链 解码→像素转换→scale→帧回调
 pub fn convert(containers: &ContainerRegistry, codecs: &CodecRegistry,
                input: Box<dyn ReadSeek>, output_format: &str,
-               output: Box<dyn WriteSeek>, video: &VideoEncodeSettings,
+               output: Box<dyn WriteSeek>, video: Option<&VideoEncodeSettings>,
+               audio: &AudioEncodeSettings,
                pixels: PixelOps, progress: ConvertProgress<'_>, cancel: &AtomicBool)
     -> Result<ConvertStats, ConvertError>;
-    // 编码模式（M3 集成落地）：视频 解码→处理链→强制 yuv420p→H.264
-    // 编码→`output_format` 点名 muxer 封装；音频包直通（每轨平移到
-    // 首包 dts=0）；字幕轨丢弃；单视频流（多路显式 InvalidArguments）
+    // 编码模式（M3 集成落地，M3 补齐扩展）：视频 解码→处理链→强制
+    // yuv420p→H.264 编码→`output_format` 点名 muxer 封装；audio 三态
+    // （Copy 每轨平移到首包 dts=0 / Aac 解码→凑 1024→编码→esds 模板
+    // / Drop）；video = None 剥视频（纯音频输出，多视频流不再拒收）；
+    // 剥光（无输出轨）显式 InvalidArguments；字幕轨丢弃；单视频流
+    // （video 在场时多路显式 InvalidArguments）
 pub struct ConvertStats { pub streams: usize, pub video_frames: u64,
                           pub audio_frames: u64, pub processed_us: i64, pub total_us: i64 }
 pub enum ConvertError { Cancelled, Sink(String), InvalidArguments(String),
@@ -667,10 +689,19 @@ rgba8/rgb24 转换、yuv420p/rgba8 域双线性 scale，色彩范围取帧
   忽略**；B 帧缺席故 dts = pts（无重排）；duration = 一帧时长；
   `stream_index` 恒 0（流号归封装侧改写）。GOP：帧号 0, N, 2N, … 为
   IDR。
-- **质量模式语义**：`Qp(q)` 恒定 QP 直取；`Crf(c)` 为**启发式**简单
-  CRF——基 QP = c，按帧内活动度（luma 相邻差均值）加 0..=4 的 ΔQP
-  （复杂帧更粗，方向对齐 x264）；无码控闭环，CBR/2-pass/完整 CRF
-  归后续批次。运动估计搜索范围首轮固定 ±16px（可配归真码控批次）。
+- **质量模式语义（M3 补齐后）**：`Qp(q)` 恒定 QP 直取；`Crf(c)` 为
+  **启发式**简单 CRF——基 QP = c，按帧内活动度（luma 相邻差均值）加
+  0..=4 的 ΔQP（复杂帧更粗，方向对齐 x264）。**真码控**
+  （`EncoderConfig.bit_rate = Some(bps)`，2026-10-26 M3 补齐）：
+  虚拟缓冲单程反馈（`encoder/rate.rs`，纯整数 i64——容量 2×bps 对齐
+  锻 ffmpeg 引擎 `-bufsize 2b` 口径、目标水位半满、ΔQP 单帧 ±4 钳
+  制、QP 1..=51）；`Qp` 基准 → CBR 风味（QP 自基值积分游走，平均
+  码率趋近目标），`Crf` 基准 → A-VBR（游走仅在与活动度基 QP 取大时
+  生效，对标 `-crf c -maxrate b`）；`bit_rate = None` 逐字节恒等
+  于纯质量模式（回归锁定）；`Some(0)` 工厂拒收。实测：CBR 300k
+  +9.3% / 800k −0.7%（±25% 容差带内不贴边），A-VBR Crf(18)+300k
+  封顶落到无封顶的 35.6%。2-pass/完整 CRF 归后续批次。运动估计
+  搜索范围固定 ±16px（可配归后续批次）。
 - **重建快照**：本地解码环逐帧重建经 `H264Encoder::recon_frames()`
   暴露（`clear_recon` 释放）——位级回环验证与消费方预览共用，
   长编码内存代价由调用方自理。
@@ -695,6 +726,38 @@ rgba8/rgb24 转换、yuv420p/rgba8 域双线性 scale，色彩范围取帧
   PSNR 对拍（运动方块族）暴露。修复后以
   `fwd_dct4x4_matches_n_rows_matrix`（蝶形 == N·r·Nᵀ 逐元素）锁死，
   `satd_4x4` 同源笔误一并修正。
+
+## AAC-LC 编码器输出契约（M3 补齐，2026-10-26）
+
+实现 crate：`ye-codec-aac`（`encoder` 目录：bitwriter/psy/quant/
+section/element，公共面 `encoder_factory` 与自由函数
+`esds_extradata(sample_rate, channels)`）；门面注册
+`ye::codec_aac::register_aac_encoder`（`aac` feature，替换桩语义）。
+范围 = AAC-LC 长窗（ONLY_LONG、sine 窗、帧长 1024）、无 TNS/PNS/
+M-S/短块（absence 位合法流）。
+
+- **配置面**：`EncoderConfig` 的 `codec = Aac` + `audio` 在场 +
+  `bit_rate = Some(bps)`（>0；**码率是唯一质量旋钮**，None 工厂
+  拒收）；声道仅单/双（SCE / CPE〔common_window=1、ms_mask=0，两
+  声道独立编码〕）；采样率限 ASC 标准 13 档；输入 packed f32
+  （`SampleFormat::F32`）交错。1024 样本一包、逐帧同步（flush 收
+  前视缓冲至多两包）；包 pts 按帧号 × 1024/采样率 重标度到
+  `time_base`。
+- **码流形态**：`Packet.data` = raw_data_block（裸访问单元，MP4
+  esds 直填形态）；码率环从细侧向预算收敛、**FIL 填充元素按字节
+  补齐到恒定码率**（低熵内容也满足码率门）；TDAC 前视 framing
+  （交付帧 ∥ 下一帧），包 pts 与交付样本严格对齐。
+- **带外参数**：`esds_extradata` 构造完整 esds 载荷（4 字节
+  version/flags + ES_Descriptor 链，内含 ASC），MP4 `mp4a` stsd 的
+  extradata 直填；自家解码器双形态（含/不含版本前缀）均可消费。
+- **对拍口径**：①自家解码 PCM == 编码侧量化谱 IMDCT 逆变换（逐位
+  一致）；②ffmpeg 解码我们的 ADTS 退出码 0 且帧数 = ceil(样本/
+  1024)；③自家解码 vs ffmpeg 解码同一 ADTS 逐样本 100% |Δ|≤1e-5
+  （实测 8.9e-8，按实测收紧）；④SNR ≥ 18dB（128k 立体声 AM 正弦，
+  实测 28.2dB，跳过首 1024 priming 样本）；⑤码率命中目标 ±20%
+  （实测 +0.5%/+0.2%）。工具缺席分级 skip（`tests/common` 三档
+  定位器），在场失败不许 skip。回归
+  `crates/ye-codec-aac/tests/encode_oracle.rs`。
 
 ## 处理图最小集契约（M3 T6，2026-10-26）
 
@@ -750,18 +813,17 @@ M2+ 才交付的能力（解码/编码/处理图）先以**接口桩**占位：�
    `CodecError::UnsupportedStub(&'static str)`，文案**含交付去向标注**
    （供调用方与测试识别）；`flush` 无操作（实现交付前状态机无意义）。
 
-**覆盖清单（2026-10-26 M3 收口后）**：
+**覆盖清单（2026-10-26 M3 补齐后）**：
 
 - `ye-codec` 桩（`stubs` 模块，根级 re-export `register_stubs`）收窄为
-  **三项**：H.264 解码 / AAC 解码（真实现已随 M2 交付，桩文案维持
-  「桩：M2 交付」、仅接口占位用途）+ **AAC 编码**（文案改后续批次
-  标注「桩：AAC-LC 编码归后续批次」——m3-plan §5 裁决 10：原「M3
-  交付」已过期，AAC-LC 编码移出 M3，届时随交付删桩）。**H.264 编码
-  桩已删除**（`h264_encoder_factory` 消失）：注册位由
-  `ye-codec-h264` 的 `encoder_factory` 接管（门面
-  `register_h264_encoder`）——桩注册表上
-  `supports_encoder(H264)` 为假、`create_encoder(H264)` →
-  `NotRegistered`，经真工厂注册后恢复。
+  **两项**：H.264 解码 / AAC 解码（真实现已随 M2 交付，桩文案维持
+  「桩：M2 交付」、仅接口占位用途）。**H.264 编码桩已删除**
+  （`h264_encoder_factory` 消失）：注册位由 `ye-codec-h264` 的
+  `encoder_factory` 接管（门面 `register_h264_encoder`）；**AAC 编码
+  桩已随 M3 补齐删除**（`aac_encoder_factory` 消失）：注册位由
+  `ye-codec-aac` 的 `encoder_factory` 接管（门面
+  `register_aac_encoder`）——桩注册表上 `supports_encoder` 对两者
+  均为假、`create_encoder` → `NotRegistered`，经真工厂注册后恢复。
 - `ye-filter`：**处理图桩已随 M3 处理图最小集删除**——
   `topological_order` 为 Kahn 真实现、`FilterError::Unsupported` 变体
   移除（见「处理图最小集契约」）。
@@ -777,30 +839,30 @@ workspace 门槛）——断言随收窄更新：H.264 编码在桩注册表上�
 经真工厂（dev 依赖直连）注册后可查且校验参数；处理图组装 + 拓扑
 排序真行为经聚合入口成立。
 
-**替换路径（更新）**：H.264 解码/编码与处理图调度已完成真实现替换
-（M2/M3）；剩余桩 = AAC 编码——`ye-codec-aac` 编码侧交付后
-`register_stubs` 收窄为解码×2 或整体删除（届时 AAC 编码工厂接管
-`CodecId::Aac` 编码注册位）。
+**替换路径（更新）**：H.264 解码/编码、处理图调度、AAC-LC 编码均
+已完成真实现替换（M2/M3/M3 补齐）；桩面仅剩 H.264/AAC 解码占位
+（真实现早已在场，桩只为接口试验保留），`register_stubs` 收窄为
+解码×2（2026-10-26 M3 补齐）。
 
-## 测试基线（M3 集成阶段后，2026-10-27）
+## 测试基线（M3 补齐后，2026-10-26）
 
 `cargo test --workspace`（默认 feature 集，ffmpeg/ffprobe 在 PATH 的
-环境实跑全绿），共 **619** 项：
+环境实跑全绿），共 **677** 项：
 
 | crate | 测试 | 说明 |
 | --- | --- | --- |
 | ye-time | 28 | 整除性/往返/舍入/溢出/`i64::MIN` 边界 |
 | ye-pixfmt | 28 | 元数据表/布局公式/紧密切片/错误 |
-| ye-codec | 41 | trait/注册表/参数/包/帧 + 桩语义（收窄后三项面） |
-| ye-codec-h264 | 176 | 码流层 + 解码主链（M2）+ 编码写侧 T2–T5：BitWriter/CAVLC 写侧位级回环、I/P 帧黑盒回环 0 容差、level 查表/avcC 回环、`fwd_dct4x4 == N·r·Nᵀ` 锁死、Encoder 配置校验/状态机/打戳 GOP、conformance 2 项 |
-| ye-codec-aac | 44 | AAC-LC 解码主链（M2）+ conformance 单元 |
+| ye-codec | 40 | trait/注册表/参数/包/帧 + 桩语义（M3 补齐收窄为解码×2，编码桩删除） |
+| ye-codec-h264 | 188 | 码流层 + 解码主链（M2）+ 编码写侧 T2–T5：BitWriter/CAVLC 写侧位级回环、I/P 帧黑盒回环 0 容差、level 查表/avcC 回环、`fwd_dct4x4 == N·r·Nᵀ` 锁死、Encoder 配置校验/状态机/打戳 GOP、conformance 2 项；**M3 补齐 + 码控 12 项**（rate.rs 单元 + CBR 收敛 ±25%〔实测 +9.3%/−0.7%〕/单调性/A-VBR 封顶/None 逐字节回归，`tests/encode_h264.rs`） |
+| ye-codec-aac | 69 | AAC-LC 解码主链（M2）+ conformance 单元；**M3 补齐 + 编码 25 项**（码表逐符号回环、ASC/esds 回环、编码→自家解码位级一致、码率环 + FIL 补齐、ffmpeg oracle：双解码一致 100% |Δ|≤1e-5〔实测 8.9e-8〕/SNR 28.2dB/码率 ±20%，`tests/encode_oracle.rs`） |
 | ye-conformance（辅助 crate） | 26 | 向量清单/校验和/获取脚本 |
 | ye-container | 26 | 契约 trait/注册表/探测 |
 | ye-container-mp4 | 111 | 读取端黄金/变体/错误/回归 + fMP4 读全矩阵 + Mp4Writer progressive/fMP4 + adapter 接线 + ffmpeg/ffprobe oracle 组（PATH 无工具跳过） |
 | ye-filter | 70 | 像素核（M2 scale/转换）+ 处理图最小集（M3：拓扑排序 DAG/环/孤立节点、Crop/Fps/Volume 参数与核、`Timestamp` 化 fps API、oracle 对拍组） |
 | ye-png | 22 | PNG 编码器（M2）+ oracle 组 |
-| ye（门面） | 32 | remux 回归 3 + convert 泵 12（帧模式 7 + **编码模式 4**：重编码+缩放全链回读/音频逐包直通对拍/入口取消/编码器未注册）+ convert 单元 6（设置缺省/帧率推导含 NTSC/avcC 构造与失败面/scale 桥接恒等）+ **编码收口对拍 `encode_h264.rs` 11 项**（三类平滑族 ×QP20/32 位级回环 + PSNR 门槛 36/28 dB + ffmpeg 双解码、LCG 噪声位级/合法性、注册面全链、avcC 回环、CRF 路径；第 11 项为 `h264` feature 门面路径——workspace 运行时经 ye-cli 的 feature 声明统一开启） |
-| ye-cli | 15 | probe 报告/参数解析/二进制端到端 9 + remux e2e 4 + **convert e2e 2**（ffmpeg 造 3s 176x144 H.264+AAC 源 → `ye convert --size 320x240` → ffmpeg 无错解码 + ffprobe 流参数/时长/帧数对拍；PATH 无工具跳过） |
+| ye（门面） | 36 | remux 回归 3 + convert 泵 12（帧模式 7 + 编码模式 4：重编码+缩放全链回读/音频逐包直通对拍/入口取消/编码器未注册）+ convert 单元 6（设置缺省含音频三态缺省/帧率推导含 NTSC/avcC 构造与失败面/scale 桥接恒等）+ 编码收口对拍 `encode_h264.rs` 11 项（第 11 项为 `h264` feature 门面路径——workspace 运行时经 ye-cli 的 feature 声明统一开启）+ **M3 补齐 `convert_audio.rs` 4 项**（纯音频重编码自家回环/双流剥视频丢包回归/剥光守卫/码率接线冒烟）（workspace 统一口径；`-p ye` 单独运行时 feature 门组不计） |
+| ye-cli | 17 | probe 报告/参数解析（含 M3 补齐旗标面）/二进制端到端 9 + remux e2e 4 + convert e2e 2（M3：`--size` 全链；**M3 补齐：`--no-video --audio aac:96` 纯音频**——ffmpeg 无错解码/单 aac 轨/时长对拍/码率容差；PATH 无工具跳过） |
 
 另有非默认 feature 组：`cargo test -p ye --features
 codec-stubs,filter-stubs`（桩聚合回归，含收窄断言）。单元层全为手工

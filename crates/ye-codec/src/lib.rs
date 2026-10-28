@@ -17,9 +17,9 @@
 //!   [`VideoEncoderConfig`]/[`QualityMode`]/[`AudioEncoderConfig`]/
 //!   [`EncoderConfig`]：trait、工厂与编码配置（`codec` 模块）；
 //! - [`CodecRegistry`]：显式注册表（`registry` 模块）；
-//! - [`register_stubs`]/[`h264_decoder_factory`]/[`aac_decoder_factory`]/
-//!   [`aac_encoder_factory`]：M2+ 接口桩的注册与工厂（`stubs` 模块；
-//!   H.264 编码桩已随 M3 真实现删除，见该模块文档）；
+//! - [`register_stubs`]/[`h264_decoder_factory`]/[`aac_decoder_factory`]：
+//!   M2+ 接口桩的注册与工厂（`stubs` 模块；编码桩已全部随真实现删除
+//!   ——H.264 2026-10-26 M3、AAC-LC 2026-10-26 M3 补齐，见该模块文档）；
 //! - [`CodecError`]：本 crate 错误枚举（`error` 模块，包装
 //!   `ye_time::TimeError` 与 `ye_pixfmt::PixfmtError`）。
 //!
@@ -34,8 +34,9 @@
 //! - **桩的语义边界**（`stubs` 模块）：可注册——注册项经
 //!   `supports_*`/`*_ids` 可查；可构造——`create_*`/工厂一律成功；
 //!   不可用——`feed`/`pull` 调用即返回 [`CodecError::UnsupportedStub`]，
-//!   文案注明交付去向（H.264/AAC 解码真实现已随 M2 交付；AAC 编码 →
-//!   后续批次；H.264 编码桩已随 M3 真实现删除），`flush` 无操作；
+//!   文案注明交付去向（H.264/AAC 解码真实现已随 M2 交付；编码桩已
+//!   全部随真实现删除——H.264 2026-10-26 M3、AAC-LC 2026-10-26 M3
+//!   补齐），`flush` 无操作；
 //! - 本 crate 零第三方依赖（仅 std + ye-time + ye-pixfmt）、不含 unsafe；
 //!   panic 仅一处文档写明的编程错误：[`VideoFrame::plane`] 的平面索引
 //!   越界（全库五处中的第⑤处），数据驱动失败一律 `Result`。
@@ -59,4 +60,4 @@ pub use media::{CodecId, MediaType};
 pub use packet::{Packet, PacketFlags};
 pub use params::{AudioParams, CodecParameters, VideoParams};
 pub use registry::CodecRegistry;
-pub use stubs::{aac_decoder_factory, aac_encoder_factory, h264_decoder_factory, register_stubs};
+pub use stubs::{aac_decoder_factory, h264_decoder_factory, register_stubs};

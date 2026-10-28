@@ -447,8 +447,14 @@ fn convert_reports_open_failure_with_path() {
     let cancel = AtomicBool::new(false);
     let called = std::cell::Cell::new(false);
     let progress = |_, _| called.set(true);
-    let err = ye_cli::convert(&missing, &out, None, &progress, &cancel)
-        .expect_err("打开不存在的文件应失败");
+    let err = ye_cli::convert(
+        &missing,
+        &out,
+        &ye_cli::ConvertOptions::default(),
+        &progress,
+        &cancel,
+    )
+    .expect_err("打开不存在的文件应失败");
     assert!(
         err.contains(missing.display().to_string().as_str()),
         "错误信息应含输入路径，实际: {err}"
@@ -534,7 +540,7 @@ fn parse_args_rejects_bad_usage() {
 
 #[test]
 fn parse_args_accepts_convert() {
-    // 裸双路径（size = None）。
+    // 裸双路径（缺省选项：直通、无缩放）。
     let case = parse_args(&[
         OsString::from("convert"),
         OsString::from("in.mp4"),
@@ -545,7 +551,7 @@ fn parse_args_accepts_convert() {
         Ok(Command::Convert {
             input: PathBuf::from("in.mp4"),
             output: PathBuf::from("out.mp4"),
-            size: None
+            options: ye_cli::ConvertOptions::default()
         })
     );
     // --size 在路径后。
@@ -561,7 +567,10 @@ fn parse_args_accepts_convert() {
         Ok(Command::Convert {
             input: PathBuf::from("in.mp4"),
             output: PathBuf::from("out.mp4"),
-            size: Some((320, 240))
+            options: ye_cli::ConvertOptions {
+                size: Some((320, 240)),
+                ..ye_cli::ConvertOptions::default()
+            }
         })
     );
     // --size 在路径间（选项与位置参数可混排）。
@@ -575,7 +584,10 @@ fn parse_args_accepts_convert() {
     assert!(matches!(
         case,
         Ok(Command::Convert {
-            size: Some((320, 240)),
+            options: ye_cli::ConvertOptions {
+                size: Some((320, 240)),
+                ..
+            },
             ..
         })
     ));

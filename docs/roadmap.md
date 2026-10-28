@@ -117,6 +117,31 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
+- 2026-10-26（晚）：M3 补齐——真码控 + AAC-LC 编码 + convert 音频
+  三态/剥视频，两仓门禁全绿。**真码控**（`ye-codec-h264`
+  `encoder/rate.rs`）：`EncoderConfig.bit_rate`（既有字段）由编码器
+  消费——纯整数虚拟缓冲（容量 2×bps 对齐锻 ffmpeg 引擎 `-bufsize 2b`
+  口径），`Qp` 基准 → CBR 风味、`Crf` 基准 → A-VBR（对标
+  `-crf c -maxrate b`）；实测 CBR 300k +9.3% / 800k −0.7%（±25%
+  容差带内不贴边），A-VBR Crf(18)+300k 封顶落到无封顶的 35.6%，
+  `bit_rate=None` 逐字节回归锁定。**AAC-LC 编码**（`ye-codec-aac`
+  `encoder/`：长窗、SCE/CPE〔common_window、无 M/S〕、轻量心理声学 +
+  幂律量化 + 码率环从细侧收敛 + FIL 填充补齐恒定码率，复用解码侧
+  码表/窗核）：ffmpeg 对拍解码退出码 0、自家解码 vs ffmpeg 解码逐
+  样本 100% |Δ|≤1e-5（实测 8.9e-8）、SNR 128k 立体声 28.2dB、码率
+  命中 +0.5%/+0.2%；AAC 编码桩随交付删除（`register_stubs` 收窄为
+  解码×2）。**convert 接线**：`VideoEncodeSettings.bit_rate` +
+  `AudioEncodeSettings`（Copy/Aac/Drop 三态）+ `video=None` 剥视频 +
+  剥光守卫；`ye convert` CLI 增 `--vb`/`--audio copy|aac:kbps`/
+  `--no-video`；实测修掉两处接线 bug——音频包提前写输出流号致落头
+  冲出错轨、编码包自带 stream_index=0 致剥视频双流输入静默丢包
+  （后者补了向量级回归 `strip_video_on_dual_stream_input_keeps_audio`）。
+  **锻侧（duan）**：probe 增 sampleRate/channels；ye 引擎拒绝面收窄
+  ——目标码率（A-VBR）、纯音频预设（mp4 容器 aac）、剥音轨、AAC
+  音频重编码放行，非 MP4 系容器/非 AAC 音源/改采样率/>2 声道明确
+  拒绝；e2e 增纯音频重编码与码率模式两用例；顺带修两处存量红测试
+  （maxHeight 断言逻辑、store 持久化少算 engine 字段）。2-pass/完整
+  CRF/B 帧/CABAC 编码归后续批次（waitlist 不变项）。
 - 2026-10-27：M2 收口——施工 8/8（m2-jian-plan T1–T8）+ 同日解码器分歧
   修复收口，两仓门禁全绿。**接通状态（剪侧，T4–T8）**：probe 双引擎
   （`engine` 参数，auto=ye 优先、疑似封面启发式〔多条视频流 / 短视频流 /

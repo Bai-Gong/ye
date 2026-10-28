@@ -1,6 +1,6 @@
 [package]
 name = "ye-codec-aac"
-description = "百工·冶：AAC-LC 解码——码流语法、重量化、立体声工具、TNS、IMDCT 滤波器组"
+description = "百工·冶：AAC-LC 编解码——码流语法、重量化、立体声工具、TNS、MDCT/IMDCT 滤波器组、心理声学编码（ADTS 出包）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
