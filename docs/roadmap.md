@@ -1,28 +1,9 @@
 # 路线图
 
-<!-- 2026-10-24 合流（B 案）：以下两段分别来自 develop（契约层合流前的
-     原始里程碑）与 m1-mp4（按消费方重排的修订说明），裁决为双方内容
-     都保留；现行排期以下方「里程碑」一节为准。 -->
-
-- **M0（当前）**：仓库骨架、分层约定、文档。
-- **M1**：`ye-time` / `ye-pixfmt` 基础类型；`ye-container-mp4`
-  解封装 + 封装（含 fMP4）。准入需求：`jian` 能列出素材信息。
-  - 第一步（基础类型与核心契约）已完成：`ye-time`、`ye-pixfmt`、
-    `ye-codec`、`ye-container` 四个 crate 的基础类型、trait 与注册表
-    已落地并通过各自单元测试，接口契约详见 `architecture.md`。
-    剩余：`ye-container-mp4` 解封装 + 封装（含 fMP4）。
-- **M2**：H.264 软件解码（先 Baseline，后 High / CABAC / B 帧），
-  以 FFmpeg 为 oracle 建立一致性测试。准入需求：`jian` 时间线可回放。
-- **M3**：处理图最小集（像素格式转换、scale）；`ye probe` / `ye convert`
-  端到端跑通。准入需求：`duan` 完成一次转码任务。
-- **M4**：H.264 软件编码（CRF / CBR、2-pass）；AAC-LC 编解码。
-- **M5**：硬件加速铺开（VideoToolbox / D3D11VA / VA-API / NVENC）；
-  Matroska 容器。
-- **M6+**：HEVC、ProRes、DNxHR、MXF 等，按工具需求排期。
-
-> 2026-10-22 按剪、锻的消费计划重排：里程碑不再按"解码→滤镜→编码"的
-> 库内能力顺序排，而是按消费方接入 ye 的先后排——先到的需求先做，
-> ffmpeg 在对拍期继续给剪/锻顶班。
+冶（ye）的里程碑按**消费方接入先后**排期（先到的需求先做），不按库内能力
+齐备顺序排。ffmpeg 在对拍期继续给剪/锻顶班，每接入一个调用点、对拍通过后
+对应 ffmpeg 命令才下线。当前各里程碑状态见下节「里程碑」，逐次交付的
+详细实录见文末「修订记录」与各施工图归档。
 
 ## 消费方需求对照（排期依据）
 
@@ -47,50 +28,32 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 里程碑
 
-- **M1（已完成，收口中）**：`ye-time` / `ye-pixfmt` 基础类型；
+- **M1（已完成，2026-10-24 收口）**：`ye-time` / `ye-pixfmt` 基础类型；
   `ye-container-mp4` 解封装 + 封装（progressive 与 fMP4），ffmpeg/ffprobe
-  oracle 对拍通过；`ye probe` / `ye remux` 可用。2026-10-24 合流收口：
-  m1-mp4 并入 develop（B 案，契约层为主体）、移植挂 develop 契约类型、
-  `Demuxer`/`Muxer` trait 接线 + 注册表 auto-probe、门面 `remux` 助手、
-  `convert` 占位（锻 M3 接入契约定形）、ye-codec/ye-filter 接口桩就位
-  ——M2+ 缺口总账见 [waitlist.md](waitlist.md)。收口准入：**剪的素材
-  导入 probe 换 ye**——jian 侧 `probe_media` 加双引擎开关，ffprobe 留作
-  oracle 与回退。
-- **M2 解码——服务剪的抽帧与波形**：H.264 软件解码（先 Baseline，后
-  High / CABAC / B 帧）、AAC-LC 解码、yuv→rgb 像素转换与 scale 最小集、
-  PNG 编码；音频 PCM → 波形峰值。进度勾项（2026-10-27 收口终态，m2-jian-plan
-  T1–T8 + 同日解码器分歧修复）：✅ Baseline 解码（一致性向量口径）、✅
-  AAC-LC 解码、✅ yuv→rgb 与 scale、✅ PNG 编码、✅ 波形峰值（纯核 +
-  消费助手 + oracle 对拍两条向量全绿，容差收紧 2e-4→1.5e-4）、✅ 抽帧门面
-  （`decode_frame_rgba`/`grab_frame_png` + vec-video-multi 整体 Err 行为
-  锁定）、✅ 抽帧像素/解码 YUV 对拍——早班发现的去块启用 + 30fps 长链分歧
-  （max_abs=74~76）同日修复收口（去块延后图级 + chroma QP 偏移 +
-  pred_8x16 C→D 回退），`ip30` 回归集入库（去块条 90 帧逐位一致），两条
-  对拍用例翻除 `#[ignore]` 过门（像素三点位 max |Δ|=1；no-deblock 条
-  max_abs=1 余留归档 ffmpeg 舍入边角，容差内）；High/CABAC 收口沿 M2
-  收口轨道开放（waitlist.md 第 1 行）。准入（剪的抽帧/波形走 ye 且同点位
-  对拍在容差内）：**代码面达成**——剪侧 probe/抽帧/波形三命令双引擎落地
-  （jian T4–T8），波形/probe 对拍全绿、抽帧像素对拍 ye 侧过门；jian 侧
-  像素用例未随修复翻除（`#[ignore]` 遗留）与「剪 M1 已定稿」GUI 人工回归
-  两项欠账如实登记（m2-jian-plan 收尾实录遗留①⑤）。
-- **M3 编码与转码直通——锻启动**：H.264 软件编码（CRF / CBR，2-pass
-  可后置）、AAC-LC 编码、处理图最小集（scale / fps / 像素格式 / 裁剪 /
-  音量）、`ye convert` 端到端。准入：**锻完成第一个转码任务**（改分辨率
-  与码率，时长/画面与 ffmpeg 对拍）；锻的工程骨架（Tauri+React，集群
-  套路）随本里程碑启动。
-- **M4 合成导出——接管剪的导出**：处理图扩到剪 filter_complex 全集——
-  overlay 链 / scale / rotate / 不透明度 / color 底板 / 时间窗显隐，音频
-  atempo（多段拆分）/ volume / adelay / amix，含分段速度曲线的 setpts
-  等价能力；多输入时间线合成 API + 进度回调（剪的 buildExportArgs 降级
-  为"求值 → 调 ye"）。准入：剪导出走 ye 出片，与 ffmpeg 导出对拍
-  （时长差 < 一帧、同点位抽帧视觉一致），剪保留双引擎开关一版。
+  oracle 对拍通过；`ye probe` / `ye remux` 可用。收口准入达成：剪的素材
+  导入 probe 换 ye（双引擎，ffprobe 留作 oracle 与回退）。
+- **M2 解码——服务剪的抽帧与波形（2026-10-27 收口）**：H.264 解码
+  （Baseline 收口；High/CABAC 真流对拍沿收口轨道开放，见
+  [waitlist.md](waitlist.md) 第 1 行）、AAC-LC 解码、yuv→rgb 与 scale、
+  PNG 编码、波形峰值、抽帧门面；oracle 对拍与同日解码器分歧修复收口
+  （去块延后图级 + chroma QP 偏移 + pred_8x16 C→D 回退，`ip30` 回归集
+  入库）。准入达成：剪侧 probe/抽帧/波形三命令双引擎落地、对拍过门。
+- **M3 编码与转码直通——锻启动（2026-10-26 首轮 + 同日补齐，收口）**：
+  H.264 软件编码（定 QP + 简单 CRF + 真码控 CBR 风味/A-VBR）、AAC-LC
+  编码、处理图最小集（scale / fps / 像素格式 / 裁剪 / 音量）、`ye convert`
+  端到端（音频三态/剥视频）。准入达成：锻完成第一个转码任务，e2e 对拍
+  与拒绝面矩阵锁定。
+- **M4 合成导出——接管剪的导出（首轮已交付 2026-10-26，进行中）**：
+  `ye::compose` 顺序拼接泵 + 剪导出双引擎（纯剪辑时间线走 ye，其余明确
+  拒绝指路 ffmpeg）。余留：叠加/变速/旋转/透明度/混音/转场等时间线合成
+  全集、seek 快进、段级静音填充——归 M4 后续批次。
 - **M5 格式铺开 + 硬件加速**：HEVC 解码（手机素材主力）、Matroska
   （MKV/WebM）；硬解（D3D11VA / VideoToolbox / VA-API）与硬编
   （NVENC / AMF / VideoToolbox）。准入：剪可导入 HEVC 素材出片；锻一次
   硬编转码跑通（软硬结果对拍）。剪的代理剪辑在此提速。
 - **M6+**：HEVC / AV1 编码、ProRes / DNxHR / MXF、LUT 与调色滤镜
-  （剪 M5）、文字渲染归属决策（剪侧渲染成图片素材 vs ye-filter 文字
-  滤镜）、锻预设生态所需扩展。按届时工具的真实节奏排期。
+  （剪 M5）、文字渲染归属决策、锻预设生态所需扩展。按届时工具的真实
+  节奏排期。
 
 ## 持续轨道（不占里程碑编号）
 
@@ -117,110 +80,17 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
 
 ## 修订记录
 
-- 2026-10-26（深夜）：M4 首轮——剪导出接管的纯剪辑子集，两仓门禁
-  全绿（施工代理交付、主线复核）。**ye 侧**：新门面 `ye::compose`
-  （顺序拼接泵：多段 MP4 裁剪窗口 → 单 MP4，视频 H.264 重编码 +
-  音频 AAC-LC 重编码/剥轨；CFR 桶采样 hold-last〔i128 精确有理数〕、
-  音频 f32 跨段连续累积、avcC 封装头延迟复用 convert 套路、进度/
-  取消/统计与 convert 同契约；逐段校验错误面指明段号，无重采样/
-  混音/静音填充——登记归后续）。**剪侧（jian）**：导出双引擎——
-  `run_export_ye` 命令（复用 export-progress 事件契约 + 取消表）+
-  `buildYeExportParams` 纯函数翻译层（纯剪辑时间线〔视频层首尾
-  相接、无变速/变换/效果/转场、伴音参数一致〕→ 片段列表；其余
-  明确拒绝指路 ffmpeg 引擎，3 接受 + 24 拒绝矩阵锁定）+ 顶栏引擎
-  切换（duan 同款）+ probe 双轨增 videoCodec/audioCodec/
-  sampleRate/channels。**e2e 对拍**：两段 3s 源各裁 2s → 320x240
-  @15，与 ffmpeg concat filter 对照五点位灰度帧平均 |Δ| 实测
-  0.75–1.62、容差 3.0（只准收紧）；帧数/时长/双轨形态全对齐。
-  时间线合成全集（叠加/变速/旋转/混音/转场）与 seek 快进归 M4
-  后续批次。
-- 2026-10-26（晚）：M3 补齐——真码控 + AAC-LC 编码 + convert 音频
-  三态/剥视频，两仓门禁全绿。**真码控**（`ye-codec-h264`
-  `encoder/rate.rs`）：`EncoderConfig.bit_rate`（既有字段）由编码器
-  消费——纯整数虚拟缓冲（容量 2×bps 对齐锻 ffmpeg 引擎 `-bufsize 2b`
-  口径），`Qp` 基准 → CBR 风味、`Crf` 基准 → A-VBR（对标
-  `-crf c -maxrate b`）；实测 CBR 300k +9.3% / 800k −0.7%（±25%
-  容差带内不贴边），A-VBR Crf(18)+300k 封顶落到无封顶的 35.6%，
-  `bit_rate=None` 逐字节回归锁定。**AAC-LC 编码**（`ye-codec-aac`
-  `encoder/`：长窗、SCE/CPE〔common_window、无 M/S〕、轻量心理声学 +
-  幂律量化 + 码率环从细侧收敛 + FIL 填充补齐恒定码率，复用解码侧
-  码表/窗核）：ffmpeg 对拍解码退出码 0、自家解码 vs ffmpeg 解码逐
-  样本 100% |Δ|≤1e-5（实测 8.9e-8）、SNR 128k 立体声 28.2dB、码率
-  命中 +0.5%/+0.2%；AAC 编码桩随交付删除（`register_stubs` 收窄为
-  解码×2）。**convert 接线**：`VideoEncodeSettings.bit_rate` +
-  `AudioEncodeSettings`（Copy/Aac/Drop 三态）+ `video=None` 剥视频 +
-  剥光守卫；`ye convert` CLI 增 `--vb`/`--audio copy|aac:kbps`/
-  `--no-video`；实测修掉两处接线 bug——音频包提前写输出流号致落头
-  冲出错轨、编码包自带 stream_index=0 致剥视频双流输入静默丢包
-  （后者补了向量级回归 `strip_video_on_dual_stream_input_keeps_audio`）。
-  **锻侧（duan）**：probe 增 sampleRate/channels；ye 引擎拒绝面收窄
-  ——目标码率（A-VBR）、纯音频预设（mp4 容器 aac）、剥音轨、AAC
-  音频重编码放行，非 MP4 系容器/非 AAC 音源/改采样率/>2 声道明确
-  拒绝；e2e 增纯音频重编码与码率模式两用例；顺带修两处存量红测试
-  （maxHeight 断言逻辑、store 持久化少算 engine 字段）。2-pass/完整
-  CRF/B 帧/CABAC 编码归后续批次（waitlist 不变项）。
-- 2026-10-27：M2 收口——施工 8/8（m2-jian-plan T1–T8）+ 同日解码器分歧
-  修复收口，两仓门禁全绿。**接通状态（剪侧，T4–T8）**：probe 双引擎
-  （`engine` 参数，auto=ye 优先、疑似封面启发式〔多条视频流 / 短视频流 /
-  moov.udta.meta covr 盲区〕整体回退 ffprobe 轨，AAC priming 时长偏差使
-  音频族整体回退权威轨）、抽帧双引擎（`extract_frame_ye` 命令，前端
-  thumbnail.ts ye 优先、失败回退 ffmpeg 轨）、波形命令（auto 路由，
-  `waveform_peaks_ye`/`waveform_peaks_ffmpeg` 两 pub 轨可独立调）——
-  波形双轨正弦/白噪声两向量逐桶全绿（jian 侧最坏 |Δmin|=3.588e-5 ≤
-  容差 1.5e-4）、probe 双轨判等全绿（宽高/kind 精确等，带封面 m4a 回退
-  后逐字段一致）。**解码器分歧处置**：早班像素对拍暴露的两处分歧（去块
-  启用首差帧 0 luma：解码期行内去块污染帧内预测 + chroma QP 漏加 PPS
-  偏移；关去块首差帧 81 chroma：pred_8x16 缺 C→D 回退）同日修复收口
-  ——去块延后到图级（编码器本地重建同步对齐，位级回环保持 0 容差）、
-  `chroma_qp_offset` 接线、pred_8x16 回退补齐；`ip30` 回归集（90 帧
-  30fps 长链 × 去块/关去块两条）入 conformance 清单，像素/YUV 对拍用例
-  翻除 `#[ignore]` 过门（像素三点位 max |Δ|=1、去块条 90 帧逐位一致）。
-  **未过项/遗留（如实）**：① no-deblock 条帧 81 起 Cr 平面孤立 ±1 样本
-  （300 帧扩展实测 24 帧 × 每帧 ≤2 样本，M2 YUV 容差〔≥99.9% Δ=0，实测
-  ≥99.998%〕内过门；二轮复核已排除 MC/参考选择/残差反量化/idct 语义，
-  归档 ffmpeg 内部舍入边角——收紧 `ip30` 容差前须先收口，见
-  ye-codec-h264 tests/conformance.rs `ip30` 注释）；② jian 侧像素对拍
-  用例仍挂 `#[ignore]` 未随修复翻除（经路径依赖已链修复后的 ye，翻除
-  复跑归 jian 后续）；③ High/CABAC 真流对拍仍开放（waitlist.md 第 1
-  行）。收尾实录与遗留总账见
-  [m2-jian-plan.md](m2-jian-plan.md) 文末。
-- 2026-10-27：剪接线 ye 侧交付（m2-jian-plan T1–T3）——`waveform`
-  模块（分桶纯核 + 消费助手）与 `frame_grab` 门面入库；oracle 对拍
-  基建（`tests/common/mod.rs` 定位器 + lavfi 向量配方，四档定位 +
-  分级 skip 语义）与两个对拍测试文件落地。实测：波形对拍正弦/白噪声
-  两条向量逐桶逐声道全绿（最坏 |Δmax|=5.022e-6 / 8.810e-5，容差按
-  实测收紧 2e-4→1.5e-4）；vec-video-multi（`-ac 6` 不可解音轨）抽帧
-  整体 Err 行为锁定生效；抽帧像素对拍发现 H.264 Baseline 解码在
-  去块启用 + 30fps 长链真实内容上与 ffmpeg 分歧（90 帧 max_abs=74、
-  首差帧 0 luma；关去块对照仍 max_abs=76、首差帧 81 chroma；像素核
-  |Δ|≤1 与帧定位已排除，归因解码器；M2 一致性向量全部 `no-deblock=1`
-  未覆盖该形态）——像素/YUV 两条对拍用例以 `#[ignore]` 如实登记，
-  解码器修复工程师接手后翻除过门（证据链见
-  [waitlist.md](waitlist.md) 第 1 行）。M2 准入（剪侧接线 + 对拍在
-  容差内）仍开放（jian 侧 T4–T8 在途）。
-- 2026-10-26：M3 首轮收尾——施工 6/6 + 集成阶段同轮落地，全仓门禁
-  全绿、端到端转码通过、无未过项。交付：H.264 软件编码真实现
-  （Baseline/CAVLC、I/P 帧、定 QP + 简单 CRF、无 B 帧；H.264 编码桩
-  随删）、处理图最小集（`topological_order` 真实现、`FilterParams`、
-  crop/fps/volume、fps API 改 `Timestamp` 入参）、convert 编码模式
-  真实现（视频重编码 + MP4 封装、音频直通）+ `ye convert` CLI
-  （--size）。对拍：编码器位级回环 0 容差 + ffmpeg 双解码 + Y-PSNR
-  门槛（QP20≥36dB / QP32≥28dB）全过；端到端经 ffprobe 三重验收
-  （解码无错 / 流参数 / 时长与帧数一致）。施工图与逐任务实录见
-  [m3-plan.md](m3-plan.md)。范围外如实登记：AAC-LC 编码、真码控
-  （CBR/A-VBR、2-pass、完整 CRF）、B 帧/CABAC/High 编码、分块 inter
-  模式归后续批次（m3-plan §7）；CABAC 解码真流对拍卡点沿 M2 收口
-  轨道开放（m3-plan §6）；锻 duan 接线（D1/D2）未动——M3 准入
-  （锻完成第一个转码任务）仍开放，[waitlist.md](waitlist.md) 已同步。
-- 2026-10-24：M1 冶侧收口——m1-mp4 合流（B 案）+ 移植挂 develop
-  契约类型 + `Demuxer`/`Muxer` trait 接线 + 门面 `remux` 助手 +
-  `convert` 占位（锻 M3 接入契约定形）+ ye-codec/ye-filter 接口桩；
-  新增 [waitlist.md](waitlist.md)（M2+ 等待清单：缺口 × 阻塞层 ×
-  准入里程碑）。收口准入（剪 probe 双引擎）仍开放。
-- 2026-10-22：按剪/锻消费计划重排——M2 准入从"剪时间线可回放"改为
-  "剪抽帧/波形"（剪的预览走浏览器，不经 ye，原准入是伪需求）；原
-  M3 滤镜最小集与 M4 编码合并为新 M3 转码直通（convert 端到端本来就
-  需要编码，锻首个任务作准入）；新增 M4 合成导出承接剪的
-  filter_complex 全集；硬件加速与格式铺开归 M5；新增消费方对照表、
-  持续轨道与接入方式两节。
+- 2026-10-27：M2 收口——剪接入（m2-jian-plan T1–T8）+ 同日解码器分歧
+  修复收口，两仓门禁全绿。详录见 [m2-jian-plan.md](m2-jian-plan.md)。
+- 2026-10-26（深夜）：M4 首轮——剪导出接管的纯剪辑子集（`ye::compose`
+  顺序拼接泵 + 剪导出双引擎 + e2e 对拍），两仓门禁全绿。
+- 2026-10-26（晚）：M3 补齐——真码控 + AAC-LC 编码 + convert 音频三态/
+  剥视频 + 锻侧拒绝面收窄，两仓门禁全绿。
+- 2026-10-26：M3 首轮收尾——H.264 软件编码（Baseline/CAVLC）+ 处理图
+  最小集 + convert 编码模式 + `ye convert` CLI，全仓门禁全绿、端到端
+  转码通过。详录见 [m3-plan.md](m3-plan.md)。
+- 2026-10-24：M1 冶侧收口——m1-mp4 合流（B 案）+ trait 接线 + remux
+  助手 + convert 占位 + 接口桩；新增 [waitlist.md](waitlist.md)。
+- 2026-10-22：按剪/锻消费计划重排里程碑（M2 准入改为剪抽帧/波形；
+  M3 合并为转码直通；新增 M4 合成导出；硬件加速归 M5）。
 - 2026-10-20：初版（M1 收口时留档）。
