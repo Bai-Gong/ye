@@ -51,6 +51,53 @@ impl SliceType {
 /// 诊断与后续阶段（②b/②c 的片级状态）消费。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
+pub(crate) struct PlaceholderRemoved {
+}
+
+/// pred_weight_table 的单参考帧权重（spec 7.3.3.2.2；FFmpeg
+/// `pred_weight_table` 同语义：w∈[-128,127]、o∈[-128,127]，
+/// 未显式发送的分量 = 默认（w=1<<ld、o=0)）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WpWeights {
+    /// luma (weight, offset)。
+    pub y: (i32, i32),
+    /// Cb (weight, offset)。
+    pub u: (i32, i32),
+    /// Cr (weight, offset)。
+    pub v: (i32, i32),
+}
+
+/// 加权预测表（P 显式 / B 显式 idc==2）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WpTables {
+    pub luma_log2_denom: u32,
+    pub chroma_log2_denom: u32,
+    pub l0: Vec<WpWeights>,
+    pub l1: Vec<WpWeights>,
+}
+
+impl WpTables {
+    /// 权重是否全默认（恒等：w=1<<ld、o=0）——恒等时 MC 无需加权遍历。
+    pub(crate) fn is_identity(&self) -> bool {
+        let ld = self.luma_log2_denom;
+        let cd = self.chroma_log2_denom;
+        let one = |t: &[(i32, i32); 3], lds: [u32; 3]| {
+            t.iter()
+                .zip(lds)
+                .all(|(&(_w, o), ld)| o == 0)
+                && t[0].0 == 1 << lds[0]
+                && t[1].0 == 1 << lds[1]
+                && t[2].0 == 1 << lds[2]
+        };
+        self.l0.iter().all(|w| {
+            one(
+                &[w.y, w.u, w.v],
+                [ld, cd, cd],
+            )
+        }) && self.l1.iter().all(|w| one(&[w.y, w.u, w.v], [ld, cd, cd]))
+    }
+}
+
 pub(crate) struct SliceHeader {
     pub first_mb_in_slice: usize,
     pub slice_type: SliceType,
@@ -84,6 +131,8 @@ pub(crate) struct SliceHeader {
     pub cabac_init_idc: u8,
     /// 去块参数（片级）。
     pub deblock: DeblockParams,
+    /// pred_weight_table（P 显式 / B 显式 idc==2；否则空表=恒等）。
+    pub wp: WpTables,
 }
 
 /// 去块滤波片级参数（FFmpeg deblocking_filter/slice_alpha_c0_offset/
@@ -139,6 +188,60 @@ pub(crate) fn rbsp_data_bits(rbsp: &[u8]) -> usize {
 /// - `InvalidData`：字段越界（first_mb/slice_type/qp 等）；
 /// - `Unsupported`：②a 之外但位流合法的形态（场图、P/B/SP/SI 片、
 ///   去块 idc ≠ 2、冗余片）。
+/// ue 读取并夹 [0, max]（spec 约束，超界报错）。
+fn u_cl(r: &mut crate::bitreader::BitReader<'_>, max: u32, name: &str) -> Result<u32, H264Error> {
+    let v = r.ue()?;
+    if v > u64::from(max) {
+        return Err(H264Error::InvalidData(format!("{name} {v} out of range")));
+    }
+    Ok(v as u32)
+}
+
+/// 单列表 pred_weight_table（spec 7.3.3.2.2；FFmpeg pred_weight_table）：
+/// luma_weight_lX_flag → (se, se)；chroma 同（两通道）。
+fn read_wp_list(
+    r: &mut crate::bitreader::BitReader<'_>,
+    chroma: bool,
+    n: usize,
+    ld_luma: u32,
+    ld_chroma: u32,
+    list: u8,
+) -> Result<Vec<WpWeights>, H264Error> {
+    let mut out = Vec::with_capacity(n);
+    let def_luma = 1i32 << ld_luma;
+    let def_chroma = 1i32 << ld_chroma;
+    for i in 0..n {
+        let mut w = WpWeights {
+            y: (def_luma, 0),
+            u: (def_chroma, 0),
+            v: (def_chroma, 0),
+        };
+        let tag = format!("luma_weight_l{list}[{i}]");
+        if r.u1()? {
+            let wt = r.se()?;
+            let off = r.se()?;
+            if !(-128..=127).contains(&wt) || !(-128..=127).contains(&off) {
+                return Err(H264Error::InvalidData(format!("{tag} out of range")));
+            }
+            w.y = (wt as i32, off as i32);
+        }
+        if chroma && r.u1()? {
+            for (j, slot) in [(&mut w.u, "cb"), (&mut w.v, "cr")].into_iter().enumerate() {
+                let wt = r.se()?;
+                let off = r.se()?;
+                if !(-128..=127).contains(&wt) || !(-128..=127).contains(&off) {
+                    return Err(H264Error::InvalidData(format!(
+                        "chroma_weight_l{list}[{i}][{j}] out of range"
+                    )));
+                }
+                *slot.0 = (wt as i32, off as i32);
+            }
+        }
+        out.push(w);
+    }
+    Ok(out)
+}
+
 pub(crate) fn parse_slice_header(
     r: &mut BitReader<'_>,
     sps: &Sps,
@@ -264,12 +367,10 @@ pub(crate) fn parse_slice_header(
         }
         Ok(usize::MAX) // 哨兵：未覆盖
     };
+    let mut wp = WpTables::default();
+    let mut wp_explicit_b = false;
+    let dbg2 = std::env::var_os("YE_SHDBG").is_some();
     if slice_type == SliceType::P {
-        if pps.weighted_pred_flag {
-            return Err(H264Error::Unsupported(
-                "weighted prediction (P) lands in a later stage",
-            ));
-        }
         num_ref_l0 = usize::from(pps.num_ref_idx_l0_default_active_minus1) + 1;
         if let n @ 0..=15 = read_num_ref(r, 0)? {
             num_ref_l0 = n;
@@ -278,19 +379,24 @@ pub(crate) fn parse_slice_header(
             ref_mods = read_reorder(r, num_ref_l0)?;
         }
     } else if slice_type == SliceType::B {
-        if pps.weighted_bipred_idc != 0 {
-            return Err(H264Error::Unsupported(
-                "explicit weighted biprediction lands in a later stage",
-            ));
-        }
+        // FFmpeg 4.4 h264_slice.c:1874-1877：B 片仅 weighted_bipred_idc==1
+        // 时读 pred_weight_table；idc==2 不读表（走 implicit 权重，
+        // MC 侧按 POC 距离或 32/32 平均）。x264 默认 PPS 写 idc=2。
+        wp_explicit_b = pps.weighted_bipred_idc == 1;
         direct_spatial_mv_pred = r.u1()?;
         num_ref_l0 = usize::from(pps.num_ref_idx_l0_default_active_minus1) + 1;
         num_ref_l1 = usize::from(pps.num_ref_idx_l1_default_active_minus1) + 1;
-        if let n @ 0..=15 = read_num_ref(r, 0)? {
-            num_ref_l0 = n;
-        }
-        if let n @ 0..=15 = read_num_ref(r, 1)? {
-            num_ref_l1 = n;
+        // spec 7.3.3：单个 override flag 门两列表（=1 时 l0、l1 依次 ue）。
+        if r.u1()? {
+            let n0 = r.ue()?;
+            let n1 = r.ue()?;
+            if n0 > 14 || n1 > 14 {
+                return Err(H264Error::InvalidData(format!(
+                    "num_ref_idx_active_minus1 ({n0},{n1}) out of range"
+                )));
+            }
+            num_ref_l0 = n0 as usize + 1;
+            num_ref_l1 = n1 as usize + 1;
         }
         if r.u1()? {
             ref_mods = read_reorder(r, num_ref_l0)?;
@@ -299,16 +405,32 @@ pub(crate) fn parse_slice_header(
             ref_mods_l1 = read_reorder(r, num_ref_l1)?;
         }
     }
-    // cabac_init_idc（CABAC 且非 I/SI 片；spec 7.3.3）
-    let mut cabac_init_idc = 0u8;
-    if pps.entropy_coding_mode_flag && slice_type != SliceType::I {
-        let v = r.ue()?;
-        if v > 2 {
-            return Err(H264Error::InvalidData(format!(
-                "cabac_init_idc {v} out of range"
-            )));
+    // pred_weight_table（spec 7.3.3.2.2：P 且 weighted_pred_flag、
+    // 或 B 且 weighted_bipred_idc==2 时读取；FFmpeg pred_weight_table）。
+    if (slice_type == SliceType::P && pps.weighted_pred_flag)
+        || (slice_type == SliceType::B && wp_explicit_b)
+    {
+        if slice_type == SliceType::B {
+            // idc==1 的 implicit 加权 MC 未实现（x264 默认不产生此形态）；
+            // 表仍按语法读掉以维持位序，随后如实拒绝。
+            let _ = &wp;
+            return Err(H264Error::Unsupported(
+                "implicit weighted biprediction (weighted_bipred_idc=1)",
+            ));
         }
-        cabac_init_idc = v as u8;
+        let chroma = sps.chroma_format_idc != 0;
+        wp.luma_log2_denom = u_cl(r, 7, "luma_log2_weight_denom")?;
+        wp.chroma_log2_denom = if chroma {
+            u_cl(r, 7, "chroma_log2_weight_denom")?
+        } else {
+            0
+        };
+        let n0 = num_ref_l0.min(32);
+        let n1 = if slice_type == SliceType::B { num_ref_l1.min(32) } else { 0 };
+        wp.l0 = read_wp_list(r, chroma, n0, wp.luma_log2_denom, wp.chroma_log2_denom, 0)?;
+        if slice_type == SliceType::B {
+            wp.l1 = read_wp_list(r, chroma, n1, wp.luma_log2_denom, wp.chroma_log2_denom, 1)?;
+        }
     }
 
     // dec_ref_pic_marking（I/P 参考帧；nal_ref_idc==0 不标记）。
@@ -351,6 +473,19 @@ pub(crate) fn parse_slice_header(
                 }
             }
         }
+    }
+
+
+    // cabac_init_idc（CABAC 且非 I/SI 片；spec 7.3.3）
+    let mut cabac_init_idc = 0u8;
+    if pps.entropy_coding_mode_flag && slice_type != SliceType::I {
+        let v = r.ue()?;
+        if v > 2 {
+            return Err(H264Error::InvalidData(format!(
+                "cabac_init_idc {v} out of range"
+            )));
+        }
+        cabac_init_idc = v as u8;
     }
 
     // slice_qp_delta
@@ -409,6 +544,7 @@ pub(crate) fn parse_slice_header(
         delta_poc_bottom,
         delta_poc,
         cabac_init_idc,
+        wp,
     })
 }
 
@@ -525,6 +661,11 @@ fn decode_slice_cabac(
     register_deblock_params(pic, slice_id, &header.deblock);
     loop {
         if mb_idx >= slice_end_mb {
+            // 临时诊断（提交前剥离）：SALVAGE 下放行越界片，供像素定位
+            if std::env::var_os("YE_CABAC_SALVAGE").is_some() {
+                eprintln!("SALVAGE: slice exceeds @mb{mb_idx}");
+                break;
+            }
             return Err(H264Error::InvalidData(
                 "slice data exceeds picture boundary (end_of_slice_flag missing)".into(),
             ));
@@ -536,7 +677,7 @@ fn decode_slice_cabac(
         }
         let mbx = mb_idx % pic.mb_width;
         let mby = mb_idx / pic.mb_width;
-        decode_mb_cabac(
+        if let Err(e) = decode_mb_cabac(
             &mut reader,
             pic,
             mbx,
@@ -547,12 +688,24 @@ fn decode_slice_cabac(
             &mut last_qscale_diff,
             pctx,
             is_b,
-        )
-        .map_err(|e| H264Error::InvalidData(format!("cabac mb ({mbx},{mby}): {e}")))?;
+        ) {
+            // 诊断残骸模式（临时，不入库）：YE_CABAC_SALVAGE=1 时 MB 出错
+            // 跳过该 MB 终止本片，让帧走完输出链路——供对拍定位帧内首个
+            // 视觉损坏行（= 分歧起始宏块）。
+            if std::env::var_os("YE_CABAC_SALVAGE").is_some() {
+                eprintln!("SALVAGE: slice 在 ({mbx},{mby}) 出错终止：{e}");
+                break;
+            }
+            return Err(H264Error::InvalidData(format!("cabac mb ({mbx},{mby}): {e}")));
+        }
         mb_idx += 1;
         if reader.cabac.terminate() {
             break; // end_of_slice_flag = 1
         }
+    }
+    // 残骸模式：片提前终止时吞掉「越过片界」检查（帧不完整是预期的）。
+    if std::env::var_os("YE_CABAC_SALVAGE").is_some() {
+        return Ok(mb_idx);
     }
     if mb_idx > slice_end_mb {
         return Err(H264Error::InvalidData(

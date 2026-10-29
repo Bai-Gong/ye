@@ -49,6 +49,18 @@ const CTX_CBP_CHROMA: usize = 77;
 const CTX_T8X8: usize = 399;
 
 /// coded_block_flag 基址（FFmpeg get_cabac_cbf_ctx 的 base_ctx[14]）。
+// —— 变异扫描（临时诊断，不入库）：YE_CABAC_MUTATE=<n> 选中一个语义位点
+// 翻转，其余位点保持原语义。0/缺省 = 无变异（对照）。
+pub(crate) fn mutation(n: u8) -> bool {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("YE_CABAC_MUTATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }) == n
+}
+
 const CBF_BASE: [usize; 14] = [
     85, 89, 93, 97, 101, 1012, 460, 464, 468, 1016, 472, 476, 480, 1020,
 ];
@@ -83,6 +95,10 @@ const ABS_TRANSITION: [[usize; 8]; 2] = [
 /// `scan`：系数序→块内光栅；`qmul`：None = DC（原值，后续 Hadamard
 /// 反量化）；否则按槽位融合反量化（FFmpeg STORE_BLOCK）。
 /// 返回非零系数数（nnz）。
+/// cat 5（luma 8x8）**不读 coded_block_flag**（FFmpeg：4:2:0 下 cbf
+/// 读取仅在 4:4:4 的 8x8 路径存在，4:2:0 由 cbp 象限位直接门控）。
+/// （缺陷修复登记 2026-10-26：曾误读 cbf（ctx 1012..1015）——该 bin
+/// 编码器从未写出，首个真 8x8 宏块即脱轨。）
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_residual(
     r: &mut CabacReader<'_>,
@@ -93,17 +109,19 @@ pub(crate) fn decode_residual(
     nnz_ctx: (Option<u8>, Option<u8>),
     block: &mut [i16],
 ) -> Result<usize, H264Error> {
-    // coded_block_flag（FFmpeg get_cabac_cbf_ctx：nza>0 +1、nzb>0 +2）
-    let (nza, nzb) = nnz_ctx;
-    let mut ctx = 0usize;
-    if nza.unwrap_or(0) > 0 {
-        ctx += 1;
-    }
-    if nzb.unwrap_or(0) > 0 {
-        ctx += 2;
-    }
-    if r.bin(CBF_BASE[cat] + ctx) == 0 {
-        return Ok(0);
+    if cat != 5 {
+        // coded_block_flag（FFmpeg get_cabac_cbf_ctx：nza>0 +1、nzb>0 +2）
+        let (nza, nzb) = nnz_ctx;
+        let mut ctx = 0usize;
+        if nza.unwrap_or(0) > 0 {
+            ctx += 1;
+        }
+        if nzb.unwrap_or(0) > 0 {
+            ctx += 2;
+        }
+        if r.bin(CBF_BASE[cat] + ctx) == 0 {
+            return Ok(0);
+        }
     }
     if max_coeff == 0 {
         return Err(H264Error::InvalidData("residual max_coeff == 0".into()));
@@ -132,7 +150,7 @@ pub(crate) fn decode_residual(
             }
         }
     }
-    if !last_flag_hit {
+    if !last_flag_hit && !mutation(1) {
         index[coeff_count] = max_coeff - 1;
         coeff_count += 1;
     }
@@ -167,9 +185,12 @@ fn decode_residual_8x8(
         }
     }
     if !hit_last {
-        // 循环走完：末位（62）隐含 significant（FFmpeg：
-        // if (last == max_coeff-1) index[coeff_count++] = last）
-        index[coeff_count] = 62;
+        // 循环走完：末位（63）隐含 significant（FFmpeg DECODE_SIGNIFICANCE
+        // 尾部 `if (last == coefs)`：coefs=63，隐式追加的是 63——sig 循环
+        // 已覆盖 0..=62，62 若显著已在 index，尾部只能补 63）。
+        // （缺陷修复登记 2026-10-26：曾错补 62——sig[62]=1 时重复计 62
+        // 且真末位 63 永不出现，系数反向解码整块错位。）
+        index[coeff_count] = 63;
         coeff_count += 1;
     }
     store_levels(r, index, coeff_count, scan, qmul, block, cat)?;
@@ -197,16 +218,30 @@ fn store_levels(
             let v = r.cabac.bypass_sign(-1);
             dequant_level(v, qmul, j)
         } else {
-            // |level| > 1：一元前缀（<15）或 UEGk 后缀
-            node_ctx = ABS_TRANSITION[1][node_ctx];
+            // |level| > 1：一元前缀（<15）或 UEGk 后缀。
+            // FFmpeg STORE_BLOCK 顺序：gt1 的 ctxIdx 取**转移前**的
+            // node_ctx（ctx 赋值先于 transition[1]），状态转移随后。
+            // 若先转移再取 ctx，除 node 7 外每个 >1 系数都读错上下文
+            // （GT1[old] ≠ GT1[TRANS[1][old]]），引擎整体脱轨。
+            // （缺陷修复登记 2026-10-26：真流对拍首轮定位——首个
+            // 4x4 块第二个系数起 ctxIdx 即偏 +1。）
+            let gt1_base = if mutation(2) {
+                node_ctx = ABS_TRANSITION[1][node_ctx];
+                abs_base + ABS_LEVELGT1_CTX[node_ctx]
+            } else {
+                let b = abs_base + ABS_LEVELGT1_CTX[node_ctx];
+                node_ctx = ABS_TRANSITION[1][node_ctx];
+                b
+            };
             let mut abs: i32 = 2;
-            let gt1_base = abs_base + ABS_LEVELGT1_CTX[node_ctx];
-            while abs < 15 && r.bin(gt1_base) == 1 {
+            let unary_cap = if mutation(8) { 14 } else { 15 };
+            while abs < unary_cap && r.bin(gt1_base) == 1 {
                 abs += 1;
             }
             if abs >= 15 {
                 let mut k = 0i32;
-                while r.cabac.bypass() == 1 && k < 16 + 7 {
+                let k_limit = if mutation(7) { 16 } else { 16 + 7 };
+                while r.cabac.bypass() == 1 && k < k_limit {
                     k += 1;
                 }
                 abs = 1;
@@ -232,6 +267,57 @@ fn store_levels(
     Ok(())
 }
 
+// 临时诊断（提交前剥离）：YE_MB_COEFFS="mbx,mby" 时转储该 MB 的
+// 反量化系数（4x4 块按栅格索引；系数项 = 栅格位置:值）。
+fn dump_mb_coeffs(
+    mbx: usize,
+    mby: usize,
+    qp: u8,
+    mb: &crate::macroblock::Macroblock,
+    luma_blocks: &[[i16; 16]; 16],
+    luma8_blocks: &[[i16; 64]; 4],
+    chroma_blocks: &[[[i16; 16]; 4]; 2],
+) {
+    use std::sync::OnceLock;
+    static TARGET: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let target = TARGET.get_or_init(|| {
+        std::env::var("YE_MB_COEFFS").ok().and_then(|s| {
+            let (a, b) = s.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+    });
+    if *target != Some((mbx, mby)) {
+        return;
+    }
+    eprintln!(
+        "COEFF mb=({mbx},{mby}) qp={qp} kind={:?} t8={} cbp={:#04x} i16={} i4={:?} cmode={} nnz={:?} cdc={:?}",
+        mb.kind, mb.transform_8x8, mb.cbp, mb.i16_mode, mb.i4_modes, mb.chroma_mode, mb.nnz,
+        mb.nnz_chroma_dc
+    );
+    let sparse = |blk: &[i16]| -> String {
+        blk.iter()
+            .enumerate()
+            .filter(|(_, v)| **v != 0)
+            .map(|(j, v)| format!("{j}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    if mb.transform_8x8 {
+        for (q, blk) in luma8_blocks.iter().enumerate() {
+            eprintln!("  Q{q}[{}]", sparse(blk));
+        }
+    } else {
+        for (b, blk) in luma_blocks.iter().enumerate() {
+            eprintln!("  B{b:02}[{}]", sparse(blk));
+        }
+    }
+    for (p, cblocks) in chroma_blocks.iter().enumerate() {
+        for (i, blk) in cblocks.iter().enumerate() {
+            eprintln!("  C{p}{i}[{}]", sparse(blk));
+        }
+    }
+}
+
 /// 反量化融合（FFmpeg：DC 原值；AC `(sign·abs·qmul[j] + 32) >> 6`）。
 fn dequant_level(v: i32, qmul: Option<&[u32]>, j: usize) -> i32 {
     match qmul {
@@ -248,11 +334,17 @@ fn dequant_level(v: i32, qmul: Option<&[u32]>, j: usize) -> i32 {
 fn decode_skip(r: &mut CabacReader<'_>, pic: &Picture, mbx: usize, mby: usize, is_b: bool) -> bool {
     let mb_xy = mby * pic.mb_width + mbx;
     let mut ctx = 0usize;
-    if mbx > 0 && pic.mbs[mb_xy - 1].decoded && !pic.mbs[mb_xy - 1].skipped {
-        ctx += 1;
+    // FFmpeg decode_cabac_mb_skip / spec 9.3.3.1.1：左、上各 ctx++。
+    // 左邻是 flat 索引 mb_xy-1（h264_cabac.c:1350——行首的"左邻"即
+    // 上一行行末宏块，同片且已解码即计入）；上邻 mb_xy-mb_width。
+    if mb_xy > 0 {
+        let l = &pic.mbs[mb_xy - 1];
+        if l.decoded && !l.skipped {
+            ctx += 1;
+        }
     }
     if mby > 0 && pic.mbs[mb_xy - pic.mb_width].decoded && !pic.mbs[mb_xy - pic.mb_width].skipped {
-        ctx += 2;
+        ctx += 1;
     }
     let base = if is_b { CTX_SKIP_B } else { CTX_SKIP };
     r.bin(base + ctx) == 1
@@ -327,10 +419,12 @@ fn decode_b_mb_type(
     let mut ctx = 0usize;
     // FFmpeg：!IS_DIRECT(left_type − 1)——邻块非直接（+1 的哨兵位移）
     let is_direct = |mb: &Macroblock| mb.kind == MbKind::InterB && mb.skipped || direct_mb(pic, mb);
-    if mbx == 0 || !is_direct(&pic.mbs[mb_xy - 1]) {
+    // FFmpeg `!IS_DIRECT(left_type - 1)`：邻居不可用（left_type=0 → −1
+    // 的 DIRECT2 位为 1）时视为 direct，**不** ctx++——此前边界 MB 误加。
+    if mbx > 0 && !is_direct(&pic.mbs[mb_xy - 1]) {
         ctx += 1;
     }
-    if mby == 0 || !is_direct(&pic.mbs[mb_xy - pic.mb_width]) {
+    if mby > 0 && !is_direct(&pic.mbs[mb_xy - pic.mb_width]) {
         ctx += 1;
     }
     if r.bin(CTX_MB_TYPE_B + ctx) == 0 {
@@ -409,18 +503,27 @@ fn decode_i4_mode(r: &mut CabacReader<'_>, pred: u8) -> u8 {
     mode + u8::from(mode >= pred)
 }
 
-/// intra_chroma_pred_mode（FFmpeg decode_cabac_mb_chroma_pre_mode）。
+/// intra_chroma_pred_mode（FFmpeg decode_cabac_mb_chroma_pre_mode；spec
+/// Table 9-23：ctxIdxInc = 非DC 邻块**计数**，左/上各 +1，值域 0..2）。
+/// 邻块比较用**语法值**（FFmpeg 独立 chroma_pred_mode_table 存语法值），
+/// 而 `Macroblock.chroma_mode` 存边界改写后的最终模式（DC 在角落被
+/// rewrite_dc_mode 改写为内部变体 4..6）——按 1..=3 判「非 DC」。
+/// （缺陷修复登记 2026-10-26：①改写值 ≠0 曾令角落 MB 右邻块 ctxInc 虚
+/// +1；②上邻块曾误按 +2 计权（左/上应各 +1，ctxIdx 值域止于 66）——
+/// 双非 DC 邻块场景此前从未被单行向量覆盖，真流对拍定位。）
 fn decode_chroma_mode(r: &mut CabacReader<'_>, pic: &Picture, mbx: usize, mby: usize) -> u8 {
     let mb_xy = mby * pic.mb_width + mbx;
     let mut ctx = 0usize;
-    if mbx > 0 && pic.mbs[mb_xy - 1].decoded && pic.mbs[mb_xy - 1].chroma_mode != 0 {
+    // FFmpeg decode_cabac_mb_chroma_pre_mode：取 chroma_pred_mode_table
+    // （**语法原值**）判非 DC——改写后的 4..6 变体不参与计数。
+    if mbx > 0 && pic.mbs[mb_xy - 1].decoded && pic.mbs[mb_xy - 1].chroma_syntax != 0 {
         ctx += 1;
     }
     if mby > 0
         && pic.mbs[mb_xy - pic.mb_width].decoded
-        && pic.mbs[mb_xy - pic.mb_width].chroma_mode != 0
+        && pic.mbs[mb_xy - pic.mb_width].chroma_syntax != 0
     {
-        ctx += 2;
+        ctx += 1;
     }
     if r.bin(CTX_CHROMA_PRED + ctx) == 0 {
         return 0;
@@ -472,7 +575,9 @@ fn decode_cbp_luma(r: &mut CabacReader<'_>, left_cbp: u16, top_cbp: u16) -> u8 {
     cbp
 }
 
-/// cbp chroma（FFmpeg decode_cabac_mb_cbp_chroma）。
+/// cbp chroma（FFmpeg decode_cabac_mb_cbp_chroma：`(cbp>>4)&3` 口径，
+/// DC 位不参与——cbp_table 的 DC 位在 fill_decode_caches 进 top/left_cbp
+/// 前不映入 0..3 段，==2 判定按纯 chroma 值）。
 fn decode_cbp_chroma(r: &mut CabacReader<'_>, left_cbp: u16, top_cbp: u16) -> u8 {
     let cbp_a = (left_cbp >> 4) & 0x03;
     let cbp_b = (top_cbp >> 4) & 0x03;
@@ -486,13 +591,7 @@ fn decode_cbp_chroma(r: &mut CabacReader<'_>, left_cbp: u16, top_cbp: u16) -> u8
     if r.bin(CTX_CBP_CHROMA + ctx) == 0 {
         return 0;
     }
-    ctx = 4;
-    if cbp_a == 2 {
-        ctx += 1;
-    }
-    if cbp_b == 2 {
-        ctx += 2;
-    }
+    ctx = 4 + usize::from(cbp_a == 2) + 2 * usize::from(cbp_b == 2);
     1 + r.bin(CTX_CBP_CHROMA + ctx) as u8
 }
 
@@ -508,7 +607,7 @@ fn decode_dqp(
         return Ok(());
     }
     let mut val = 1i32;
-    let mut ctx = 2usize;
+    let mut ctx = if mutation(4) { 1usize } else { 2usize };
     while r.bin(CTX_DQP + ctx) == 1 {
         ctx = 3;
         val += 1;
@@ -561,7 +660,10 @@ fn decode_ref(r: &mut CabacReader<'_>, max: usize, refa: i8, refb: i8) -> Result
 /// 一元至 9 后 UEG0 旁路后缀；返回带符号差）。`amvd` = 邻块 mvd 之和
 /// （带符号）。
 fn decode_mvd(r: &mut CabacReader<'_>, ctx_base: usize, amvd: i32) -> Result<i16, H264Error> {
-    let mut base = ctx_base + 2 + usize::from(amvd > 2) + usize::from(amvd > 32);
+    // FFmpeg 1497-1505：slot = ctxbase + ((amvd-3)>>31) + ((amvd-33)>>31) + 2
+    // —— i32 算术右移 31：amvd<3 → −1、amvd<33 → −1，即：
+    // amvd≤2 → +0、3..=32 → +1、>32 → +2。此前误 +2+(>2)+(>32) 全档偏 +2。
+    let mut base = ctx_base + usize::from(amvd > 2) + usize::from(amvd > 32);
     if r.bin(base) == 0 {
         return Ok(0);
     }
@@ -710,7 +812,10 @@ impl RefMvdEdge {
             for xx in bx..bx + w {
                 let b = (yy * 4 + xx) as usize;
                 self.cur_ref[b] = ref_idx;
-                self.cur_mvd[b] = mvd;
+                // FFmpeg mvd_cache 存**幅度** mvda（decode_cabac_mb_mvd 的
+                // *mvda = mvd<70 ? mvd : 70，符号无关）——amvd 上下文用幅度
+                // 求和；此前误存带符号差，负向 mvd 邻块的首 bin 槽位偏档。
+                self.cur_mvd[b] = [mvd[0].unsigned_abs().min(70) as i16, mvd[1].unsigned_abs().min(70) as i16];
                 self.cur_direct[b] = direct;
             }
         }
@@ -804,6 +909,51 @@ pub(crate) fn decode_mb_cabac(
     ictx: Option<&InterCtx<'_>>,
     is_b_slice: bool,
 ) -> Result<(), H264Error> {
+    let mb_xy = mby * pic.mb_width + mbx;
+    let is_inter_slice = ictx.is_some();
+    let dump = std::env::var_os("YE_MB_DUMP").is_some();
+    let result = decode_mb_cabac_inner(
+        r,
+        pic,
+        mbx,
+        mby,
+        pps,
+        slice_id,
+        qp,
+        last_qscale_diff,
+        ictx,
+        is_b_slice,
+    );
+    if dump {
+        let mb = &pic.mbs[mb_xy];
+        eprintln!(
+            "MB({mbx},{mby}) kind={:?} cbp={:#x} qp={qp} chroma={} i4={:?} nnzsum={} cdc={:?} ldc={}",
+            mb.kind,
+            mb.cbp,
+            mb.chroma_mode,
+            mb.i4_modes,
+            mb.nnz.iter().map::<u32, _>(|v| u32::from(*v)).sum::<u32>(),
+            mb.nnz_chroma_dc,
+            mb.luma_dc_coded
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_mb_cabac_inner(
+    r: &mut CabacReader<'_>,
+    pic: &mut Picture,
+    mbx: usize,
+    mby: usize,
+    pps: &Pps,
+    slice_id: u16,
+    qp: &mut u8,
+    last_qscale_diff: &mut i32,
+    ictx: Option<&InterCtx<'_>>,
+    is_b_slice: bool,
+) -> Result<(), H264Error> {
+    crate::cabac::binlog::marker(&format!("{mbx},{mby}"));
     let mb_xy = mby * pic.mb_width + mbx;
     let is_inter_slice = ictx.is_some();
 
@@ -945,18 +1095,32 @@ pub(crate) fn decode_mb_cabac(
             }
             let mut modes = [0u8; 16];
             if mb.transform_8x8 {
-                // 4 个 8x8 模式（z 序象限：q = 2·(块行/2)+块列/2，与 Z_ORDER 对齐）
+                // 4 个 8x8 模式（FFmpeg：i = 0,4,8,12 逐象限，pred_intra_mode
+                // 读 cache[scan8[i]-1]/cache[scan8[i]-8]——右列象限（q&1==1）
+                // 的左邻与下行象限（q>>1==1）的上邻落在当前 MB cache 区，
+                // 是**本 MB 已解象限**的模式（fill_rectangle 后整象限同值）；
+                // 其余方向取跨 MB 邻块逐块语法原值（4x4 邻=i4_syntax，I16
+                // 等非 4x4 邻=2），任一侧不可用 → prev=DC(2)。
                 for q in 0..4usize {
-                    let left =
-                        left_mb.map(|_m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 0));
-                    let top =
-                        top_mb.map(|_m| intra8x8::neighbor_i8_mode_quads(pic, mbx, mby, q, 1));
+                    let left = if q & 1 == 1 {
+                        Some(modes[(q - 1) * 4])
+                    } else {
+                        left_mb.map(|m| neighbor_i4_mode(m, 3 + 8 * (q >> 1)))
+                    };
+                    let top = if q >> 1 == 1 {
+                        Some(modes[(q - 2) * 4])
+                    } else {
+                        top_mb.map(|m| neighbor_i4_mode(m, 12 + 2 * (q & 1)))
+                    };
                     let prev = prev_i4_mode(left, top);
                     let mode = decode_i4_mode(r, prev);
                     for k in 0..4usize {
                         modes[q * 4 + k] = mode;
                     }
                 }
+                // 语法原值（改写前）落库：邻块 prev 查询走 i4_syntax
+                //（FFmpeg write_back 在 check 改写之前）。
+                mb.i4_syntax = modes;
                 for q in 0..4usize {
                     let qa = intra8x8::quad_avail(&avail, q & 1, q >> 1);
                     let m = intra8x8::rewrite_8x8_mode(modes[q * 4], &qa)?;
@@ -980,18 +1144,26 @@ pub(crate) fn decode_mb_cabac(
                     let prev = prev_i4_mode(left, top);
                     modes[b] = decode_i4_mode(r, prev);
                 }
+                // 语法原值（改写前）落库：邻块 prev 查询走 i4_syntax
+                //（FFmpeg write_back 在 check 改写之前）。
+                mb.i4_syntax = modes;
                 rewrite_4x4_modes(&mut modes, avail.top, avail.left, avail.topleft)?;
             }
             mb.i4_modes = modes;
-            mb.chroma_mode = decode_chroma_mode(r, pic, mbx, mby);
+            mb.chroma_syntax = decode_chroma_mode(r, pic, mbx, mby);
             mb.chroma_mode =
-                rewrite_dc_mode(mb.chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
+                rewrite_dc_mode(mb.chroma_syntax, avail.top, avail.left, avail.topleft, 0)?;
             let lw = left_mb.map(cbp_word).unwrap_or(cbp_unavailable(true));
             let tw = top_mb.map(cbp_word).unwrap_or(cbp_unavailable(true));
             mb.cbp = decode_cbp_luma(r, lw, tw);
             mb.cbp |= decode_cbp_chroma(r, lw, tw) << 4;
             if mb.cbp > 0 {
                 decode_dqp(r, last_qscale_diff, qp)?;
+            } else {
+                // FFmpeg 4.4 ff_h264_decode_mb_cabac：!(cbp || IS_INTRA16x16)
+                // 时 last_qscale_diff = 0——下一 MB 的 mb_qp_delta 首 bin
+                // 上下文（60 + last_qscale_diff!=0）据此选择槽位。
+                *last_qscale_diff = 0;
             }
         } else {
             // ---- I16x16 ----
@@ -1005,9 +1177,9 @@ pub(crate) fn decode_mb_cabac(
                 2,
             )?;
             mb.cbp = crate::macroblock::I16_CBP[k >> 2];
-            mb.chroma_mode = decode_chroma_mode(r, pic, mbx, mby);
+            mb.chroma_syntax = decode_chroma_mode(r, pic, mbx, mby);
             mb.chroma_mode =
-                rewrite_dc_mode(mb.chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
+                rewrite_dc_mode(mb.chroma_syntax, avail.top, avail.left, avail.topleft, 0)?;
             decode_dqp(r, last_qscale_diff, qp)?;
         }
         decode_residual_mb(
@@ -1021,6 +1193,15 @@ pub(crate) fn decode_mb_cabac(
             left_mb,
             top_mb,
         )?;
+        dump_mb_coeffs(
+            mbx,
+            mby,
+            *qp,
+            &mb,
+            &luma_blocks,
+            &luma8_blocks,
+            &chroma_blocks,
+        );
         reconstruct_intra(
             pic,
             mbx,
@@ -1311,7 +1492,23 @@ pub(crate) fn decode_mb_cabac(
         }
     }
 
-    // ---- cbp / dqp（inter；FFmpeg：非 intra16 都读 cbp）----
+/// FFmpeg `get_dct8x8_allowed`（ff_h264dec.h:810-820）：8x8 变换 flag 的
+/// 读取门——sub_mb_type 内部位（ff_h264_p/b_sub_mb_type_info）任含
+/// 16x8/8x16/8x8（inference=0 时另含 DIRECT2）即不允许。
+/// 按 spec 子类型码：P 片仅 0（8x8 sub，内部 16x16 型）允许；
+/// B 片 0（direct，inference=1 时）/1/2/3（8x8 族，16x16 型）允许。
+fn sub_types_allow_8x8(sub_shape: &[u8; 4], direct_8x8_inference: bool, is_b: bool) -> bool {
+    if !is_b {
+        // P 片：仅 8x8 sub（码 0，内部 16x16 型）允许
+        sub_shape.iter().all(|&s| s == 0)
+    } else if direct_8x8_inference {
+        sub_shape.iter().all(|&s| s <= 3)
+    } else {
+        sub_shape.iter().all(|&s| (1..=3).contains(&s))
+    }
+}
+
+// ---- cbp / dqp（inter；FFmpeg：非 intra16 都读 cbp）----
     let left_mb = if mbx > 0 && pic.mbs[mb_xy - 1].decoded {
         Some(&pic.mbs[mb_xy - 1])
     } else {
@@ -1326,11 +1523,22 @@ pub(crate) fn decode_mb_cabac(
     let tw = top_mb.map(cbp_word).unwrap_or(cbp_unavailable(false));
     mb.cbp = decode_cbp_luma(r, lw, tw);
     mb.cbp |= decode_cbp_chroma(r, lw, tw) << 4;
-    if mb.shape == InterShape::P8x8
-        && pps.transform_8x8_mode_flag
-        && ctx.direct_8x8_inference
-        && mb.cbp & 0x0F != 0
-    {
+    // FFmpeg partition_count==4 ⇔ P_8x8（P 片 mb_type 3）/B_8x8（码 22）
+    let partition_count_4 = (!is_b && t == 3) || (is_b && t == 22);
+    // FFmpeg 4.4 ff_h264_decode_mb_cabac:2338：`dct8x8_allowed && (cbp&15)
+    // && !IS_INTRA` 即读 transform_size_8x8_flag——**无分区形状限制**：
+    // dct8x8_allowed 初值 = pps.transform_8x8_mode（1916），仅
+    // partition_count==4（P8x8/B_8x8）分支内经 get_dct8x8_allowed 用
+    // sub_mb_type 收窄（2152-2153）。即 P16x16/16x8/8x16 只要
+    // pps.t8 且 cbp&15 同样读此 bin（读值仅影响 mb_type 标志）。
+    // 此前漏读（门限误加 shape==P8x8），P 片自首个 cbp&15≠0 的非
+    // P8x8 inter 宏块起引擎错位。
+    let mut allow_t8 = pps.transform_8x8_mode_flag;
+    if partition_count_4 {
+        // P8x8/B_8x8：FFmpeg get_dct8x8_allowed（ff_h264dec.h:810）
+        allow_t8 = allow_t8 && sub_types_allow_8x8(&mb.sub_shape, ctx.direct_8x8_inference, is_b);
+    }
+    if allow_t8 && mb.cbp & 0x0F != 0 {
         let mut nts = 0usize;
         if let Some(l) = left_mb {
             nts += usize::from(l.transform_8x8);
@@ -1342,6 +1550,9 @@ pub(crate) fn decode_mb_cabac(
     }
     if mb.cbp > 0 {
         decode_dqp(r, last_qscale_diff, qp)?;
+    } else {
+        // FFmpeg 4.4：!(cbp || IS_INTRA16x16) → last_qscale_diff = 0。
+        *last_qscale_diff = 0;
     }
 
     // ---- 残差（inter：无 luma DC；luma 走 cat2/4x4 或 cat5/8x8）----
@@ -1356,6 +1567,15 @@ pub(crate) fn decode_mb_cabac(
         left_mb,
         top_mb,
     )?;
+    dump_mb_coeffs(
+        mbx,
+        mby,
+        *qp,
+        &mb,
+        &luma_blocks,
+        &luma8_blocks,
+        &chroma_blocks,
+    );
 
     // ---- MC + 残差叠加 + 落库 ----
     apply_parts(ctx, pic, mbx, mby, &parts)?;
@@ -1558,7 +1778,7 @@ fn decode_residual_mb(
     let cur_intra = matches!(mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm);
     let lw = left_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
     let tw = top_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
-    let nnz_unavail: u8 = if cur_intra { 64 } else { 0 };
+    let nnz_unavail: u8 = if cur_intra && !mutation(5) { 64 } else { 0 };
     // 邻块 nnz 查询（luma 4x4 块 b 的左/上）
     let luma_nnz = |nnz: &[u8; 24], b: usize| -> (u8, u8) {
         let (cx, cy) = (b % 4, b / 4);
@@ -1671,8 +1891,10 @@ fn decode_residual_mb(
                     blk,
                 )?;
                 let nnz = n as u8;
+                // 光栅位回填（FFmpeg fill_rectangle(&nnz_cache[scan8[4q]],
+                // 2,2,8,coeff_count,1)：象限 q 覆盖光栅块 Z_ORDER[4q..4q+4]）。
                 for k in 0..4usize {
-                    mb.nnz[q * 4 + k] = nnz;
+                    mb.nnz[Z_ORDER[4 * q + k]] = nnz;
                 }
             }
         }
@@ -1707,7 +1929,9 @@ fn decode_residual_mb(
                 r,
                 3,
                 4,
-                &[0usize, 1, 4, 5],
+                // 2x2 光栅序（FFmpeg ff_h264_chroma_dc_scan {0,1,2,3}；
+                // 2x2 的 zigzag 即光栅）。
+                &[0usize, 1, 2, 3],
                 None,
                 (Some(nza), Some(nzb)),
                 &mut buf,

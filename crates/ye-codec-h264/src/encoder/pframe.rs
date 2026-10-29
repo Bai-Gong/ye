@@ -388,6 +388,7 @@ pub(crate) fn encode_p_frame(
     // decode_skip_mb 的帧间上下文（单参考帧 = 上一帧重建）
     let l0 = [refp.clone()];
     let ictx = InterCtx {
+        wp: crate::slice::WpTables::default(),
         l0: &l0,
         l1: &[],
         constrained: false,

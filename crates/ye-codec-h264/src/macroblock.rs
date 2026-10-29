@@ -659,6 +659,14 @@ pub(crate) struct Macroblock {
     pub i4_modes: [u8; 16],
     /// chroma 预测模式（spec 编号 0=DC,1=H,2=V,3=Plane + 变体 4..6）。
     pub chroma_mode: u8,
+    /// chroma 预测模式**语法原值**（改写前 0..3；FFmpeg
+    /// `chroma_pred_mode_table` 语义，供 CABAC 邻块 ctx 查询；
+    /// inter/skip/未解码 = 0 与 FFmpeg 同）。
+    pub chroma_syntax: u8,
+    /// Intra4x4 预测模式**语法原值**（光栅 16 块、改写前 0..8；FFmpeg
+    /// `write_back_intra_pred_mode` 在 `check` 改写**之前**落库——
+    /// 邻块 prev 查询取改写前值。非 I4x4 宏块无意义（查询走 2）。
+    pub i4_syntax: [u8; 16],
     /// nnz：0..15 luma（光栅，I16 为 AC 计数）、16..19 Cb AC、20..23 Cr AC。
     /// PCM 时全部 = 16。
     pub nnz: [u8; 24],
@@ -708,6 +716,8 @@ impl Default for Macroblock {
             i16_mode: 2,
             i4_modes: [2; 16],
             chroma_mode: 0,
+            chroma_syntax: 0,
+            i4_syntax: [2; 16],
             nnz: [0; 24],
             nnz_chroma_dc: [0; 2],
             luma_dc_coded: false,
@@ -1010,9 +1020,13 @@ pub(crate) fn nc_chroma_dc(left: Option<u8>, top: Option<u8>) -> u8 {
 
 /// 邻块 Intra4x4 模式（非 I4x4 邻块贡献 2=DC——FFmpeg
 /// `fill_decode_caches` 的 `2 - 3*!avail` 语义；可用性由调用方判定）。
+/// 取**语法原值**（改写前）——FFmpeg `write_back_intra_pred_mode`
+/// 先落库后由 `check` 改写缓存，邻块读到的是改写前值。
+/// （缺陷修复登记 2026-10-29：曾取改写后值——边角块被改写成 DC
+/// 变体后 prev 随之漂移，预测错位。）
 pub(crate) fn neighbor_i4_mode(mb: &Macroblock, slot: usize) -> u8 {
     if mb.kind == MbKind::Intra4x4 {
-        mb.i4_modes[slot]
+        mb.i4_syntax[slot]
     } else {
         2
     }
@@ -1767,9 +1781,11 @@ pub(crate) fn decode_macroblock(
             }
             modes[b] = mode;
         }
+        mb.i4_syntax = modes;
         rewrite_4x4_modes(&mut modes, avail.top, avail.left, avail.topleft)?;
         mb.i4_modes = modes;
         let chroma_mode = r.ue()? as u8;
+        mb.chroma_syntax = chroma_mode;
         mb.chroma_mode = rewrite_dc_mode(chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
 
         // coded_block_pattern me(v)
@@ -1817,6 +1833,7 @@ pub(crate) fn decode_macroblock(
         mb.cbp = I16_CBP[k >> 2];
         mb.kind = MbKind::Intra16x16;
         let chroma_mode = r.ue()? as u8;
+        mb.chroma_syntax = chroma_mode;
         mb.chroma_mode = rewrite_dc_mode(chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
         // mb_qp_delta：I16 恒解析（spec：cbp>0 || Intra16x16）
         apply_qp_delta(r, qp)?;

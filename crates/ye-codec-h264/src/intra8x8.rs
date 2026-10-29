@@ -166,8 +166,14 @@ impl Edge8<'_> {
     fn at(&self, x: i32, y: i32) -> i32 {
         let px = self.ox as i64 + i64::from(x);
         let py = self.oy as i64 + i64::from(y);
-        if px < 0 || py < 0 || px >= self.luma.len() as i64 / self.stride as i64 {
+        // px 以行跨度（stride）为界、py 以行数（len/stride）为界——
+        // 原实现误把行数当 x 上界，最右宏块列（x ≥ 行数）的边沿
+        // 样本被误判越界恒读 0，重建整块归零。
+        if px < 0 || py < 0 || px >= self.stride as i64 {
             return 0; // 不可用侧由调用方保证不读（模式改写）
+        }
+        if py >= self.luma.len() as i64 / self.stride as i64 {
+            return 0;
         }
         if py * self.stride as i64 + px >= self.luma.len() as i64 {
             return 0;
@@ -189,7 +195,7 @@ fn load_top(e: &Edge8, q: &QuadAvail) -> [i32; 8] {
 }
 
 /// 滤波顶边延伸 t8..t15（FFmpeg PREDICT_8x8_LOAD_TOPRIGHT：不可得复制 t7）。
-fn load_topright(e: &Edge8, q: &QuadAvail, t7: i32) -> [i32; 8] {
+fn load_topright(e: &Edge8, q: &QuadAvail, _t7: i32) -> [i32; 8] {
     let s = |x: i32| e.at(x, -1);
     let mut t = [0i32; 8];
     if q.topright {
@@ -198,7 +204,11 @@ fn load_topright(e: &Edge8, q: &QuadAvail, t7: i32) -> [i32; 8] {
         }
         t[7] = (s(14) + 3 * s(15) + 2) >> 2;
     } else {
-        t = [t7; 8];
+        // FFmpeg PREDICT_8x8_LOAD_TOPRIGHT 不可用分支：t8..t15 = 原始
+        // 样本 SRC(7,-1)（未滤波）——此前误用滤波后 t7，边界非平坦时
+        // 8x8 DDL/DDLR 等低角输出偏差 ±1。
+        let s7 = s(7);
+        t = [s7; 8];
     }
     t
 }

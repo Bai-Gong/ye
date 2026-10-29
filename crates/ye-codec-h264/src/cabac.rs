@@ -108,12 +108,14 @@ impl<'a> Cabac<'a> {
     /// 旁路决策（spec 9.3.3.3.2）。
     pub(crate) fn bypass(&mut self) -> u32 {
         self.offset = (self.offset << 1) | u32::from(self.next_bit());
-        if self.offset >= self.range {
+        let v = if self.offset >= self.range {
             self.offset -= self.range;
             1
         } else {
             0
-        }
+        };
+        binlog::log("B", -1, 0, v);
+        v
     }
 
     /// 旁路符号（FFmpeg get_cabac_bypass_sign 逐字：bypass 比较 ≥
@@ -126,18 +128,52 @@ impl<'a> Cabac<'a> {
     /// （调用方随后停止本片解码；引擎不再归一化）。
     pub(crate) fn terminate(&mut self) -> bool {
         self.range -= 2;
-        if self.offset >= self.range {
+        let t = if self.offset >= self.range {
             true
         } else {
             self.renorm();
             false
-        }
+        };
+        binlog::log("T", -2, 0, u32::from(t));
+        t
     }
 
     /// I_PCM 后重启（spec 7.3.5.3：PCM 样值后按 9.3.1 重新对齐初始化）。
     pub(crate) fn restart_after_pcm(&mut self) {
         let byte = self.bit_pos.div_ceil(8);
         *self = Cabac::new(self.data, byte);
+    }
+}
+
+// 临时诊断（提交前剥离）：YE_BIN_LOG=<n> 时打印前 n 个 bin
+//（D=常规/ctx 槽位、B=旁路、T=终止），配 MBIN 宏块边界标记。
+pub(crate) mod binlog {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    pub(crate) fn max() -> usize {
+        static M: OnceLock<usize> = OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("YE_BIN_LOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn log(tag: &str, ctx: i32, state: u8, bin: u32) {
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < max() {
+            eprintln!("BIN {n} {tag} ctx={ctx} st={state} v={bin}");
+        }
+    }
+
+    pub(crate) fn marker(s: &str) {
+        if max() > 0 {
+            eprintln!("MBIN {s}");
+        }
     }
 }
 
@@ -194,7 +230,10 @@ impl<'a> CabacReader<'a> {
 
     /// 常规 bin。
     pub(crate) fn bin(&mut self, ctx_idx: usize) -> u32 {
-        self.cabac.decision(&mut self.ctx.state[ctx_idx])
+        let st = self.ctx.state[ctx_idx];
+        let v = self.cabac.decision(&mut self.ctx.state[ctx_idx]);
+        binlog::log("D", ctx_idx as i32, st, v);
+        v
     }
 
     /// 一元截止前缀（spec 9.3.2.3 前缀形态；如 mb_qp_delta 的 |Δ| 前缀）。

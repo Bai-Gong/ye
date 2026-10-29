@@ -26,6 +26,8 @@ use crate::mc;
 pub(crate) struct InterCtx<'a> {
     /// List0（已含默认序 + 重排）。
     pub l0: &'a [Arc<Picture>],
+    /// 加权预测表（恒等权重时 MC 走原路径）。
+    pub wp: crate::slice::WpTables,
     /// List1（B 片）。
     pub l1: &'a [Arc<Picture>],
     /// constrained_intra_pred_flag。
@@ -520,6 +522,10 @@ pub(crate) fn apply_parts(
                 .ok_or_else(|| H264Error::InvalidData(format!("ref_idx l0 {ri} out of range")))?
                 .clone();
             mc_partition(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv)?;
+            if !ctx.wp.is_identity() {
+                let w = ctx.wp.l0.get(ri as usize).copied().unwrap_or_default();
+                weight_partition(pic, mbx, mby, p.bx, p.by, p.w, p.h, w, &ctx.wp);
+            }
         }
         // list1：avg（与已写结果平均）；仅 list1（无 list0）时先 put
         if let Some((ri, mv)) = p.l1 {
@@ -529,13 +535,62 @@ pub(crate) fn apply_parts(
                 .ok_or_else(|| H264Error::InvalidData(format!("ref_idx l1 {ri} out of range")))?
                 .clone();
             if p.l0.is_some() {
+                // B 双向显式加权（idc==2）需要 biweight 组合——本路径覆盖
+                // idc==0 的 rnd 平均（x264 默认）；显式加权流会在此前被拒。
                 mc_partition_avg(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv)?;
             } else {
                 mc_partition(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv)?;
+                if !ctx.wp.is_identity() {
+                    let w = ctx.wp.l1.get(ri as usize).copied().unwrap_or_default();
+                    weight_partition(pic, mbx, mby, p.bx, p.by, p.w, p.h, w, &ctx.wp);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// 分区区域加权（FFmpeg h264weight `weight_h264_pixels` 逐字：
+/// dst = clip((dst·w + (o<<ld) + (1<<(ld−1))) >> ld)）。
+#[allow(clippy::too_many_arguments)]
+fn weight_partition(
+    pic: &mut Picture,
+    mbx: usize,
+    mby: usize,
+    bx: i32,
+    by: i32,
+    w: i32,
+    h: i32,
+    wt: crate::slice::WpWeights,
+    tab: &crate::slice::WpTables,
+) {
+    let ls = pic.luma_stride();
+    let cs = pic.chroma_stride();
+    let lx = (mbx as i32 * 16 + bx * 4) as usize;
+    let ly = (mby as i32 * 16 + by * 4) as usize;
+    let (wpx, hpx) = ((w * 4) as usize, (h * 4) as usize);
+    let apply = |plane: &mut [u8], stride: usize, base: usize, pw: usize, ph: usize,
+                 (wt, off): (i32, i32), ld: u32| {
+        if wt == (1i32 << ld) && off == 0 {
+            return;
+        }
+        let bias = if ld > 0 {
+            (off << ld) + (1 << (ld - 1))
+        } else {
+            off
+        };
+        for y in 0..ph {
+            let row = &mut plane[base + y * stride..base + y * stride + pw];
+            for px in row.iter_mut() {
+                *px = ((i32::from(*px) * wt + bias) >> ld).clamp(0, 255) as u8;
+            }
+        }
+    };
+    apply(&mut pic.luma, ls, ly * ls + lx, wpx, hpx, wt.y, tab.luma_log2_denom);
+    let (cx, cy) = (lx / 2, ly / 2);
+    let cbase = cy * cs + cx;
+    apply(&mut pic.cb, cs, cbase, wpx / 2, hpx / 2, wt.u, tab.chroma_log2_denom);
+    apply(&mut pic.cr, cs, cbase, wpx / 2, hpx / 2, wt.v, tab.chroma_log2_denom);
 }
 
 /// avg 变体分区 MC（luma/chroma 均与现值 rnd 平均）。

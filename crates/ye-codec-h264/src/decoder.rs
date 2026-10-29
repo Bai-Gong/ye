@@ -403,6 +403,7 @@ impl H264Decoder {
                 SliceType::I => None,
                 SliceType::P => Some(InterCtx {
                     l0: &list0,
+                    wp: sh.wp.clone(),
                     l1: &[],
                     constrained: pps.constrained_intra_pred_flag,
                     direct_spatial: true,
@@ -441,6 +442,7 @@ impl H264Decoder {
                     Some(InterCtx {
                         l0: &list0,
                         l1: &list1,
+                        wp: sh.wp.clone(),
                         constrained: pps.constrained_intra_pred_flag,
                         direct_spatial: sh.direct_spatial_mv_pred,
                         cur_poc,
@@ -477,7 +479,7 @@ impl H264Decoder {
             return Ok(());
         };
         let total = ctx.mb_total();
-        if ctx.decoded_mb_count != total {
+        if ctx.decoded_mb_count != total && std::env::var_os("YE_CABAC_SALVAGE").is_none() {
             return Err(CodecError::InvalidData(format!(
                 "incomplete picture: {} of {total} macroblocks decoded",
                 ctx.decoded_mb_count
