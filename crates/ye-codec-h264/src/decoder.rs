@@ -1027,6 +1027,20 @@ fn build_frame(pic: &Picture, pts: Option<Timestamp>) -> Result<VideoFrame, H264
     copy_in(vf.plane_mut(0), ls, &pic.luma, pic.luma_stride(), h, w);
     copy_in(vf.plane_mut(1), cs, &pic.cb, pic.chroma_stride(), ch, cw);
     copy_in(vf.plane_mut(2), cs, &pic.cr, pic.chroma_stride(), ch, cw);
+    // 临时诊断（提交前剥离）：YE_DUMP_Y=<n> 落盘前 n 帧 luma 原始面
+    //（与 ffmpeg rawvideo 口径对拍用，stride 紧致）。
+    if let Ok(n) = std::env::var("YE_DUMP_Y") {
+        if let Ok(n) = n.parse::<usize>() {
+            static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let k = IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k < n {
+                let _ = std::fs::write(
+                    std::env::temp_dir().join(format!("ye-dump-f{k}.y")),
+                    &pic.luma[..h * pic.luma_stride()],
+                );
+            }
+        }
+    }
     Ok(vf)
 }
 

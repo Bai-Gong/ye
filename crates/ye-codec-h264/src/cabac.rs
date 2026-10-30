@@ -230,6 +230,31 @@ impl<'a> CabacReader<'a> {
 
     /// 常规 bin。
     pub(crate) fn bin(&mut self, ctx_idx: usize) -> u32 {
+        // 临时诊断（提交前剥离）：
+        // YE_INJECT_ABS/YE_INJECT_S——第 n 个 D bin 后用 slot 追加读一个 bin；
+        // YE_SUBST_ABS/YE_SUBST_S——第 n 个 D bin 改用 slot 读（换槽分叉枚举）。
+        let mut ctx_idx = ctx_idx;
+        {
+            let inj_a = std::env::var("YE_INJECT_ABS").unwrap_or_default().parse::<usize>().ok();
+            let inj_s = std::env::var("YE_INJECT_S").ok().and_then(|x| x.parse::<usize>().ok());
+            let sub_a = std::env::var("YE_SUBST_ABS").unwrap_or_default().parse::<usize>().ok();
+            let sub_s = std::env::var("YE_SUBST_S").ok().and_then(|x| x.parse::<usize>().ok());
+            if inj_a.is_some() || sub_a.is_some() {
+                static CNT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let k = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let (Some(a), Some(s2)) = (sub_a, sub_s) {
+                    if k == a {
+                        ctx_idx = s2;
+                    }
+                }
+                if let (Some(a), Some(s2)) = (inj_a, inj_s) {
+                    if k == a {
+                        let _ = self.cabac.decision(&mut self.ctx.state[s2]);
+                    }
+                }
+            }
+        }
         let st = self.ctx.state[ctx_idx];
         let v = self.cabac.decision(&mut self.ctx.state[ctx_idx]);
         binlog::log("D", ctx_idx as i32, st, v);
