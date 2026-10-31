@@ -53,3 +53,7 @@ filter-stubs = []
 # 仅存于测试编译单元，不进产品依赖面。
 ye-codec-h264 = { path = "../ye-codec-h264" }
 ye-codec-aac = { path = "../ye-codec-aac" }
+
+[[example]]
+name = "recording_acceptance"
+required-features = ["mp4", "h264", "aac", "png"]
