@@ -468,7 +468,7 @@ fn run_segment(
 /// 定夺并发射所有「时刻早于该帧 pts」的 tick，`finish` 冲尾部余量。
 ///
 /// tick 时刻比较在 µs × 帧率分子 域做整数交叉相乘（i128），无 f64。
-struct CfrSampler {
+pub(crate) struct CfrSampler {
     /// 段号（0 起，报错用 1 起）。
     seg_index: usize,
     /// 窗口起点（µs）。
@@ -488,7 +488,7 @@ struct CfrSampler {
 
 impl CfrSampler {
     /// 构造（窗口与帧率校验 + tick 数推导）。
-    fn new(
+    pub(crate) fn new(
         seg_index: usize,
         trim_in_us: i64,
         trim_out_us: i64,
@@ -531,7 +531,7 @@ impl CfrSampler {
 
     /// 送入一个窗口内帧（调用方已过滤窗口 + 过链；pts 升序）。触发发射
     /// 所有已定夺的 tick（`emit` 可能被调多次）。
-    fn push(
+    pub(crate) fn push(
         &mut self,
         frame: VideoFrame,
         emit: &mut dyn FnMut(&VideoFrame) -> Result<(), ConvertError>,
@@ -543,7 +543,7 @@ impl CfrSampler {
     }
 
     /// 窗口结束：空窗（一帧未见）显式拒绝；余下 tick hold-last 补尾发射。
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         emit: &mut dyn FnMut(&VideoFrame) -> Result<(), ConvertError>,
     ) -> Result<(), ConvertError> {

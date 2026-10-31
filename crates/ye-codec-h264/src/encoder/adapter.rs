@@ -85,6 +85,7 @@ pub struct H264Encoder {
     extradata: Vec<u8>,
     out: VecDeque<Packet>,
     recon: Vec<ReconFrame>,
+    record_recon: bool,
     time_base: Rational,
     frame_rate: Rational,
     frame_index: u64,
@@ -181,6 +182,7 @@ impl H264Encoder {
             extradata: build_avcc(&sps, &pps),
             out: VecDeque::new(),
             recon: Vec::new(),
+            record_recon: true,
             time_base: config.time_base,
             frame_rate: video.frame_rate,
             frame_index: 0,
@@ -303,11 +305,13 @@ impl H264Encoder {
             packet.flags.insert(PacketFlags::KEYFRAME);
         }
         self.out.push_back(packet);
-        self.recon.push(ReconFrame {
-            luma: encoded.recon_luma,
-            cb: encoded.recon_cb,
-            cr: encoded.recon_cr,
-        });
+        if self.record_recon {
+            self.recon.push(ReconFrame {
+                luma: encoded.recon_luma,
+                cb: encoded.recon_cb,
+                cr: encoded.recon_cr,
+            });
+        }
         if let Some(rc) = self.rate.as_mut() {
             rc.report_frame(frame_bits, qp);
         }
@@ -386,7 +390,9 @@ fn codec_err(e: H264Error) -> CodecError {
 /// 见 [`H264Encoder::new`]（真工厂交付即校验，对照桩的「工厂不校验」
 /// 语义——桩已删除）。
 pub fn encoder_factory(config: &EncoderConfig) -> Result<Box<dyn Encoder>, CodecError> {
-    Ok(Box::new(H264Encoder::new(config)?))
+    let mut encoder = H264Encoder::new(config)?;
+    encoder.record_recon = false;
+    Ok(Box::new(encoder))
 }
 
 // ---------------------------------------------------------------------------

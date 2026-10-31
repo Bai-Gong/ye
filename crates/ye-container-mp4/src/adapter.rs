@@ -250,11 +250,27 @@ impl Demuxer for Mp4Demuxer {
     /// 流表克隆 + 容器级时长（各轨时长重标度到 canonical 后取最大）。
     /// 重复调用合法（每次重建，读取器状态不受影响）。
     fn read_header(&mut self) -> Result<MediaHeader, ContainerError> {
-        let streams = self.reader.streams().to_vec();
+        let mut streams = self.reader.streams().to_vec();
+        for stream in &mut streams {
+            if let Some(ticks) = stream
+                .metadata
+                .get("mp4.edit.duration_ticks")
+                .and_then(|v| v.parse().ok())
+            {
+                stream.duration = Some(Timestamp::new(ticks, stream.time_base));
+                let start = stream
+                    .metadata
+                    .get("mp4.edit.start_ticks")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                stream.start_time = Some(Timestamp::new(start, stream.time_base));
+            }
+        }
         let mut duration: Option<Timestamp> = None;
         for s in &streams {
             let Some(d) = s.duration else { continue };
-            let canonical = d.to_canonical()?;
+            let end = d.checked_add(s.start_time.unwrap_or(Timestamp::new(0, s.time_base)))?;
+            let canonical = end.to_canonical()?;
             duration = Some(match duration {
                 None => canonical,
                 Some(cur) => {

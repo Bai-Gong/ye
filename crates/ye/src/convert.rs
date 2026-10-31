@@ -184,6 +184,19 @@ pub enum AudioEncodeSettings {
     Drop,
 }
 
+/// Additive output controls; the original convert entry point retains its defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvertOptions {
+    pub frame_rate: Option<Rational>,
+    pub audio_output: Option<AudioOutput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AudioOutput {
+    pub sample_rate: u32,
+    pub channels: u8,
+}
+
 /// 帧消费回调：过链后的帧（视频已转换/缩放，音频直通）逐帧送达。
 ///
 /// 返回 `Err` 即终止泵（消费方失败原样透传，见 [`ConvertError::Sink`]）。
@@ -393,6 +406,44 @@ pub fn convert(
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
 ) -> Result<ConvertStats, ConvertError> {
+    convert_with_options(
+        containers,
+        codecs,
+        input,
+        output_format,
+        output,
+        video,
+        audio,
+        &ConvertOptions::default(),
+        pixels,
+        progress,
+        cancel,
+    )
+}
+
+/// Transcode with rational CFR and streaming 44.1/48kHz mono/stereo output.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_with_options(
+    containers: &ContainerRegistry,
+    codecs: &CodecRegistry,
+    input: Box<dyn ReadSeek>,
+    output_format: &str,
+    output: Box<dyn WriteSeek>,
+    video: Option<&VideoEncodeSettings>,
+    audio: &AudioEncodeSettings,
+    options: &ConvertOptions,
+    pixels: PixelOps,
+    progress: ConvertProgress<'_>,
+    cancel: &AtomicBool,
+) -> Result<ConvertStats, ConvertError> {
+    if options.frame_rate.is_some_and(|r| r.num() <= 0) {
+        return Err(ConvertError::InvalidArguments("目标帧率须为正".into()));
+    }
+    if options.audio_output.is_some() && !matches!(audio, AudioEncodeSettings::Aac { .. }) {
+        return Err(ConvertError::InvalidArguments(
+            "音频输出配置要求 AAC 重编码".into(),
+        ));
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err(ConvertError::Cancelled);
     }
@@ -429,7 +480,12 @@ pub fn convert(
         let lane = match stream.media_type {
             // video = None：剥视频（纯音频输出，对标 -vn）。
             MediaType::Video => match video {
-                Some(settings) => Lane::Video(build_video_lane(codecs, stream, settings)?),
+                Some(settings) => Lane::Video(build_video_lane(
+                    codecs,
+                    stream,
+                    settings,
+                    options.frame_rate,
+                )?),
                 None => Lane::Dropped,
             },
             MediaType::Audio => match *audio {
@@ -445,7 +501,7 @@ pub fn convert(
                     out_index: 0,
                 }),
                 AudioEncodeSettings::Aac { bitrate_bps } => Lane::Audio(AudioLane::Encode(
-                    build_audio_encode_lane(codecs, stream, bitrate_bps)?,
+                    build_audio_encode_lane(codecs, stream, bitrate_bps, options.audio_output)?,
                 )),
                 AudioEncodeSettings::Drop => Lane::Dropped,
             },
@@ -501,6 +557,7 @@ fn build_video_lane(
     codecs: &CodecRegistry,
     stream: &Stream,
     video: &VideoEncodeSettings,
+    target_rate: Option<Rational>,
 ) -> Result<VideoLane, ConvertError> {
     let source = stream.codec.video.as_ref().ok_or_else(|| {
         ConvertError::InvalidArguments(format!(
@@ -509,7 +566,9 @@ fn build_video_lane(
         ))
     })?;
     let (width, height) = video.chain.size.unwrap_or((source.width, source.height));
-    let frame_rate = stream_frame_rate(stream).unwrap_or(Rational::RATE_25);
+    let frame_rate = target_rate
+        .or_else(|| stream_frame_rate(stream))
+        .unwrap_or(Rational::RATE_25);
     if frame_rate.num() <= 0 {
         return Err(ConvertError::InvalidArguments(format!(
             "视频流 #{} 帧率非正（{}/{}），无法配置编码器",
@@ -543,6 +602,24 @@ fn build_video_lane(
         size: (width, height),
         extradata: None,
         out_index: 0,
+        sampler: match target_rate {
+            Some(_) => Some(crate::compose::CfrSampler::new(
+                0,
+                0,
+                stream
+                    .duration
+                    .ok_or_else(|| ConvertError::InvalidArguments("改帧率要求已知源时长".into()))?
+                    .checked_add(
+                        stream
+                            .start_time
+                            .unwrap_or(Timestamp::new(0, stream.time_base)),
+                    )?
+                    .rescale(MICRO)?
+                    .ticks(),
+                frame_rate,
+            )?),
+            None => None,
+        },
     })
 }
 
@@ -656,6 +733,7 @@ struct VideoLane {
     extradata: Option<Vec<u8>>,
     /// 输出流号（`write_header` 时分配）。
     out_index: u32,
+    sampler: Option<crate::compose::CfrSampler>,
 }
 
 /// AAC-LC 每帧样本数（长窗；编码轨的成帧粒度）。
@@ -670,6 +748,7 @@ fn build_audio_encode_lane(
     codecs: &CodecRegistry,
     stream: &Stream,
     bitrate_bps: u32,
+    output: Option<AudioOutput>,
 ) -> Result<EncodeAudioLane, ConvertError> {
     let audio = stream.codec.audio.as_ref().ok_or_else(|| {
         ConvertError::InvalidArguments(format!(
@@ -677,18 +756,24 @@ fn build_audio_encode_lane(
             stream.index
         ))
     })?;
-    let sample_rate = audio.sample_rate;
+    let sample_rate = output.map_or(audio.sample_rate, |o| o.sample_rate);
     if sample_rate == 0 {
         return Err(ConvertError::InvalidArguments(format!(
             "音频流 #{} 采样率为 0，无法配置 AAC 编码器",
             stream.index
         )));
     }
-    let Some(layout) = audio.channel_layout else {
+    let Some(source_layout) = audio.channel_layout else {
         return Err(ConvertError::InvalidArguments(format!(
             "音频流 #{} 缺声道布局（容器未携带），无法配置 AAC 编码器",
             stream.index
         )));
+    };
+    let layout = match output.map(|o| o.channels) {
+        None => source_layout,
+        Some(1) => ChannelLayout::MONO,
+        Some(2) => ChannelLayout::STEREO,
+        _ => return Err(ConvertError::InvalidArguments("输出须为单/双声道".into())),
     };
     // ChannelLayout 的声道数（u32 → usize 在本库目标平台恒无损；0 声道
     // 由类型不变式排除）。
@@ -736,6 +821,33 @@ fn build_audio_encode_lane(
         layout,
         channels,
         out_index: 0,
+        resampler: output
+            .map(|_| {
+                ye_filter::audio::Resampler::new(
+                    audio.sample_rate,
+                    sample_rate,
+                    source_layout.channels() as usize,
+                    channels,
+                )
+            })
+            .transpose()
+            .map_err(filter_err)?,
+        source_rate: audio.sample_rate,
+        source_channels: source_layout.channels() as usize,
+        source_frames: 0,
+        source_end: stream
+            .duration
+            .map(|d| {
+                d.checked_add(
+                    stream
+                        .start_time
+                        .unwrap_or(Timestamp::new(0, stream.time_base)),
+                )
+            })
+            .transpose()?
+            .map(|d| d.rescale(Rational::new(1, audio.sample_rate as i32)))
+            .transpose()?
+            .map(|d| d.ticks()),
     })
 }
 
@@ -804,6 +916,11 @@ struct EncodeAudioLane {
     channels: usize,
     /// 输出流号（`write_header` 时分配）。
     out_index: u32,
+    resampler: Option<ye_filter::audio::Resampler>,
+    source_rate: u32,
+    source_channels: usize,
+    source_frames: i64,
+    source_end: Option<i64>,
 }
 
 /// 封装头状态：视频首包未到 → 缓冲音频包；落头后 → 直写。
@@ -876,8 +993,24 @@ impl EncodeRun<'_> {
             // 编码槽只吃 yuv420p：处理后帧仍非 yuv420p 时再过一次转换槽。
             (self.pixels.convert)(&frame, PixelFormat::Yuv420p)?
         };
+        let sampler = match self.lanes.get_mut(index) {
+            Some(Lane::Video(lane)) => lane.sampler.take(),
+            _ => None,
+        };
+        if let Some(mut sampler) = sampler {
+            let result = sampler.push(frame, &mut |f| self.feed_video(index, f));
+            if let Some(Lane::Video(lane)) = self.lanes.get_mut(index) {
+                lane.sampler = Some(sampler);
+            }
+            result
+        } else {
+            self.feed_video(index, &frame)
+        }
+    }
+
+    fn feed_video(&mut self, index: usize, frame: &VideoFrame) -> Result<(), ConvertError> {
         if let Some(Lane::Video(lane)) = self.lanes.get_mut(index) {
-            lane.encoder.feed(&Frame::Video(frame))?;
+            lane.encoder.feed(&Frame::Video(frame.clone()))?;
         }
         self.video_frames += 1;
         self.drain_encoder(index)
@@ -977,6 +1110,53 @@ impl EncodeRun<'_> {
                 "音频解码帧字节数非 4 的倍数（packed f32 破损）".into(),
             ));
         }
+        let has_resampler = matches!(self.lanes.get(index), Some(Lane::Audio(AudioLane::Encode(lane))) if lane.resampler.is_some());
+        if has_resampler {
+            let (rate, channels, cursor, end) = match &self.lanes[index] {
+                Lane::Audio(AudioLane::Encode(lane)) => (
+                    lane.source_rate,
+                    lane.source_channels,
+                    lane.source_frames,
+                    lane.source_end,
+                ),
+                _ => return Ok(()),
+            };
+            let start = frame
+                .pts()
+                .ok_or_else(|| ConvertError::InvalidData("音频帧缺时间戳".into()))?
+                .rescale(Rational::new(1, rate as i32))?
+                .ticks();
+            if channels == 0 || !(bytes.len() / 4).is_multiple_of(channels) {
+                return Err(ConvertError::InvalidData("音频采样声道布局损坏".into()));
+            }
+            // Fill genuine timestamp gaps in bounded blocks. Negative priming is decoded then discarded.
+            let gap_end = start.min(end.unwrap_or(i64::MAX));
+            let mut at = cursor;
+            while at < gap_end {
+                let n = (gap_end - at).min(1024) as usize;
+                self.resample_audio(index, &vec![0.0; n * channels])?;
+                at += n as i64;
+            }
+            let n = bytes.len() / 4 / channels;
+            let skip = at.saturating_sub(start).max(0).min(n as i64) as usize;
+            let stop = end.map_or(n, |end| {
+                end.saturating_sub(start).max(0).min(n as i64) as usize
+            });
+            if skip < stop {
+                let pcm: Vec<_> = bytes[skip * channels * 4..stop * channels * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                self.resample_audio(index, &pcm)?;
+                at = start + stop as i64;
+            }
+            if let Lane::Audio(AudioLane::Encode(lane)) = &mut self.lanes[index] {
+                lane.source_frames = at;
+            }
+            return Ok(());
+        }
         if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index) {
             lane.samples.extend(
                 bytes
@@ -985,6 +1165,16 @@ impl EncodeRun<'_> {
                     .iter()
                     .map(|c| f32::from_le_bytes(*c)),
             );
+        }
+        self.flush_audio_chunks(index)
+    }
+
+    fn resample_audio(&mut self, index: usize, pcm: &[f32]) -> Result<(), ConvertError> {
+        if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index)
+            && let Some(resampler) = lane.resampler.as_mut()
+        {
+            lane.samples
+                .extend(resampler.push(pcm).map_err(filter_err)?);
         }
         self.flush_audio_chunks(index)
     }
@@ -1145,6 +1335,19 @@ impl EncodeRun<'_> {
             }
             self.drain_video_decoder(index)?;
             self.drain_audio_decoder(index)?;
+            let sampler = match self.lanes.get_mut(index) {
+                Some(Lane::Video(lane)) => lane.sampler.take(),
+                _ => None,
+            };
+            if let Some(mut sampler) = sampler {
+                sampler.finish(&mut |f| self.feed_video(index, f))?;
+            }
+            if let Some(Lane::Audio(AudioLane::Encode(lane))) = self.lanes.get_mut(index)
+                && let Some(resampler) = lane.resampler.as_mut()
+            {
+                lane.samples.extend(resampler.finish());
+            }
+            self.flush_audio_chunks(index)?;
             self.flush_audio_padding(index)?;
             if let Some(Lane::Video(lane)) = self.lanes.get_mut(index) {
                 lane.encoder.flush();
