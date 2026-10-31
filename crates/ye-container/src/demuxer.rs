@@ -32,8 +32,8 @@ pub trait Demuxer: Send + Sync {
     /// 读下一个包；EOF 返回 `Ok(None)`（此后幂等）。
     fn read_packet(&mut self) -> Result<Option<Packet>, ContainerError>;
 
-    /// 定位到 `target`（任意时基，实现内部精确比较）时刻的前一个
-    /// 关键帧，返回实际落到的时刻（指定流的时基）。流不存在 →
+    /// 定位到显示时刻 `target`（任意时基，实现内部精确比较）之前的
+    /// 关键帧，返回实际落到的解码时刻（指定流的时基）。流不存在 →
     /// `Err(ContainerError::StreamNotFound(..))`。
     fn seek(&mut self, stream_index: u32, target: Timestamp) -> Result<Timestamp, ContainerError>;
 }

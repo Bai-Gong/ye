@@ -352,10 +352,23 @@ impl Demuxer for Mp4Demuxer {
             return Err(ContainerError::StreamNotFound(stream_index));
         }
         let at_or_before = self.sample_at_or_before(si, target)?;
-        let key = self
+        let mut key = self
             .reader
             .keyframe_index_before(si, at_or_before)
             .map_err(map_read_err)?;
+        // DTS is monotone and supports binary search, but a B-frame GOP's IDR
+        // can decode before target while presenting after it. Retain the preceding
+        // GOP until the candidate keyframe's presentation time reaches target.
+        while key > 0 {
+            let timing = self.reader.sample_timing(si, key).map_err(map_read_err)?;
+            if Timestamp::compare(self.shifted(si, timing.pts)?, target).is_le() {
+                break;
+            }
+            key = self
+                .reader
+                .keyframe_index_before(si, key - 1)
+                .map_err(map_read_err)?;
+        }
         let landed = self
             .reader
             .sample_timing(si, key)
@@ -883,9 +896,17 @@ mod tests {
         let header = demuxer.read_header().unwrap();
         let v_tb = header.streams[0].time_base;
 
-        // target 0.35s（用毫秒时基表达，验证跨时基比较）：
-        // ≤0.35s 的最大视频样例是 3 号（0.3s，非关键帧）→ 回溯 2 号（0.2s）。
-        let target = Timestamp::new(350, Rational::new(1, 1000));
+        // Candidate key #2 decodes at .2s but presents at .4s. A .35s display
+        // target must retain key #0; .45s can safely start from key #2.
+        let early = demuxer
+            .seek(0, Timestamp::new(350, Rational::new(1, 1000)))
+            .unwrap();
+        assert_eq!(
+            early.ticks(),
+            0,
+            "future presentation GOP must not replace the current GOP"
+        );
+        let target = Timestamp::new(450, Rational::new(1, 1000));
         let landed = demuxer.seek(0, target).unwrap();
         assert_eq!(landed.time_base(), v_tb, "返回值应为流时基");
         assert_eq!(landed.ticks(), 2, "应落到 2 号关键帧（0.2s）");

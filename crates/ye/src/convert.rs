@@ -205,6 +205,67 @@ pub(crate) fn presentation_metadata(ticks: Option<i64>) -> Metadata {
     metadata
 }
 
+/// Check a transcode against actual stream parameters and registered codec factories.
+/// No output is opened. Factories are exercised again by execution; payload damage
+/// can only be established while decoding. Optional audio on a video task may be absent.
+pub fn check_convert(
+    header: &ye_container::MediaHeader,
+    codecs: &CodecRegistry,
+    video: Option<&VideoEncodeSettings>,
+    audio: &AudioEncodeSettings,
+    options: &ConvertOptions,
+) -> Vec<ConvertError> {
+    let mut issues = Vec::new();
+    if options.frame_rate.is_some_and(|r| r.num() <= 0) {
+        issues.push(ConvertError::InvalidArguments("目标帧率须为正".into()));
+    }
+    if options.audio_output.is_some() && !matches!(audio, AudioEncodeSettings::Aac { .. }) {
+        issues.push(ConvertError::InvalidArguments(
+            "音频输出配置要求 AAC 重编码".into(),
+        ));
+    }
+    let videos = header
+        .streams
+        .iter()
+        .filter(|s| s.media_type == MediaType::Video)
+        .count();
+    let audios = header
+        .streams
+        .iter()
+        .filter(|s| s.media_type == MediaType::Audio)
+        .count();
+    if video.is_some() && videos != 1 {
+        issues.push(ConvertError::InvalidArguments(format!(
+            "视频任务要求恰一条视频流，实际{videos}条"
+        )));
+    }
+    if video.is_none() && (matches!(audio, AudioEncodeSettings::Drop) || audios == 0) {
+        issues.push(ConvertError::InvalidArguments("任务没有可输出轨道".into()));
+    }
+    for stream in &header.streams {
+        let checked = match stream.media_type {
+            MediaType::Video => {
+                video.map(|v| build_video_lane(codecs, stream, v, options.frame_rate).map(drop))
+            }
+            MediaType::Audio => match audio {
+                AudioEncodeSettings::Aac { bitrate_bps } => Some(
+                    build_audio_encode_lane(codecs, stream, *bitrate_bps, options.audio_output)
+                        .map(drop),
+                ),
+                AudioEncodeSettings::Copy if stream.codec.codec != CodecId::Aac => Some(Err(
+                    ConvertError::InvalidArguments("MP4 任务音频直通仅支持 AAC".into()),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(Err(error)) = checked {
+            issues.push(error);
+        }
+    }
+    issues
+}
+
 /// 帧消费回调：过链后的帧（视频已转换/缩放，音频直通）逐帧送达。
 ///
 /// 返回 `Err` 即终止泵（消费方失败原样透传，见 [`ConvertError::Sink`]）。
@@ -299,7 +360,14 @@ pub fn convert_frames(
     let mut total_us = 0i64;
     for stream in &header.streams {
         if let Some(duration) = stream.duration {
-            let us = duration.rescale(MICRO)?.ticks();
+            let us = duration
+                .checked_add(
+                    stream
+                        .start_time
+                        .unwrap_or(Timestamp::new(0, stream.time_base)),
+                )?
+                .rescale(MICRO)?
+                .ticks();
             total_us = total_us.max(us);
         }
     }
@@ -477,7 +545,14 @@ pub fn convert_with_options(
     let mut total_us = 0i64;
     for stream in &header.streams {
         if let Some(duration) = stream.duration {
-            let us = duration.rescale(MICRO)?.ticks();
+            let us = duration
+                .checked_add(
+                    stream
+                        .start_time
+                        .unwrap_or(Timestamp::new(0, stream.time_base)),
+                )?
+                .rescale(MICRO)?
+                .ticks();
             total_us = total_us.max(us);
         }
     }

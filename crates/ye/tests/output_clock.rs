@@ -42,6 +42,38 @@ fn rational_cfr_and_resampled_mono_audio_have_one_origin() {
     ye::codec_h264::register_h264_encoder(&mut codecs);
     ye::codec_aac::register_aac(&mut codecs);
     ye::codec_aac::register_aac_encoder(&mut codecs);
+    let input_header = ye::media::inspect(Box::new(File::open(&input).unwrap())).unwrap();
+    assert!(
+        check_convert(
+            &input_header,
+            &codecs,
+            Some(&VideoEncodeSettings::default()),
+            &AudioEncodeSettings::Aac {
+                bitrate_bps: 128000
+            },
+            &ConvertOptions {
+                frame_rate: Some(Rational::new(24, 1)),
+                audio_output: Some(AudioOutput {
+                    sample_rate: 48000,
+                    channels: 2
+                })
+            }
+        )
+        .is_empty()
+    );
+    assert!(
+        !check_convert(
+            &input_header,
+            &codecs,
+            Some(&VideoEncodeSettings::default()),
+            &AudioEncodeSettings::Drop,
+            &ConvertOptions {
+                frame_rate: Some(Rational::ZERO),
+                audio_output: None
+            }
+        )
+        .is_empty()
+    );
     let stats = convert_with_options(
         &containers,
         &codecs,

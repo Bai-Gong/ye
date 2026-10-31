@@ -1112,3 +1112,7 @@ MP4 mux 模板可带 `mp4.presentation.duration_ticks`，写 v1 elst，并采用
 `audio_peaks_aligned_with_count` 只解码所需音轨，依据编辑列表与帧 PTS 排除 priming、保留开头静音。按已知呈现时长固定分桶，仅保存当前 PCM 块及桶累计器，内存不随素材长度增长。旧 `audio_peaks_with_count` 保留原始样本口径供历史调用与对拍。带250ms音频起点偏移的素材与 FFmpeg `-copyts` 参考比对使用原非PNS容差1.5e-4。
 
 Demuxer 在应用呈现裁尾前从原始样本表计算 frame_rate。禁止用裁过最后半帧的呈现时长反推编码帧率，否则24fps成片会被误识别成24.975fps。
+
+`convert::check_convert` 在不打开输出的情况下检查实际流、目标时钟与编解码器工厂；任务执行仍重新建轨校验。`timeline::check_timeline` 聚合窗口与静态参数问题，解码能力由 `media::validate_decoding` 检查。预检不能替代逐包解码来证明素材没有损坏。
+
+seek 的目标为显示时间，返回落地关键帧的 DTS。MP4 先二分 DTS 找候选，再检查关键帧 PTS；下一个 GOP 可能提前解码但尚未到显示时刻，此时必须回退到上一个 GOP。跨 GOP 的非关键帧裁剪与视频延迟200ms/音频延迟100ms的共同原点回归分别验收像素、PCM及转码进度总时长。

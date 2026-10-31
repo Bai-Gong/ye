@@ -288,7 +288,7 @@ fn non_keyframe_windows_seek_and_reorder_b_frames_before_selection() {
             "-bf",
             "3",
             "-g",
-            "60",
+            "30",
             "-y",
         ],
     ) else {
@@ -299,7 +299,7 @@ fn non_keyframe_windows_seek_and_reorder_b_frames_before_selection() {
     s.width = 64;
     s.height = 48;
     s.audio = AudioEncodeSettings::Drop;
-    let clips = [(1050000, 1250000, 0), (150000, 350000, 200000)]
+    let clips = [(950000, 1150000, 0), (150000, 350000, 200000)]
         .into_iter()
         .map(|(lo, hi, start)| TimelineClip {
             input: Box::new(File::open(&input).unwrap()),
@@ -337,7 +337,7 @@ fn non_keyframe_windows_seek_and_reorder_b_frames_before_selection() {
         .arg(&input)
         .args([
             "-vf",
-            "select='eq(n,4)+eq(n,7)+eq(n,31)+eq(n,34)'",
+            "select='eq(n,4)+eq(n,7)+eq(n,28)+eq(n,31)'",
             "-fps_mode",
             "passthrough",
             "-pix_fmt",
