@@ -33,12 +33,12 @@ fn facade_encodes_valid_png() {
         typed.extend_from_slice(data);
         assert_eq!(crc32(&typed), crc, "chunk #{seen} CRC");
         match seen {
-            0 => assert_eq!((ctype.as_ref(), len), (b"IHDR".as_slice(), 13)),
+            0 => assert_eq!((ctype, len), (b"IHDR".as_slice(), 13)),
             1 => {
                 assert_eq!(ctype, b"IDAT");
                 assert_eq!(&data[0..2], &[0x78, 0x9C], "fixed-Huffman 默认档 zlib 头");
             }
-            2 => assert_eq!((ctype.as_ref(), len), (b"IEND".as_slice(), 0)),
+            2 => assert_eq!((ctype, len), (b"IEND".as_slice(), 0)),
             _ => panic!("多余 chunk #{seen}"),
         }
         pos += 12 + len;
