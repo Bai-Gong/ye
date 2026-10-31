@@ -77,3 +77,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 安全文件输出：成功前不触碰目标路径。
 pub mod output;
+
+/// 容器与解码能力检查，按实际文件头而非扩展名判断。
+#[cfg(feature = "mp4")]
+pub mod media;
