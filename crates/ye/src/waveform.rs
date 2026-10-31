@@ -637,12 +637,30 @@ pub fn audio_peaks_aligned_with_count(
     bucket_count: usize,
     cancel: &AtomicBool,
 ) -> Result<AudioPeaks, ConvertError> {
+    audio_peaks_aligned_stream_with_count(input, None, bucket_count, cancel)
+}
+
+/// Presentation-aligned waveform for one explicit container audio stream.
+#[cfg(all(feature = "mp4", feature = "aac"))]
+pub fn audio_peaks_aligned_stream_with_count(
+    input: Box<dyn ReadSeek>,
+    stream_index: Option<u32>,
+    bucket_count: usize,
+    cancel: &AtomicBool,
+) -> Result<AudioPeaks, ConvertError> {
     if bucket_count == 0 || bucket_count > 8192 {
         return Err(ConvertError::InvalidArguments("波形桶数须在1..8192".into()));
     }
     let (containers, codecs) = decode_registries();
-    let mut source =
-        crate::timeline::Source::open(&containers, &codecs, input, MediaType::Audio, 0, None)?;
+    let mut source = crate::timeline::Source::open_selected(
+        &containers,
+        &codecs,
+        input,
+        MediaType::Audio,
+        0,
+        None,
+        stream_index,
+    )?;
     let params = source
         .stream
         .codec

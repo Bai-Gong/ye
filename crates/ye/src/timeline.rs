@@ -5,7 +5,7 @@ use crate::convert::{ConvertError, ConvertProgress, ConvertStats, FrameSink};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use ye_codec::{AudioFrame, CodecRegistry, Decoded, Decoder, Frame, MediaType, VideoFrame};
-use ye_container::{ContainerRegistry, Demuxer, ReadSeek, Stream, WriteSeek};
+use ye_container::{ContainerRegistry, Demuxer, MediaHeader, ReadSeek, Stream, WriteSeek};
 use ye_pixfmt::{
     ChannelLayout, ColorDesc, ColorPrimaries, ColorRange, ColorSpace, ColorTransfer, PixelFormat,
     SampleFormat,
@@ -58,6 +58,8 @@ pub enum Layer {
 
 /// Video and audio occurrences are separate; mute/solo are resolved by the editor.
 pub struct TimelineClip {
+    /// Actual container stream index; None requires an unambiguous single stream of the layer kind.
+    pub stream_index: Option<u32>,
     pub input: Box<dyn ReadSeek>,
     pub source_in_us: i64,
     pub source_out_us: i64,
@@ -131,6 +133,33 @@ pub fn check_timeline(
     issues
 }
 
+/// Resolve an explicit source stream, rejecting missing indexes and mismatched media kinds.
+/// Without an index, preserve the single-stream contract instead of silently choosing a track.
+pub fn select_stream(
+    header: &MediaHeader,
+    kind: MediaType,
+    index: Option<u32>,
+) -> Result<&Stream, ConvertError> {
+    if let Some(index) = index {
+        return header
+            .streams
+            .iter()
+            .find(|s| s.index == index && s.media_type == kind)
+            .ok_or_else(|| invalid(format!("源流 {index} 不存在或不是 {kind:?}")));
+    }
+    let mut matching = header.streams.iter().filter(|s| s.media_type == kind);
+    let stream = matching
+        .next()
+        .ok_or_else(|| invalid(format!("没有 {kind:?} 流")))?;
+    let count = 1 + matching.count();
+    if count != 1 {
+        return Err(invalid(format!(
+            "任务要求明确选择 {kind:?} 源流，实际 {count} 条"
+        )));
+    }
+    Ok(stream)
+}
+
 /// One decoder, one selected stream. Decode preroll after a keyframe seek.
 pub(crate) struct Source {
     demux: Box<dyn Demuxer>,
@@ -148,20 +177,20 @@ impl Source {
         trim_us: i64,
         trim_out_us: Option<i64>,
     ) -> Result<Self, ConvertError> {
+        Self::open_selected(containers, codecs, input, kind, trim_us, trim_out_us, None)
+    }
+    pub(crate) fn open_selected(
+        containers: &ContainerRegistry,
+        codecs: &CodecRegistry,
+        input: Box<dyn ReadSeek>,
+        kind: MediaType,
+        trim_us: i64,
+        trim_out_us: Option<i64>,
+        stream_index: Option<u32>,
+    ) -> Result<Self, ConvertError> {
         let (_, mut demux) = containers.open_demuxer(input)?;
         let header = demux.read_header()?;
-        let selected: Vec<_> = header
-            .streams
-            .iter()
-            .filter(|s| s.media_type == kind)
-            .collect();
-        if selected.len() != 1 {
-            return Err(invalid(format!(
-                "任务要求恰一条 {kind:?} 流，实际 {} 条",
-                selected.len()
-            )));
-        }
-        let stream = selected[0].clone();
+        let stream = select_stream(&header, kind, stream_index)?.clone();
         if let (Some(duration), Some(trim_out_us)) = (stream.duration, trim_out_us) {
             let end = duration.checked_add(
                 stream
@@ -518,13 +547,14 @@ pub fn render_frames(
         let cursor = match c.layer {
             Layer::Video(t) => Cursor::Video(
                 Box::new(VideoCursor {
-                    source: Source::open(
+                    source: Source::open_selected(
                         containers,
                         codecs,
                         c.input,
                         MediaType::Video,
                         c.source_in_us,
                         Some(c.source_out_us),
+                        c.stream_index,
                     )?,
                     held: None,
                     next: None,
@@ -533,13 +563,14 @@ pub fn render_frames(
                 t,
             ),
             Layer::Audio(m) => {
-                let source = Source::open(
+                let source = Source::open_selected(
                     containers,
                     codecs,
                     c.input,
                     MediaType::Audio,
                     c.source_in_us,
                     Some(c.source_out_us),
+                    c.stream_index,
                 )?;
                 let audio = source
                     .stream

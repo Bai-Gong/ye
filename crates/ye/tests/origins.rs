@@ -69,6 +69,7 @@ fn different_video_and_audio_origins_keep_black_and_silence_in_one_clock() {
             .unwrap()
             .ticks();
         clips.push(TimelineClip {
+            stream_index: None,
             input: Box::new(File::open(&input).unwrap()),
             source_in_us: 0,
             source_out_us: end,

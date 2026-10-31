@@ -36,6 +36,7 @@ fn settings() -> ComposeSettings {
 }
 fn clip(path: &Path, start: i64, end: i64, layer: Layer) -> TimelineClip {
     TimelineClip {
+        stream_index: None,
         input: Box::new(File::open(path).unwrap()),
         source_in_us: 0,
         source_out_us: end - start,
@@ -359,6 +360,7 @@ fn non_keyframe_windows_seek_and_reorder_b_frames_before_selection() {
     let clips = [(950000, 1150000, 0), (150000, 350000, 200000)]
         .into_iter()
         .map(|(lo, hi, start)| TimelineClip {
+            stream_index: None,
             input: Box::new(File::open(&input).unwrap()),
             source_in_us: lo,
             source_out_us: hi,
