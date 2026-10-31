@@ -132,21 +132,21 @@ pub fn check_timeline(
 }
 
 /// One decoder, one selected stream. Decode preroll after a keyframe seek.
-struct Source {
+pub(crate) struct Source {
     demux: Box<dyn Demuxer>,
     decoder: Box<dyn Decoder>,
-    stream: Stream,
+    pub(crate) stream: Stream,
     eof: bool,
     saw_frame: bool,
 }
 impl Source {
-    fn open(
+    pub(crate) fn open(
         containers: &ContainerRegistry,
         codecs: &CodecRegistry,
         input: Box<dyn ReadSeek>,
         kind: MediaType,
         trim_us: i64,
-        trim_out_us: i64,
+        trim_out_us: Option<i64>,
     ) -> Result<Self, ConvertError> {
         let (_, mut demux) = containers.open_demuxer(input)?;
         let header = demux.read_header()?;
@@ -162,7 +162,7 @@ impl Source {
             )));
         }
         let stream = selected[0].clone();
-        if let Some(duration) = stream.duration {
+        if let (Some(duration), Some(trim_out_us)) = (stream.duration, trim_out_us) {
             let end = duration.checked_add(
                 stream
                     .start_time
@@ -187,7 +187,7 @@ impl Source {
             saw_frame: false,
         })
     }
-    fn next(&mut self, cancel: &AtomicBool) -> Result<Option<Frame>, ConvertError> {
+    pub(crate) fn next(&mut self, cancel: &AtomicBool) -> Result<Option<Frame>, ConvertError> {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(ConvertError::Cancelled);
@@ -512,7 +512,7 @@ pub fn render_frames(
                         c.input,
                         MediaType::Video,
                         c.source_in_us,
-                        c.source_out_us,
+                        Some(c.source_out_us),
                     )?,
                     held: None,
                     next: None,
@@ -527,7 +527,7 @@ pub fn render_frames(
                     c.input,
                     MediaType::Audio,
                     c.source_in_us,
-                    c.source_out_us,
+                    Some(c.source_out_us),
                 )?;
                 let audio = source
                     .stream

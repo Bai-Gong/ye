@@ -1094,7 +1094,7 @@ AAC-LC 解码支持码本 13：独立 noise scalefactor 差分链、逐窗逐带
 - High/B 帧、30000/1001 帧率的五个抽帧时点与 FFmpeg 比对通过；BT.709 两种范围的 RGBA 最大通道差不超过 2。仍须推进音频对齐和编辑时长消费，不能据此宣布整个 P1 完成。
 # 联动输出时钟（P2）
 
-`convert_with_options` 保留 `convert` 的原有默认入口，增加可选有理数目标帧率及 `AudioOutput`（44.1/48kHz 单/双声道）。改帧率按窗口内显示时刻 hold-last，帧数为窗口时长乘目标帧率向上取整。音频输出启用时以时间零为共同原点，负时间 priming 丢弃、正时间空隙分块填零；32-tap sinc 重采样，输出有效样本数按输入样本数与采样率比向上取整，编码末块仍补到 AAC 的1024样本。当前文件端尚未写有效样本数裁尾信息，不能将编码填充误报为已通过精确时长验收。
+`convert_with_options` 保留 `convert` 的原有默认入口，增加可选有理数目标帧率及 `AudioOutput`（44.1/48kHz 单/双声道）。改帧率按窗口内显示时刻 hold-last，帧数为窗口时长乘目标帧率向上取整。音频输出启用时以时间零为共同原点，负时间 priming 丢弃、正时间空隙分块填零；32-tap sinc 重采样，输出有效样本数按输入样本数与采样率比向上取整，编码末块仍补到 AAC 的1024样本。MP4 呈现时长通过下述 elst 裁尾记录，原始包仍含编码填充。
 
 MP4 Demuxer 头的 duration/start_time 现应用常见编辑列表；原始 Mp4Reader 保留原样本时钟。编码注册工厂关闭重建历史缓存；具体 H264Encoder 的测试访问器保留原行为。
 # 静态时间线渲染（联动 P3）
@@ -1106,3 +1106,9 @@ MP4 Demuxer 头的 duration/start_time 现应用常见编辑列表；原始 Mp4R
 输出 RGBA 经 BT.709 limited 矩阵转换，编码首个 SPS 携带色彩 VUI。输入 BT.601/709 与 full/limited 按帧色彩转换；HDR 与未知矩阵明确拒绝。首版不处理关键帧、变速、效果、转场、图片；消费方 DTO 后端须列出这些阻塞项。
 
 MP4 mux 模板可带 `mp4.presentation.duration_ticks`，写 v1 elst，并采用882MHz movie时钟精确表达微秒和44.1/48kHz样本。底层样本表保留编码包时长，Demuxer 的呈现时长裁去填充；使用原始 Mp4Reader 的调用方仍须自行解释编辑列表。旧模板未设置该字段时不改变封装。
+
+## 呈现波形与源帧率
+
+`audio_peaks_aligned_with_count` 只解码所需音轨，依据编辑列表与帧 PTS 排除 priming、保留开头静音。按已知呈现时长固定分桶，仅保存当前 PCM 块及桶累计器，内存不随素材长度增长。旧 `audio_peaks_with_count` 保留原始样本口径供历史调用与对拍。带250ms音频起点偏移的素材与 FFmpeg `-copyts` 参考比对使用原非PNS容差1.5e-4。
+
+Demuxer 在应用呈现裁尾前从原始样本表计算 frame_rate。禁止用裁过最后半帧的呈现时长反推编码帧率，否则24fps成片会被误识别成24.975fps。

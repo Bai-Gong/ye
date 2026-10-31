@@ -72,6 +72,12 @@ fn rational_cfr_and_resampled_mono_audio_have_one_origin() {
         .find_map(|s| s.codec.audio.as_ref())
         .unwrap();
     assert_eq!(audio.sample_rate, 48000);
+    let video = header
+        .streams
+        .iter()
+        .find_map(|s| s.codec.video.as_ref())
+        .unwrap();
+    assert_eq!(video.frame_rate, Some(Rational::new(24, 1)));
     assert_eq!(audio.channel_layout.unwrap().channels(), 2);
     // ffmpeg must decode the complete produced file without packet or timestamp errors.
     let result = Command::new(ffmpeg)

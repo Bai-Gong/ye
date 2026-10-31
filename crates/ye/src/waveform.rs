@@ -629,6 +629,125 @@ pub fn audio_peaks_with_count(
     })
 }
 
+/// Presentation-aligned, bounded waveform for product timelines. Decode only audio;
+/// retain priming for overlap reconstruction, but exclude it from visible buckets.
+#[cfg(all(feature = "mp4", feature = "aac"))]
+pub fn audio_peaks_aligned_with_count(
+    input: Box<dyn ReadSeek>,
+    bucket_count: usize,
+    cancel: &AtomicBool,
+) -> Result<AudioPeaks, ConvertError> {
+    if bucket_count == 0 || bucket_count > 8192 {
+        return Err(ConvertError::InvalidArguments("波形桶数须在1..8192".into()));
+    }
+    let (containers, codecs) = decode_registries();
+    let mut source =
+        crate::timeline::Source::open(&containers, &codecs, input, MediaType::Audio, 0, None)?;
+    let params = source
+        .stream
+        .codec
+        .audio
+        .as_ref()
+        .ok_or_else(|| ConvertError::InvalidData("缺音频参数".into()))?;
+    let sample_rate = params.sample_rate;
+    let channels = params.channel_layout.map_or(0, |l| l.channels() as usize);
+    if sample_rate == 0 || !(1..=2).contains(&channels) {
+        return Err(ConvertError::InvalidArguments("波形要求单/双声道".into()));
+    }
+    let duration = source
+        .stream
+        .duration
+        .ok_or_else(|| ConvertError::InvalidArguments("波形要求已知呈现时长".into()))?;
+    let end = duration.checked_add(
+        source
+            .stream
+            .start_time
+            .unwrap_or(ye_time::Timestamp::new(0, source.stream.time_base)),
+    )?;
+    let time_base = ye_time::Rational::new(1, sample_rate as i32);
+    let total = usize::try_from(end.rescale(time_base)?.ticks())
+        .map_err(|_| ConvertError::InvalidData("无效音频时长".into()))?;
+    if total == 0 {
+        return Err(ConvertError::InvalidData("音频时长为零".into()));
+    }
+    let len = total.div_ceil(bucket_count);
+    let mut accum = vec![vec![PeakAccum::new(); bucket_count]; channels];
+    let mut cursor = 0usize;
+    let mut saw = false;
+    fn silence(accum: &mut [Vec<PeakAccum>], cursor: &mut usize, end: usize, len: usize) {
+        while *cursor < end {
+            let bucket = *cursor / len;
+            let stop = end.min((bucket + 1) * len);
+            let n = (stop - *cursor) as u64;
+            for row in accum.iter_mut() {
+                let b = &mut row[bucket];
+                b.min = b.min.min(0.0);
+                b.max = b.max.max(0.0);
+                b.count += n;
+            }
+            *cursor = stop;
+        }
+    }
+    while let Some(frame) = source.next(cancel)? {
+        let Frame::Audio(frame) = frame else {
+            return Err(ConvertError::InvalidData("音频解码器返回视频".into()));
+        };
+        if frame.format() != ye_pixfmt::SampleFormat::F32
+            || frame.sample_rate() != sample_rate
+            || frame.channel_layout().channels() as usize != channels
+            || !frame.data().len().is_multiple_of(4 * channels)
+        {
+            return Err(ConvertError::InvalidData("音频参数变化或 PCM 损坏".into()));
+        }
+        saw = true;
+        let start = frame
+            .pts()
+            .ok_or_else(|| ConvertError::InvalidData("音频缺 PTS".into()))?
+            .rescale(time_base)?
+            .ticks();
+        for (i, pcm) in frame.data().chunks_exact(4 * channels).enumerate() {
+            let at = start.saturating_add(i as i64);
+            if at < 0 || at < cursor as i64 {
+                continue;
+            }
+            if at >= total as i64 {
+                break;
+            }
+            let at = at as usize;
+            silence(&mut accum, &mut cursor, at, len);
+            for (channel, bytes) in pcm.chunks_exact(4).enumerate() {
+                let value = f32::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| ConvertError::InvalidData("PCM".into()))?,
+                );
+                if !value.is_finite() {
+                    return Err(ConvertError::InvalidData("非有限 PCM".into()));
+                }
+                accum[channel][at / len].feed(value);
+            }
+            cursor = at + 1;
+        }
+        if cursor >= total {
+            break;
+        }
+    }
+    if !saw {
+        return Err(ConvertError::InvalidData("没有可解码的音频帧".into()));
+    }
+    silence(&mut accum, &mut cursor, total, len);
+    Ok(AudioPeaks {
+        sample_rate,
+        channels,
+        bucket_samples: len,
+        buckets: bucket_count,
+        peaks: accum
+            .into_iter()
+            .map(|row| row.iter().map(PeakAccum::peak).collect())
+            .collect(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 单元测试（纯核无条件；消费助手件随 feature 门）
 // ---------------------------------------------------------------------------

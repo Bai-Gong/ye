@@ -252,6 +252,27 @@ impl Demuxer for Mp4Demuxer {
     fn read_header(&mut self) -> Result<MediaHeader, ContainerError> {
         let mut streams = self.reader.streams().to_vec();
         for stream in &mut streams {
+            // Derive the coded cadence before presentation edits trim a partial final frame.
+            if let (Some(count), Some(duration)) = (stream.nb_frames, stream.duration)
+                && count > 0
+                && duration.ticks() > 0
+                && stream.time_base.num() > 0
+            {
+                let mut n = u128::from(count) * stream.time_base.den() as u128;
+                let mut d = duration.ticks() as u128 * stream.time_base.num() as u128;
+                let (mut a, mut b) = (n, d);
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                n /= a;
+                d /= a;
+                if n <= i32::MAX as u128
+                    && d <= i32::MAX as u128
+                    && let Some(video) = stream.codec.video.as_mut()
+                {
+                    video.frame_rate = Some(Rational::new(n as i32, d as i32));
+                }
+            }
             if let Some(ticks) = stream
                 .metadata
                 .get("mp4.edit.duration_ticks")
