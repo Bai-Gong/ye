@@ -543,7 +543,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
         let mut streams = Vec::with_capacity(ctx.builders.len());
         let mut tracks = Vec::with_capacity(ctx.builders.len());
         for (i, b) in ctx.builders.into_iter().enumerate() {
-            let (s, t) = finish_track(i, b)?;
+            let (s, t) = finish_track(i, b, ctx.movie_timescale)?;
             streams.push(s);
             tracks.push(t);
         }
@@ -795,6 +795,7 @@ struct ParseCtx {
     /// 底层文件总长：trun 解析期按「样例数据必须装进文件」原则做长度界
     /// 校验用（from_reader 进入前填入）。
     file_len: u64,
+    movie_timescale: Option<u32>,
     builders: Vec<TrackBuilder>,
     /// mvex 内的 trex（按 track_id 查缺省值）。
     trex: Vec<Trex>,
@@ -816,6 +817,7 @@ struct TrackBuilder {
     track_id: Option<u32>,
     timescale: Option<u32>,
     mdhd_duration: Option<u64>,
+    edit: Option<(u64, i64, u64)>,
     handler: Option<FourCc>,
     stsd_codec: Option<FourCc>,
     /// stsd 首 entry 内容（去掉 entry 的 8 字节 box 头）；
@@ -847,6 +849,7 @@ impl TrackBuilder {
             track_id: None,
             timescale: None,
             mdhd_duration: None,
+            edit: None,
             handler: None,
             stsd_codec: None,
             stsd_content: Vec::new(),
@@ -943,7 +946,7 @@ fn walk<R: Read + Seek>(
 
         if matches!(
             kind.as_slice(),
-            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"moof" | b"traf" | b"mvex"
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"moof" | b"traf" | b"mvex" | b"edts"
         ) {
             let plain = join_path(path, &h.kind.as_str());
             let (child_scope, child_path) = if kind == *b"moov" {
@@ -953,6 +956,8 @@ fn walk<R: Read + Seek>(
                 let p = join_path(path, &format!("trak[{i}]"));
                 ctx.builders.push(TrackBuilder::new(p.clone()));
                 (Scope::Trak(i), p)
+            } else if kind == *b"edts" {
+                (scope, plain)
             } else if kind == *b"mdia" {
                 match scope {
                     Scope::Trak(i) => (Scope::Mdia(i), plain),
@@ -1050,6 +1055,7 @@ fn parse_leaf<R: Read + Seek>(
         let payload = read_payload(r, content_start, box_end)?;
         match &kind {
             b"tkhd" => parse_tkhd(&payload, path, b),
+            b"elst" => parse_edit_list(&payload, path, b),
             b"mdhd" => parse_mdhd(&payload, path, b),
             b"hdlr" => parse_hdlr(&payload, path, b),
             b"stsd" => parse_stsd(&payload, path, b),
@@ -1064,7 +1070,28 @@ fn parse_leaf<R: Read + Seek>(
         }
     };
     match scope {
-        Scope::Trak(i) if kind == *b"tkhd" => dispatch(&mut ctx.builders[i]),
+        Scope::Trak(i) if kind == *b"tkhd" || kind == *b"elst" => dispatch(&mut ctx.builders[i]),
+        Scope::Moov if kind == *b"mvhd" => {
+            let d = read_payload(r, content_start, box_end)?;
+            let offset = match d.first() {
+                Some(0) => 12,
+                Some(1) => 20,
+                _ => return Err(malformed(path, "unsupported mvhd version")),
+            };
+            let bytes = d
+                .get(offset..offset + 4)
+                .ok_or_else(|| malformed(path, "truncated movie timescale"))?;
+            let scale = u32::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| malformed(path, "movie timescale"))?,
+            );
+            if scale == 0 {
+                return Err(malformed(path, "zero movie timescale"));
+            }
+            ctx.movie_timescale = Some(scale);
+            Ok(())
+        }
         Scope::Mdia(i) if kind == *b"mdhd" || kind == *b"hdlr" => dispatch(&mut ctx.builders[i]),
         Scope::Stbl(i) if is_sample_table(kind) => dispatch(&mut ctx.builders[i]),
         Scope::Mvex if kind == *b"trex" => {
@@ -1701,7 +1728,11 @@ fn parse_trun(d: &[u8], path: &str, ctx: &mut ParseCtx) -> Res<()> {
 
 // —— 收敛 ——
 
-fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
+fn finish_track(
+    index: usize,
+    b: TrackBuilder,
+    movie_timescale: Option<u32>,
+) -> Res<(Stream, TrackTables)> {
     let path = b.path;
     let missing = |name: &str| malformed(&format!("{path}.mdia.minf.stbl.{name}"), "缺失该表");
     let codec = b.stsd_codec.ok_or_else(|| missing("stsd"))?;
@@ -1767,7 +1798,7 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         None => (Vec::new(), String::new()),
     };
     let media_type = kind.media_type();
-    let stream = Stream {
+    let mut stream = Stream {
         index: index as u32,
         media_type,
         codec: CodecParameters {
@@ -1797,6 +1828,38 @@ fn finish_track(index: usize, b: TrackBuilder) -> Res<(Stream, TrackTables)> {
         nb_frames: Some(sample_count),
         metadata: Metadata::new(),
     };
+    if let Some((empty, media, duration)) = b.edit {
+        let scale =
+            movie_timescale.ok_or_else(|| malformed(&path, "elst requires movie timescale"))?;
+        let movie_base = Rational::try_new(
+            1,
+            i32::try_from(scale).map_err(|_| malformed(&path, "movie timescale overflow"))?,
+        )
+        .map_err(|_| malformed(&path, "movie timescale"))?;
+        let empty = i64::try_from(empty).map_err(|_| malformed(&path, "empty edit overflow"))?;
+        let empty = Timestamp::new(empty, movie_base)
+            .rescale(timebase)
+            .map_err(|_| malformed(&path, "edit rescale overflow"))?
+            .ticks();
+        let shift = empty
+            .checked_sub(media)
+            .ok_or_else(|| malformed(&path, "edit offset overflow"))?;
+        let duration =
+            i64::try_from(duration).map_err(|_| malformed(&path, "edit duration overflow"))?;
+        let duration = Timestamp::new(duration, movie_base)
+            .rescale(timebase)
+            .map_err(|_| malformed(&path, "edit duration rescale"))?
+            .ticks();
+        stream
+            .metadata
+            .insert("mp4.edit.shift_ticks", shift.to_string());
+        stream
+            .metadata
+            .insert("mp4.edit.duration_ticks", duration.to_string());
+        stream
+            .metadata
+            .insert("mp4.edit.start_ticks", empty.to_string());
+    }
     let tables = TrackTables {
         kind,
         track_id: b.track_id.unwrap_or(0),
@@ -1920,4 +1983,88 @@ fn child_payload(content: &[u8], at: usize, path: &str) -> Res<Vec<u8>> {
     }
     // 只取声明 size 内的载荷：兄弟 box（pasp/btrt/…）不得混进 extra_data。
     Ok(content[at + header..end as usize].to_vec())
+}
+
+/// 支持单个 rate=1 媒体 edit，前面可带一个空 edit；复杂重排明确拒绝。
+fn parse_edit_list(data: &[u8], path: &str, b: &mut TrackBuilder) -> Res<()> {
+    if b.edit.is_some() {
+        return Err(malformed(path, "duplicate edit list"));
+    }
+    if data.len() < 8 {
+        return Err(malformed(path, "truncated edit list"));
+    }
+    let version = data[0];
+    let count = u32::from_be_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| malformed(path, "edit count"))?,
+    ) as usize;
+    let size = match version {
+        0 => 12,
+        1 => 20,
+        _ => return Err(malformed(path, "unsupported edit version")),
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    if count > 2 {
+        return Err(Mp4Error::Unsupported("multiple media edits"));
+    }
+    if data.len() < 8 + count * size {
+        return Err(malformed(path, "truncated edit entries"));
+    }
+    let mut empty = 0u64;
+    let mut media = None;
+    for i in 0..count {
+        let d = &data[8 + i * size..8 + (i + 1) * size];
+        let (duration, time, rate) = if version == 0 {
+            (
+                u32::from_be_bytes(d[..4].try_into().unwrap()) as u64,
+                i32::from_be_bytes(d[4..8].try_into().unwrap()) as i64,
+                &d[8..12],
+            )
+        } else {
+            (
+                u64::from_be_bytes(d[..8].try_into().unwrap()),
+                i64::from_be_bytes(d[8..16].try_into().unwrap()),
+                &d[16..20],
+            )
+        };
+        if rate != [0, 1, 0, 0] {
+            return Err(Mp4Error::Unsupported("edit rate other than one"));
+        }
+        if time == -1 && i == 0 && count == 2 {
+            empty = duration;
+        } else if time >= 0 && media.is_none() {
+            media = Some((time, duration));
+        } else {
+            return Err(Mp4Error::Unsupported("unsupported edit sequence"));
+        }
+    }
+    let (time, duration) = media.ok_or_else(|| malformed(path, "edit list has no media"))?;
+    b.edit = Some((empty, time, duration));
+    Ok(())
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn empty_delay_then_media_and_rejection_boundaries() {
+        let mut bytes = vec![0, 0, 0, 0, 0, 0, 0, 2];
+        for (duration, time) in [(500u32, -1i32), (3000, 1024)] {
+            bytes.extend(duration.to_be_bytes());
+            bytes.extend(time.to_be_bytes());
+            bytes.extend([0, 1, 0, 0]);
+        }
+        let mut track = TrackBuilder::new("test".into());
+        parse_edit_list(&bytes, "test", &mut track).unwrap();
+        assert_eq!(track.edit, Some((500, 1024, 3000)));
+        for len in 0..bytes.len() {
+            let mut track = TrackBuilder::new("test".into());
+            assert!(parse_edit_list(&bytes[..len], "test", &mut track).is_err());
+        }
+        bytes[31] = 1;
+        assert!(parse_edit_list(&bytes, "test", &mut TrackBuilder::new("test".into())).is_err());
+    }
 }

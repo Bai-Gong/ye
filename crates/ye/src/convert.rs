@@ -1368,7 +1368,19 @@ pub fn filter_convert(frame: &VideoFrame, target: PixelFormat) -> Result<VideoFr
     match (frame.format(), target) {
         (PixelFormat::Yuv420p, PixelFormat::Rgba8) => {
             let view = yuv_view(frame)?;
-            let tight = ye_filter::yuv420p_to_rgba(&view, w, h, range).map_err(filter_err)?;
+            let matrix = match frame.color().space {
+                ye_pixfmt::ColorSpace::Bt709 => ye_filter::YuvMatrix::Bt709,
+                ye_pixfmt::ColorSpace::Unspecified
+                | ye_pixfmt::ColorSpace::Unknown(5)
+                | ye_pixfmt::ColorSpace::Smpte170m => ye_filter::YuvMatrix::Bt601,
+                other => {
+                    return Err(ConvertError::InvalidArguments(format!(
+                        "unsupported color matrix {other:?}"
+                    )));
+                }
+            };
+            let tight = ye_filter::yuv420p_to_rgba_matrix(&view, w, h, range, matrix)
+                .map_err(filter_err)?;
             packed_frame_from_tight(target, frame.width(), frame.height(), &tight, frame)
         }
         (PixelFormat::Yuv420p, PixelFormat::Rgb24) => {

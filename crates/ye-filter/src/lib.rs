@@ -48,7 +48,7 @@ pub use descriptor::{FilterDescriptor, FilterParams, PadDescriptor};
 pub use error::FilterError;
 pub use graph::{FilterGraph, NodeId, PadRef};
 pub use video::{
-    Yuv420pBuffer, Yuv420pView, YuvRange, crop_rgba, crop_yuv420p, fps_nearest_frame_indices,
-    rgb24_to_yuv420p, rgba_to_yuv420p, scale_rgba, scale_yuv420p, volume_f32, volume_gain_from_db,
-    yuv420p_to_rgb24, yuv420p_to_rgba,
+    Yuv420pBuffer, Yuv420pView, YuvMatrix, YuvRange, crop_rgba, crop_yuv420p,
+    fps_nearest_frame_indices, rgb24_to_yuv420p, rgba_to_yuv420p, scale_rgba, scale_yuv420p,
+    volume_f32, volume_gain_from_db, yuv420p_to_rgb24, yuv420p_to_rgba, yuv420p_to_rgba_matrix,
 };

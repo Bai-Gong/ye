@@ -273,6 +273,8 @@ pub struct Sps {
     pub frame_crop_bottom: u16,
     /// VUI 存在标志（内容不解析，供后续按需扩展）。
     pub vui_parameters_present_flag: bool,
+    /// VUI 的范围、矩阵、原色与传递函数。
+    pub color: ye_pixfmt::ColorDesc,
     /// 高档位 scaling matrix（6 条 4x4 有效值；缺省 = None = 平表）。
     /// `Some` 时 PPS 缺席项回退到此。
     pub scaling4: Option<[[u8; 16]; 6]>,
@@ -437,6 +439,38 @@ impl Sps {
             }
         }
         let vui_parameters_present_flag = u1f(&mut r, "sps.vui_parameters_present_flag")?;
+        let mut color = ye_pixfmt::ColorDesc::UNSPECIFIED;
+        if vui_parameters_present_flag {
+            if r.u1()? {
+                let aspect = r.u(8)?;
+                if aspect == 255 {
+                    r.u(16)?;
+                    r.u(16)?;
+                }
+            }
+            if r.u1()? {
+                r.u1()?;
+            }
+            if r.u1()? {
+                r.u(3)?;
+                color.range = if r.u1()? {
+                    ye_pixfmt::ColorRange::Jpeg
+                } else {
+                    ye_pixfmt::ColorRange::Mpeg
+                };
+                if r.u1()? {
+                    let p = r.u(8)? as u8;
+                    let t = r.u(8)? as u8;
+                    let m = r.u(8)? as u8;
+                    color.primaries = ye_pixfmt::ColorPrimaries::from_code(p)
+                        .unwrap_or(ye_pixfmt::ColorPrimaries::Unknown(p));
+                    color.transfer = ye_pixfmt::ColorTransfer::from_code(t)
+                        .unwrap_or(ye_pixfmt::ColorTransfer::Unknown(t));
+                    color.space = ye_pixfmt::ColorSpace::from_code(m)
+                        .unwrap_or(ye_pixfmt::ColorSpace::Unknown(m));
+                }
+            }
+        }
 
         let sps = Sps {
             profile_idc,
@@ -466,6 +500,7 @@ impl Sps {
             frame_crop_top: frame_crop[2],
             frame_crop_bottom: frame_crop[3],
             vui_parameters_present_flag,
+            color,
             scaling4,
             scaling8,
         };

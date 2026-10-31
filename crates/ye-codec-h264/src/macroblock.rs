@@ -760,6 +760,7 @@ pub(crate) struct Picture {
     // ---- B 片增补（M2）----
     /// 本图 POC（直接预测缩放与 DPB 重排）。
     pub poc: i32,
+    pub color: ye_pixfmt::ColorDesc,
     /// 长期参考标记（col_zero / dist_scale 门控）。
     pub is_long_term: bool,
     /// 解码本图时的两列参考快照（map_col 匹配用；缺项 None）。
@@ -780,6 +781,7 @@ impl Picture {
             mbs: vec![Macroblock::default(); mb_width * mb_height],
             deblock_params: Vec::new(),
             poc: 0,
+            color: ye_pixfmt::ColorDesc::UNSPECIFIED,
             is_long_term: false,
             used_l0: Vec::new(),
             used_l1: Vec::new(),

@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ye_codec::{CodecError, CodecId, CodecParameters, Decoded, Decoder, Frame, Packet, VideoFrame};
-use ye_pixfmt::{ColorDesc, PixelFormat};
+use ye_pixfmt::PixelFormat;
 use ye_time::Timestamp;
 
 use crate::bitreader::BitReader;
@@ -343,6 +343,7 @@ impl H264Decoder {
                 sps.height() as usize,
             ));
             let poc = self.compute_poc(&sps, &sh, is_idr, header.nal_ref_idc != 0);
+            Arc::get_mut(&mut pic).expect("new picture").color = sps.color;
             Arc::get_mut(&mut pic)
                 .expect("sole owner at picture start")
                 .poc = poc;
@@ -1056,7 +1057,7 @@ fn build_frame(pic: &Picture, pts: Option<Timestamp>) -> Result<VideoFrame, H264
         PixelFormat::Yuv420p,
         w as u32,
         h as u32,
-        ColorDesc::UNSPECIFIED,
+        pic.color,
         pts,
         None,
     )

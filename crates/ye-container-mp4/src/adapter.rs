@@ -167,6 +167,16 @@ impl Mp4Demuxer {
         Ok(Mp4Demuxer { reader, cursors })
     }
 
+    fn shifted(&self, si: usize, value: Timestamp) -> Result<Timestamp, ContainerError> {
+        let stream = &self.reader.streams()[si];
+        let offset = stream
+            .metadata
+            .get("mp4.edit.shift_ticks")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(value.checked_add(Timestamp::new(offset, stream.time_base))?)
+    }
+
     /// 该轨下一待读样例的 dts；`Ok(None)` = 本轨已读尽。
     fn next_dts(&self, si: usize) -> Result<Option<Timestamp>, ContainerError> {
         let count = self.reader.sample_count(si).map_err(map_read_err)?;
@@ -177,7 +187,7 @@ impl Mp4Demuxer {
             .reader
             .sample_timing(si, self.cursors[si] as usize)
             .map_err(map_read_err)?;
-        Ok(Some(timing.dts))
+        Ok(Some(self.shifted(si, timing.dts)?))
     }
 
     /// ≤ target 的最大 dts 样例序号（同轨 dts 单调不减，二分；
@@ -190,7 +200,10 @@ impl Mp4Demuxer {
             )));
         }
         let dts_of = |i: usize| -> Result<Timestamp, ContainerError> {
-            Ok(self.reader.sample_timing(si, i).map_err(map_read_err)?.dts)
+            self.shifted(
+                si,
+                self.reader.sample_timing(si, i).map_err(map_read_err)?.dts,
+            )
         };
         if Timestamp::compare(dts_of(0)?, target) == Ordering::Greater {
             return Ok(0);
@@ -211,7 +224,10 @@ impl Mp4Demuxer {
     fn sample_at_or_after(&self, si: usize, bound: Timestamp) -> Result<usize, ContainerError> {
         let count = self.reader.sample_count(si).map_err(map_read_err)?;
         let dts_of = |i: usize| -> Result<Timestamp, ContainerError> {
-            Ok(self.reader.sample_timing(si, i).map_err(map_read_err)?.dts)
+            self.shifted(
+                si,
+                self.reader.sample_timing(si, i).map_err(map_read_err)?.dts,
+            )
         };
         let (mut lo, mut hi) = (0usize, count);
         while lo < hi {
@@ -285,7 +301,9 @@ impl Demuxer for Mp4Demuxer {
             return Ok(None); // 全轨读尽：此后幂等
         };
         let cursor = self.cursors[si] as usize;
-        let pkt = self.reader.read_packet(si, cursor).map_err(map_read_err)?;
+        let mut pkt = self.reader.read_packet(si, cursor).map_err(map_read_err)?;
+        pkt.pts = pkt.pts.map(|t| self.shifted(si, t)).transpose()?;
+        pkt.dts = pkt.dts.map(|t| self.shifted(si, t)).transpose()?;
         self.cursors[si] += 1;
         Ok(Some(pkt))
     }
@@ -306,6 +324,7 @@ impl Demuxer for Mp4Demuxer {
             .sample_timing(si, key)
             .map_err(map_read_err)?
             .dts;
+        let landed = self.shifted(si, landed)?;
         // 目标轨定位到关键帧样例；其余轨前向恢复到首个 dts ≥ 落地时刻。
         self.cursors[si] = key as u64;
         for j in 0..self.cursors.len() {

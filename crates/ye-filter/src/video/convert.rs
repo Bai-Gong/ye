@@ -653,3 +653,43 @@ mod tests {
         eprintln!("oracle convert full-range: max_abs={worst} (容差 {ORACLE_CONVERT_MAX_ABS})");
     }
 }
+
+/// YUV 矩阵选择；范围独立由 YuvRange 表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvMatrix {
+    Bt601,
+    Bt709,
+}
+
+/// 显式矩阵转换，旧入口继续保持 BT.601 原有逐项舍入口径。
+pub fn yuv420p_to_rgba_matrix(
+    src: &Yuv420pView<'_>,
+    width: usize,
+    height: usize,
+    range: YuvRange,
+    matrix: YuvMatrix,
+) -> Result<Vec<u8>, FilterError> {
+    if matrix == YuvMatrix::Bt601 {
+        return yuv420p_to_rgba(src, width, height, range);
+    }
+    src.validate(width, height)?;
+    let mut out = vec![0; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let (yy, uu, vv) = src.sample(y, x);
+            let (luma, scale) = match range {
+                YuvRange::Limited => ((f64::from(yy) - 16.0) * 255.0 / 219.0, 255.0 / 224.0),
+                YuvRange::Full => (f64::from(yy), 1.0),
+            };
+            let u = (f64::from(uu) - 128.0) * scale;
+            let v = (f64::from(vv) - 128.0) * scale;
+            let i = (y * width + x) * 4;
+            out[i] = clip8(floor_f(luma) + floor_f(1.5748 * v));
+            out[i + 1] =
+                clip8(floor_f(luma) + floor_f(-0.1873242729 * u) + floor_f(-0.4681242729 * v));
+            out[i + 2] = clip8(floor_f(luma) + floor_f(1.8556 * u));
+            out[i + 3] = 255;
+        }
+    }
+    Ok(out)
+}

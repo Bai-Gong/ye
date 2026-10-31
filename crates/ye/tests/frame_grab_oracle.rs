@@ -406,3 +406,110 @@ fn 不可解音轨向量ye侧整体打回() {
     assert_eq!(reference.len(), (W * H * 4) as usize, "参考侧可正常出帧");
     let _ = std::fs::remove_file(&path); // 用后即删。
 }
+
+#[test]
+fn bt709_vui_limited_and_full_range_reach_rgba_output() {
+    let Some(exe) = common::ffmpeg_exe() else {
+        return;
+    };
+    for range in ["tv", "pc"] {
+        let path = std::env::temp_dir().join(format!("ye-vui-{}-{range}.mp4", std::process::id()));
+        let generated = Command::new(&exe)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "smptebars=size=320x240:rate=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_range",
+                range,
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let ours =
+            ye::frame_grab::decode_frame_rgba(Box::new(std::fs::File::open(&path).unwrap()), 0)
+                .unwrap();
+        let reference = Command::new(&exe)
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .output()
+            .unwrap();
+        assert!(reference.status.success());
+        assert_eq!(ours.rgba.len(), reference.stdout.len());
+        let worst = ours
+            .rgba
+            .iter()
+            .zip(&reference.stdout)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 2, "{range} BT709 maxAbs={worst}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn high_b_frames_random_timestamps_match_oracle() {
+    let Some(exe) = common::ffmpeg_exe() else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!("ye-random-b-{}.mp4", std::process::id()));
+    let out = Command::new(&exe)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30000/1001:duration=3",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-g",
+            "30",
+            "-bf",
+            "3",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    for time in [0, 155000, 850000, 1550000, 2850000] {
+        let ours =
+            ye::frame_grab::decode_frame_rgba(Box::new(std::fs::File::open(&path).unwrap()), time)
+                .unwrap();
+        let reference = reference_frame(&exe, &path, time, &format!("b-{time}"));
+        let worst = ours
+            .rgba
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 2, "B frame timestamp {time}: maxAbs {worst}");
+    }
+    std::fs::remove_file(path).unwrap();
+}
