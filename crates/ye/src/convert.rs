@@ -197,6 +197,14 @@ pub struct AudioOutput {
     pub channels: u8,
 }
 
+pub(crate) fn presentation_metadata(ticks: Option<i64>) -> Metadata {
+    let mut metadata = Metadata::new();
+    if let Some(ticks) = ticks {
+        metadata.insert("mp4.presentation.duration_ticks", ticks.to_string());
+    }
+    metadata
+}
+
 /// 帧消费回调：过链后的帧（视频已转换/缩放，音频直通）逐帧送达。
 ///
 /// 返回 `Err` 即终止泵（消费方失败原样透传，见 [`ConvertError::Sink`]）。
@@ -603,23 +611,43 @@ fn build_video_lane(
         extradata: None,
         out_index: 0,
         sampler: match target_rate {
-            Some(_) => Some(crate::compose::CfrSampler::new(
-                0,
-                0,
+            Some(_) => Some(
+                crate::compose::CfrSampler::new(
+                    0,
+                    0,
+                    stream
+                        .duration
+                        .ok_or_else(|| {
+                            ConvertError::InvalidArguments("改帧率要求已知源时长".into())
+                        })?
+                        .checked_add(
+                            stream
+                                .start_time
+                                .unwrap_or(Timestamp::new(0, stream.time_base)),
+                        )?
+                        .rescale(MICRO)?
+                        .ticks(),
+                    frame_rate,
+                )?
+                .black_leading(),
+            ),
+            None => None,
+        },
+        presentation_duration: target_rate
+            .map(|_| -> Result<Timestamp, ConvertError> {
                 stream
                     .duration
-                    .ok_or_else(|| ConvertError::InvalidArguments("改帧率要求已知源时长".into()))?
+                    .ok_or_else(|| ConvertError::InvalidArguments("missing duration".into()))?
                     .checked_add(
                         stream
                             .start_time
                             .unwrap_or(Timestamp::new(0, stream.time_base)),
                     )?
-                    .rescale(MICRO)?
-                    .ticks(),
-                frame_rate,
-            )?),
-            None => None,
-        },
+                    .rescale(time_base)
+                    .map_err(ConvertError::from)
+            })
+            .transpose()?
+            .map(|t| t.ticks()),
     })
 }
 
@@ -734,6 +762,7 @@ struct VideoLane {
     /// 输出流号（`write_header` 时分配）。
     out_index: u32,
     sampler: Option<crate::compose::CfrSampler>,
+    presentation_duration: Option<i64>,
 }
 
 /// AAC-LC 每帧样本数（长窗；编码轨的成帧粒度）。
@@ -814,7 +843,22 @@ fn build_audio_encode_lane(
             codec: params,
             time_base,
             frame_rate: None,
-            metadata: Metadata::new(),
+            metadata: presentation_metadata(if output.is_some() {
+                stream
+                    .duration
+                    .map(|d| {
+                        d.checked_add(
+                            stream
+                                .start_time
+                                .unwrap_or(Timestamp::new(0, stream.time_base)),
+                        )?
+                        .rescale(time_base)
+                    })
+                    .transpose()?
+                    .map(|t| t.ticks())
+            } else {
+                None
+            }),
         },
         samples: Vec::new(),
         sample_rate,
@@ -1286,7 +1330,7 @@ impl EncodeRun<'_> {
                         codec: params,
                         time_base: lane.time_base,
                         frame_rate: Some(lane.frame_rate),
-                        metadata: Metadata::new(),
+                        metadata: presentation_metadata(lane.presentation_duration),
                     });
                 }
                 Lane::Audio(lane) => {
@@ -1593,7 +1637,13 @@ pub fn filter_convert(frame: &VideoFrame, target: PixelFormat) -> Result<VideoFr
         }
         (PixelFormat::Rgba8, PixelFormat::Yuv420p) => {
             let tight = packed_tight(frame);
-            let buf = ye_filter::rgba_to_yuv420p(&tight, w, h, range).map_err(filter_err)?;
+            let matrix = if frame.color().space == ye_pixfmt::ColorSpace::Bt709 {
+                ye_filter::YuvMatrix::Bt709
+            } else {
+                ye_filter::YuvMatrix::Bt601
+            };
+            let buf = ye_filter::rgba_to_yuv420p_matrix(&tight, w, h, range, matrix)
+                .map_err(filter_err)?;
             yuv_frame_from_buffer(&buf, frame)
         }
         (PixelFormat::Rgb24, PixelFormat::Yuv420p) => {

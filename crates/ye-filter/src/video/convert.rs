@@ -326,6 +326,7 @@ fn rgb_to_yuv420p_impl(
     width: usize,
     height: usize,
     range: YuvRange,
+    matrix: YuvMatrix,
 ) -> Result<Yuv420pBuffer, FilterError> {
     if width == 0 || height == 0 {
         return Err(FilterError::InvalidArguments("zero frame dimension"));
@@ -349,7 +350,22 @@ fn rgb_to_yuv420p_impl(
                 4 => (pixel[o * 4], pixel[o * 4 + 1], pixel[o * 4 + 2]),
                 _ => (pixel[o * 3], pixel[o * 3 + 1], pixel[o * 3 + 2]),
             };
-            let (y, u, v) = rgb_to_yuv_pixel(pr, pg, pb, range);
+            let (y, u, v) = match matrix {
+                YuvMatrix::Bt601 => rgb_to_yuv_pixel(pr, pg, pb, range),
+                YuvMatrix::Bt709 => {
+                    let (r, g, b) = (f64::from(pr), f64::from(pg), f64::from(pb));
+                    let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    let (y_scale, c_scale, y_bias) = match range {
+                        YuvRange::Limited => (219.0 / 255.0, 224.0 / 255.0, 16.0),
+                        YuvRange::Full => (1.0, 1.0, 0.0),
+                    };
+                    (
+                        y_bias + y_scale * l,
+                        128.0 + c_scale * (b - l) / 1.8556,
+                        128.0 + c_scale * (r - l) / 1.5748,
+                    )
+                }
+            };
             y_plane[o] = round_half_away(y);
             let idx = (r / 2) * cw + c / 2;
             acc_u[idx] += u;
@@ -375,7 +391,7 @@ pub fn rgba_to_yuv420p(
     height: usize,
     range: YuvRange,
 ) -> Result<Yuv420pBuffer, FilterError> {
-    rgb_to_yuv420p_impl(rgba, 4, width, height, range)
+    rgb_to_yuv420p_impl(rgba, 4, width, height, range, YuvMatrix::Bt601)
 }
 
 /// rgb24（紧密，3 字节/像素）→ yuv420p。
@@ -388,7 +404,17 @@ pub fn rgb24_to_yuv420p(
     height: usize,
     range: YuvRange,
 ) -> Result<Yuv420pBuffer, FilterError> {
-    rgb_to_yuv420p_impl(rgb, 3, width, height, range)
+    rgb_to_yuv420p_impl(rgb, 3, width, height, range, YuvMatrix::Bt601)
+}
+
+pub fn rgba_to_yuv420p_matrix(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    range: YuvRange,
+    matrix: YuvMatrix,
+) -> Result<Yuv420pBuffer, FilterError> {
+    rgb_to_yuv420p_impl(rgba, 4, width, height, range, matrix)
 }
 
 #[cfg(test)]

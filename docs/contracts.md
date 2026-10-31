@@ -1097,3 +1097,12 @@ AAC-LC 解码支持码本 13：独立 noise scalefactor 差分链、逐窗逐带
 `convert_with_options` 保留 `convert` 的原有默认入口，增加可选有理数目标帧率及 `AudioOutput`（44.1/48kHz 单/双声道）。改帧率按窗口内显示时刻 hold-last，帧数为窗口时长乘目标帧率向上取整。音频输出启用时以时间零为共同原点，负时间 priming 丢弃、正时间空隙分块填零；32-tap sinc 重采样，输出有效样本数按输入样本数与采样率比向上取整，编码末块仍补到 AAC 的1024样本。当前文件端尚未写有效样本数裁尾信息，不能将编码填充误报为已通过精确时长验收。
 
 MP4 Demuxer 头的 duration/start_time 现应用常见编辑列表；原始 Mp4Reader 保留原样本时钟。编码注册工厂关闭重建历史缓存；具体 H264Encoder 的测试访问器保留原行为。
+# 静态时间线渲染（联动 P3）
+
+`timeline::render_frames` 输出编码前 RGBA 和 48kHz 双声道 PCM；`timeline::render` 复用既有编码封装泵。每个素材出场有独立游标；视频取显示时刻不晚于输出 tick 的最近帧，keyframe seek 后解码并重排。窗口含头不含尾，源区间与时间线区间等长。没有视频层的 tick 输出黑场，没有音频的采样输出静音。
+
+变换为画布中心偏移 x/y、源中心锚定、等比 scale、顺时针角度及 source-over opacity；z 增大向上。音频 gain 0–2，pan -1–1 采用左右平衡（中心两侧不变，极端关闭对侧），相加后削波，不做归一化。mute/solo 在消费方唯一求值层解决。每路仅保留相邻视频帧或少量 PCM 块；源音频支持44.1/48kHz单/双声道，32-tap sinc 插值并以源时戳对齐。
+
+输出 RGBA 经 BT.709 limited 矩阵转换，编码首个 SPS 携带色彩 VUI。输入 BT.601/709 与 full/limited 按帧色彩转换；HDR 与未知矩阵明确拒绝。首版不处理关键帧、变速、效果、转场、图片；消费方 DTO 后端须列出这些阻塞项。
+
+MP4 mux 模板可带 `mp4.presentation.duration_ticks`，写 v1 elst，并采用882MHz movie时钟精确表达微秒和44.1/48kHz样本。底层样本表保留编码包时长，Demuxer 的呈现时长裁去填充；使用原始 Mp4Reader 的调用方仍须自行解释编辑列表。旧模板未设置该字段时不改变封装。

@@ -460,6 +460,15 @@ impl Muxer for Mp4Muxer {
                 self.seal();
                 return Err(map_write_err(e));
             }
+            if let Some(value) = t.metadata.get("mp4.presentation.duration_ticks") {
+                let ticks = value.parse::<u64>().map_err(|_| {
+                    ContainerError::InvalidData("invalid presentation duration".into())
+                })?;
+                if let Err(e) = writer.set_presentation_duration(writer.stream_count() - 1, ticks) {
+                    self.seal();
+                    return Err(map_write_err(e));
+                }
+            }
         }
         self.state = MuxState::Writing;
         Ok(())

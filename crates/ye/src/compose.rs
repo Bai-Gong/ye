@@ -189,6 +189,7 @@ pub fn compose(
         header: HeaderState::Pending(Vec::new()),
         processed_us: 0,
         total_us,
+        presentation_us: None,
         progress,
         video_frames: 0,
         audio_frames: 0,
@@ -484,6 +485,7 @@ pub(crate) struct CfrSampler {
     held: Option<VideoFrame>,
     /// 是否已见过窗口内帧（空窗拒绝的依据）。
     saw_any: bool,
+    black_leading: bool,
 }
 
 impl CfrSampler {
@@ -526,7 +528,13 @@ impl CfrSampler {
             rate_den,
             held: None,
             saw_any: false,
+            black_leading: false,
         })
+    }
+
+    pub(crate) fn black_leading(mut self) -> Self {
+        self.black_leading = true;
+        self
     }
 
     /// 送入一个窗口内帧（调用方已过滤窗口 + 过链；pts 升序）。触发发射
@@ -587,7 +595,22 @@ impl CfrSampler {
                     self.next_tick
                 )));
             };
-            emit(source)?;
+            if self.black_leading && self.held.is_none() {
+                let mut black = source.clone();
+                let luma = if black.color().range == ye_pixfmt::ColorRange::Jpeg {
+                    0
+                } else {
+                    16
+                };
+                for plane in 0..3 {
+                    black
+                        .plane_mut(plane)
+                        .fill(if plane == 0 { luma } else { 128 });
+                }
+                emit(&black)?;
+            } else {
+                emit(source)?;
+            }
             self.next_tick += 1;
         }
         Ok(())
@@ -643,6 +666,7 @@ struct ComposeRun<'a> {
     header: HeaderState,
     processed_us: i64,
     total_us: i64,
+    presentation_us: Option<i64>,
     progress: ConvertProgress<'a>,
     video_frames: u64,
     audio_frames: u64,
@@ -975,7 +999,12 @@ impl ComposeRun<'_> {
                 codec: params,
                 time_base: self.video_time_base,
                 frame_rate: Some(self.frame_rate),
-                metadata: Metadata::new(),
+                metadata: crate::convert::presentation_metadata(
+                    self.presentation_us
+                        .map(|us| Timestamp::new(us, MICRO).rescale(self.video_time_base))
+                        .transpose()?
+                        .map(|t| t.ticks()),
+                ),
             });
         }
         if let Some(lane) = self.audio.as_mut() {
@@ -1009,6 +1038,123 @@ impl ComposeRun<'_> {
 // ---------------------------------------------------------------------------
 // 单元测试（CFR 桶采样纯语义 / 校验纯函数）
 // ---------------------------------------------------------------------------
+
+/// Shared output pump for already rendered frames. Input audio is 48kHz stereo.
+pub(crate) struct RenderedOutput<'a> {
+    run: ComposeRun<'a>,
+}
+impl RenderedOutput<'_> {
+    pub(crate) fn new(
+        containers: &ContainerRegistry,
+        codecs: &CodecRegistry,
+        format: &str,
+        output: Box<dyn WriteSeek>,
+        settings: &ComposeSettings,
+        total_us: i64,
+    ) -> Result<Self, ConvertError> {
+        validate_settings(settings)?;
+        let fps = settings.frame_rate;
+        let time_base = Rational::new(1, fps.num());
+        let config = EncoderConfig {
+            codec: CodecId::H264,
+            time_base,
+            bit_rate: settings.bit_rate,
+            video: Some(ye_codec::VideoEncoderConfig {
+                width: settings.width,
+                height: settings.height,
+                format: PixelFormat::Yuv420p,
+                frame_rate: fps,
+                gop: settings.gop,
+                quality: settings.quality,
+            }),
+            audio: None,
+        };
+        let mut run = ComposeRun {
+            muxer: containers.create_muxer(format, output)?,
+            video_encoder: codecs.create_encoder(&config)?,
+            video_extradata: None,
+            video_out_index: 0,
+            video_time_base: time_base,
+            frame_rate: fps,
+            width: settings.width,
+            height: settings.height,
+            pixels: crate::convert::filter_ops(),
+            audio: None,
+            header: HeaderState::Pending(Vec::new()),
+            processed_us: 0,
+            total_us,
+            presentation_us: Some(total_us),
+            progress: &|_, _| {},
+            video_frames: 0,
+            audio_frames: 0,
+            streams_out: 0,
+        };
+        if matches!(settings.audio, AudioEncodeSettings::Aac { .. }) {
+            let mut params = CodecParameters::new(CodecId::Aac, MediaType::Audio);
+            params.audio = Some(ye_codec::AudioParams {
+                sample_rate: 48000,
+                channel_layout: Some(ChannelLayout::STEREO),
+                sample_format: Some(SampleFormat::F32),
+            });
+            run.ensure_audio_lane(
+                codecs,
+                &Stream {
+                    index: 0,
+                    media_type: MediaType::Audio,
+                    codec: params,
+                    time_base: Rational::new(1, 48000),
+                    start_time: None,
+                    duration: None,
+                    nb_frames: None,
+                    metadata: Metadata::new(),
+                },
+                0,
+                settings,
+            )?;
+            if let Some(audio) = run.audio.as_mut() {
+                audio.template.metadata = crate::convert::presentation_metadata(Some(
+                    ((i128::from(total_us) * 48000 + 999999) / 1_000_000) as i64,
+                ));
+            }
+        }
+        Ok(Self { run })
+    }
+    pub(crate) fn write(&mut self, frame: Frame) -> Result<(), ConvertError> {
+        match frame {
+            Frame::Video(v) => {
+                let v = (self.run.pixels.convert)(&v, PixelFormat::Yuv420p)?;
+                self.run.emit_cfr_frame(&v)
+            }
+            Frame::Audio(a) => self.run.take_audio_frame(a, 0, self.run.total_us, 0),
+        }
+    }
+    pub(crate) fn finish(mut self) -> Result<ConvertStats, ConvertError> {
+        let run = &mut self.run;
+        run.video_encoder.flush();
+        run.drain_video_encoder()?;
+        if let Some(lane) = run.audio.as_mut()
+            && !lane.samples.is_empty()
+        {
+            lane.samples.resize(AAC_FRAME_SAMPLES * lane.channels, 0.0);
+        }
+        run.flush_audio_chunks()?;
+        if let Some(lane) = run.audio.as_mut() {
+            lane.encoder.flush();
+        }
+        run.drain_audio_encoder()?;
+        if matches!(run.header, HeaderState::Pending(_)) {
+            run.open_output_tracks()?;
+        }
+        run.muxer.write_trailer()?;
+        Ok(ConvertStats {
+            streams: run.streams_out,
+            video_frames: run.video_frames,
+            audio_frames: run.audio_frames,
+            processed_us: run.total_us,
+            total_us: run.total_us,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

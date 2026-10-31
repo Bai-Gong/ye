@@ -98,6 +98,15 @@ pub(crate) fn write_sps_nal(
     height: usize,
     level_idc: u8,
 ) -> Result<Vec<u8>, H264Error> {
+    write_sps_nal_color(width, height, level_idc, None)
+}
+
+pub(crate) fn write_sps_nal_color(
+    width: usize,
+    height: usize,
+    level_idc: u8,
+    color: Option<ye_pixfmt::ColorDesc>,
+) -> Result<Vec<u8>, H264Error> {
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
     let crop_r = (mb_w * 16 - width) / 2;
@@ -124,7 +133,24 @@ pub(crate) fn write_sps_nal(
     } else {
         w.u1(false);
     }
-    w.u1(false); // vui_parameters_present_flag
+    w.u1(color.is_some());
+    if let Some(color) = color {
+        w.u1(false); // aspect_ratio_info_present_flag
+        w.u1(false); // overscan_info_present_flag
+        w.u1(true); // video_signal_type_present_flag
+        w.u(3, 5)?; // unspecified video format
+        w.u1(color.range == ye_pixfmt::ColorRange::Jpeg);
+        w.u1(true); // colour_description_present_flag
+        w.u(8, u64::from(color.primaries.to_code()))?;
+        w.u(8, u64::from(color.transfer.to_code()))?;
+        w.u(8, u64::from(color.space.to_code()))?;
+        w.u1(false); // chroma_loc_info_present_flag
+        w.u1(false); // timing_info_present_flag
+        w.u1(false); // nal_hrd_parameters_present_flag
+        w.u1(false); // vcl_hrd_parameters_present_flag
+        w.u1(false); // pic_struct_present_flag
+        w.u1(false); // bitstream_restriction_flag
+    }
     w.rbsp_trailing_bits();
     Ok(nal_bytes(7, 3, w.take_rbsp()))
 }

@@ -54,6 +54,7 @@ pub mod codec_h264;
 pub mod compose;
 pub mod container;
 pub mod convert;
+pub mod timeline;
 
 #[cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
 pub mod frame_grab;

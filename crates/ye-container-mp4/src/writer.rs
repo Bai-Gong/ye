@@ -426,6 +426,7 @@ pub(crate) fn build_trak_skeleton(
     duration_units: u64,
     tkhd_duration_units: u64,
     stbl_children: Vec<Vec<u8>>,
+    edit: bool,
 ) -> Vec<u8> {
     let is_video = is_video_cfg(cfg);
     // tkhd 16.16 宽高（clamp 到 u16 段，字段上限）。
@@ -524,7 +525,21 @@ pub(crate) fn build_trak_skeleton(
     let mdia = md.into_box(b"mdia");
 
     let mut tk = BoxBuf::new();
-    tk.bytes(&tkhd).bytes(&mdia);
+    tk.bytes(&tkhd);
+    if edit {
+        let mut e = BoxBuf::new();
+        e.u32(0x01000000)
+            .u32(1)
+            .u64(tkhd_duration_units)
+            .u64(0)
+            .u16(1)
+            .u16(0);
+        let elst = e.into_box(b"elst");
+        let mut edts = BoxBuf::new();
+        edts.bytes(&elst);
+        tk.bytes(&edts.into_box(b"edts"));
+    }
+    tk.bytes(&mdia);
     tk.into_box(b"trak")
 }
 
@@ -560,6 +575,7 @@ struct PendingSample {
 struct TrackState {
     cfg: TrackConfig,
     timescale: u32,
+    presentation_duration: Option<u64>,
     /// Progressive：已落盘样例。
     samples: Vec<SampleRec>,
     // —— Fragmented ——
@@ -742,6 +758,7 @@ const FRAG_DURATION_PLACEHOLDER: u64 = u64::MAX;
 pub struct Mp4Writer<W> {
     w: W,
     options: Mp4WriterOptions,
+    movie_timescale: u32,
     tracks: Vec<TrackState>,
     /// 布局固定前缀（progressive：ftyp+free+mdat 头；fragmented：
     /// ftyp+moov）是否已落盘（首包/首 flush/finalize 惰性写出，
@@ -797,6 +814,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Mp4Writer {
             w,
             options,
+            movie_timescale: MOVIE_TIMESCALE,
             tracks: Vec::new(),
             prologue_done: false,
             wrote_packet: false,
@@ -889,6 +907,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
         self.tracks.push(TrackState {
             cfg,
             timescale,
+            presentation_duration: None,
             samples: Vec::new(),
             frag_pending: Vec::new(),
             frag_pending_data: Vec::new(),
@@ -900,6 +919,28 @@ impl<W: Write + Seek> Mp4Writer<W> {
 
     pub fn stream_count(&self) -> usize {
         self.tracks.len()
+    }
+
+    /// Trim encoder padding in the presentation timeline, preserving raw packet durations.
+    /// A fine movie clock represents microseconds and 44.1/48kHz samples exactly.
+    pub fn set_presentation_duration(
+        &mut self,
+        index: usize,
+        ticks: u64,
+    ) -> Result<(), WriterError> {
+        if self.prologue_done || self.options.layout != Layout::Progressive || ticks == 0 {
+            return Err(WriterError::Misuse(
+                "presentation duration requires progressive output before packets",
+            ));
+        }
+        let count = self.tracks.len();
+        let track = self
+            .tracks
+            .get_mut(index)
+            .ok_or(WriterError::InvalidStreamIndex { index, count })?;
+        track.presentation_duration = Some(ticks);
+        self.movie_timescale = 882_000_000;
+        Ok(())
     }
 
     /// 顺序写一个样例（`pkt.stream_index` 定轨）。
@@ -1142,7 +1183,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 .iter()
                 .any(|t| chunk_runs(&t.samples).iter().any(|c| c.0 > u32::MAX as u64));
 
-        let movie_tb = Rational::new(1, MOVIE_TIMESCALE as i32);
+        let movie_tb = Rational::new(1, self.movie_timescale as i32);
         let mut movie_dur_max: u64 = 0;
         let mut traks = Vec::with_capacity(self.tracks.len());
         for (i, t) in self.tracks.iter().enumerate() {
@@ -1158,8 +1199,12 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 })
                 .transpose()?
                 .unwrap_or(0);
-            let end = i64::try_from(duration_units)
-                .map_err(|_| WriterError::Misuse("mdhd 时长累计溢出"))?;
+            let presented = t.presentation_duration.unwrap_or(duration_units);
+            if presented > duration_units {
+                return Err(WriterError::Misuse("presentation exceeds encoded samples"));
+            }
+            let end =
+                i64::try_from(presented).map_err(|_| WriterError::Misuse("mdhd 时长累计溢出"))?;
             let movie_end = Timestamp::new(end, t.cfg.timebase)
                 .rescale(movie_tb)
                 .map_or(u32::MAX as u64 + 1, |v| v.ticks().max(0) as u64);
@@ -1172,11 +1217,12 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 // tkhd 取 movie 时基（与 backfill_frag_durations 同一换算）。
                 movie_end,
                 stbl_children,
+                t.presentation_duration.is_some(),
             ));
         }
         let mut moov = BoxBuf::new();
         moov.bytes(&build_mvhd(
-            MOVIE_TIMESCALE,
+            self.movie_timescale,
             movie_dur_max,
             self.tracks.len() as u32 + 1,
         ));
@@ -1316,6 +1362,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 FRAG_DURATION_PLACEHOLDER,
                 FRAG_DURATION_PLACEHOLDER,
                 empty_tables.clone(),
+                false,
             ));
         }
         moov.bytes(&build_mvex_trex(&self.tracks));

@@ -65,7 +65,7 @@ pub mod scale;
 
 pub use convert::{
     Yuv420pBuffer, Yuv420pView, YuvMatrix, YuvRange, rgb24_to_yuv420p, rgba_to_yuv420p,
-    yuv420p_to_rgb24, yuv420p_to_rgba, yuv420p_to_rgba_matrix,
+    rgba_to_yuv420p_matrix, yuv420p_to_rgb24, yuv420p_to_rgba, yuv420p_to_rgba_matrix,
 };
 pub use scale::{
     crop_rgba, crop_yuv420p, fps_nearest_frame_indices, scale_rgba, scale_yuv420p, volume_f32,

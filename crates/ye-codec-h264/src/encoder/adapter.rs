@@ -86,6 +86,7 @@ pub struct H264Encoder {
     out: VecDeque<Packet>,
     recon: Vec<ReconFrame>,
     record_recon: bool,
+    color_sps: Option<Vec<u8>>,
     time_base: Rational,
     frame_rate: Rational,
     frame_index: u64,
@@ -183,6 +184,7 @@ impl H264Encoder {
             out: VecDeque::new(),
             recon: Vec::new(),
             record_recon: true,
+            color_sps: None,
             time_base: config.time_base,
             frame_rate: video.frame_rate,
             frame_index: 0,
@@ -280,7 +282,7 @@ impl H264Encoder {
         let mut data = Vec::with_capacity(encoded.nal.len() + 16);
         if idr {
             let (sps, pps) = self.session.param_sets();
-            push_avcc_nal(&mut data, sps);
+            push_avcc_nal(&mut data, self.color_sps.as_deref().unwrap_or(sps));
             push_avcc_nal(&mut data, pps);
         }
         push_avcc_nal(&mut data, &encoded.nal);
@@ -345,6 +347,20 @@ impl Encoder for H264Encoder {
             return Err(CodecError::InvalidArguments(
                 "frame dimensions differ from encoder config",
             ));
+        }
+        if self.frame_index == 0 && video.color() != ye_pixfmt::ColorDesc::UNSPECIFIED {
+            let level = level_for(self.width as u32, self.height as u32, self.frame_rate)
+                .ok_or(CodecError::InvalidArguments("level"))?;
+            let sps = crate::encoder::frame::write_sps_nal_color(
+                self.width,
+                self.height,
+                level,
+                Some(video.color()),
+            )
+            .map_err(codec_err)?;
+            let pps = crate::encoder::frame::write_pps_nal().map_err(codec_err)?;
+            self.extradata = build_avcc(&sps, &pps);
+            self.color_sps = Some(sps);
         }
         self.encode_frame(video)
     }

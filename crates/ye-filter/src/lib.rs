@@ -53,3 +53,4 @@ pub use video::{
     volume_f32, volume_gain_from_db, yuv420p_to_rgb24, yuv420p_to_rgba, yuv420p_to_rgba_matrix,
 };
 pub mod audio;
+pub use video::rgba_to_yuv420p_matrix;
