@@ -561,7 +561,7 @@ pub(crate) fn apply_parts(
 /// 分区区域加权（FFmpeg h264weight `weight_h264_pixels` 逐字：
 /// dst = clip((dst·w + (o<<ld) + (1<<(ld−1))) >> ld)）。
 #[allow(clippy::too_many_arguments)]
-fn weight_partition(
+pub(crate) fn weight_partition(
     pic: &mut Picture,
     mbx: usize,
     mby: usize,

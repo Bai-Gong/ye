@@ -300,3 +300,71 @@ fn cabac_b_无加权对拍() {
         "keyint=30:min-keyint=30:scenecut=0:bframes=3:weightb=0",
     );
 }
+
+#[test]
+fn p_skip_weighted_color_changes_match_all_three_planes() {
+    let Some((ffmpeg, _)) = tools() else {
+        eprintln!("跳过：未定位 ffmpeg/ffprobe（weighted P_Skip）");
+        return;
+    };
+    for (tag, params) in [
+        ("cabac", "cabac=1:bframes=3:weightp=2:keyint=90:scenecut=0"),
+        // CAVLC regression targets Main-profile 4x4 transforms; High-profile
+        // CAVLC 8x8 transform syntax is tracked separately in the waitlist.
+        (
+            "cavlc",
+            "cabac=0:bframes=0:weightp=2:keyint=90:scenecut=0:8x8dct=0",
+        ),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("ye-weighted-skip-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("colors.mp4");
+        let made = Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=176x144:r=15:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=blue:s=176x144:r=15:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=white:s=176x144:r=15:d=1",
+                "-filter_complex",
+                "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                "libx264",
+                "-x264-params",
+            ])
+            .arg(params)
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let frames = decode_yuv_frames(&src);
+        assert_eq!(frames.len(), 45);
+        let reference = ffmpeg_yuv_frames(&ffmpeg, &src, 45, 176, 144);
+        for (n, (_, _, frame)) in frames.iter().enumerate() {
+            assert_eq!(
+                frame.as_slice(),
+                &reference[n * frame.len()..(n + 1) * frame.len()],
+                "{tag} frame {n}"
+            );
+        }
+        std::fs::remove_file(src).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+}

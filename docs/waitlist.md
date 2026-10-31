@@ -24,6 +24,7 @@
 | 4 | MOV 容器（QT 族导入） | ye-container（新实现 crate，MP4 近亲可大量复用） | 持续轨道·下一梯队 | 未开工；按剪的导入统计驱动（同梯队：WAV/MP3 纯探测） |
 | 5 | MKV / WebM 容器 | ye-container（Matroska 实现 crate） | **M5** | 未开工 |
 | 6 | GIF / 图片探测（纯探测，无解封装） | ye-container（纯探测工厂） | 未排期 | 未开工；按导入统计驱动 |
+| 7 | High-profile CAVLC 的 8×8 变换语法 | ye-codec-h264 CAVLC 宏块解析 | 后续解码扩展 | 2026-10-31 色块长 GOP 联调暴露：红→蓝→白、cabac=0/8x8dct=1 时白场首帧报 intra pred mode 8。不能以 CABAC 8×8 对拍通过代替此组合；CAVLC 加权 P_Skip 回归限定 Main 的 4×4 变换。CABAC 同素材三平面逐样本通过。 |
 
 维护约定：
 

@@ -1374,6 +1374,12 @@ pub(crate) fn decode_skip_mb(
     let mv = pred_pskip(pic, mbx, mby);
     let refp = pctx.l0[0].clone();
     mc_partition(pic, &refp, mbx, mby, 0, 0, 4, 4, mv)?;
+    // P_Skip omits residual/motion syntax, but still uses the slice's explicit
+    // prediction weights. Skipping these preserves the old picture on fades/cuts.
+    if !pctx.wp.is_identity() {
+        let weight = pctx.wp.l0.first().copied().unwrap_or_default();
+        crate::inter::weight_partition(pic, mbx, mby, 0, 0, 4, 4, weight, &pctx.wp);
+    }
     let mb_xy = mby * pic.mb_width + mbx;
     let mut mb = Macroblock {
         decoded: false,
