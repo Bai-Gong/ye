@@ -42,7 +42,8 @@ use crate::error::AacError;
 use crate::filterbank::{self, BlockSequence, FrameLength, WindowInfo, WindowShape};
 use crate::stereo;
 use crate::syntax::{
-    self, AudioSpecificConfig, BitReader, EIGHT_SHORT, LONG_START, LoasState, ONLY_LONG, RawElement,
+    self, AudioSpecificConfig, BitReader, EIGHT_SHORT, LONG_START, LoasState, ONLY_LONG,
+    PairCommon, RawElement,
 };
 use crate::tns;
 
@@ -331,15 +332,17 @@ impl AacDecoder {
                 }
                 RawElement::Pair { common, ch } => {
                     let (mut c0, mut c1) = (ch[0].clone(), ch[1].clone());
+                    let default_common = PairCommon {
+                        ms_present: 0,
+                        ms_used: Vec::new(),
+                    };
+                    let pc = common.as_ref().unwrap_or(&default_common);
                     crate::pns::generate(&mut c0, &mut self.noise_state);
                     crate::pns::generate(&mut c1, &mut self.noise_state);
-                    // Independent ICS may have different band counts and window
-                    // groups. Cross-channel tools are only defined for a shared
-                    // window; a fabricated empty M/S mask does not make one.
-                    if let Some(pc) = common {
-                        crate::pns::correlate(pc, &c0, &mut c1);
-                        stereo::apply(pc, &mut c0, &mut c1)?;
+                    if let Some(shared) = common {
+                        crate::pns::correlate(shared, &c0, &mut c1);
                     }
+                    stereo::apply(pc, &mut c0, &mut c1)?;
                     if let Some(t) = c0.tns.take() {
                         tns::apply(&mut c0.coeffs, &c0.ics, &t);
                     }

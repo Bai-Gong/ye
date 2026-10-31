@@ -44,6 +44,11 @@ pub(crate) fn generate(ch: &mut ChannelSyntax, state: &mut u32) {
 }
 
 pub(crate) fn correlate(common: &PairCommon, left: &ChannelSyntax, right: &mut ChannelSyntax) {
+    // No shared M/S mask means no correlation. In particular, independently
+    // windowed channels need not have the same number of bands or groups.
+    if common.ms_present == 0 {
+        return;
+    }
     let ics = &left.ics;
     let stride = if ics.window_sequence == EIGHT_SHORT {
         128
@@ -77,6 +82,40 @@ pub(crate) fn correlate(common: &PairCommon, left: &ChannelSyntax, right: &mut C
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn independent_noise_bands_do_not_read_the_other_channel() {
+        use crate::syntax::{CB_NOISE, ChannelSyntax, IcsInfo, ONLY_LONG, PairCommon};
+        let left = ChannelSyntax {
+            ics: IcsInfo {
+                window_sequence: ONLY_LONG,
+                window_shape: false,
+                max_sfb: 2,
+                num_window_groups: 1,
+                group_len: [1, 0, 0, 0, 0, 0, 0, 0],
+                swb_offset: &[0, 4, 8],
+                num_swb: 2,
+                tns_max_bands: 2,
+            },
+            codebooks: vec![0, CB_NOISE],
+            scalefactors: vec![0, 0],
+            tns: None,
+            coeffs: vec![1.0; 1024],
+        };
+        let mut right = left.clone();
+        right.ics.max_sfb = 1;
+        right.codebooks.truncate(1);
+        right.scalefactors.truncate(1);
+        right.coeffs.fill(2.0);
+        super::correlate(
+            &PairCommon {
+                ms_present: 0,
+                ms_used: Vec::new(),
+            },
+            &left,
+            &mut right,
+        );
+        assert!(right.coeffs.iter().all(|v| *v == 2.0));
+    }
     #[test]
     fn requested_noise_energy() {
         let mut band = [1.0, -2.0, 3.0, -4.0];

@@ -64,7 +64,10 @@ pub(crate) fn apply(
     for g in 0..ics1.num_window_groups as usize {
         let g_len = ics1.group_len[g] as usize;
         let mut sfb = 0usize;
-        while sfb < max_sfb {
+        // Intensity follows the right channel's own ICS even when common_window
+        // is false (FFmpeg n4.4 apply_intensity_stereo / decode_cpe). The left
+        // band count may differ and must never index the right codebook array.
+        while sfb < ics1.max_sfb as usize {
             let cb = ch1.codebooks[idx];
             if cb == CB_INTENSITY_HI || cb == CB_INTENSITY_LO {
                 let lo = ics1.swb_offset[sfb] as usize;
@@ -190,5 +193,29 @@ mod tests {
         );
         apply(&common, &mut c0, &mut c1).unwrap();
         assert!((c1.coeffs[4] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn independent_right_band_count_preserves_intensity() {
+        let mut left = chan(ics_44(), vec![1.0; 1024], vec![7; 4], vec![0; 4]);
+        let mut right_ics = ics_44();
+        right_ics.max_sfb = 2;
+        let mut right = chan(
+            right_ics,
+            vec![0.0; 1024],
+            vec![7, CB_INTENSITY_LO],
+            vec![0; 2],
+        );
+        apply(
+            &PairCommon {
+                ms_present: 0,
+                ms_used: Vec::new(),
+            },
+            &mut left,
+            &mut right,
+        )
+        .unwrap();
+        assert_eq!(&right.coeffs[4..8], &[1.0; 4]);
+        assert!(right.coeffs[8..].iter().all(|v| *v == 0.0));
     }
 }
