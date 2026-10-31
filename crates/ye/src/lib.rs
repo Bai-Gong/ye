@@ -74,3 +74,6 @@ pub use ye_time as time;
 
 /// 库版本号（与 workspace 版本一致）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 安全文件输出：成功前不触碰目标路径。
+pub mod output;
