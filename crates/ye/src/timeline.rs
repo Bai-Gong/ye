@@ -168,7 +168,7 @@ impl Source {
                     .start_time
                     .unwrap_or(Timestamp::new(0, stream.time_base)),
             )?;
-            if Timestamp::compare(Timestamp::new(trim_out_us, MICRO), end).is_gt() {
+            if trim_out_us > end.rescale(MICRO)?.ticks() {
                 return Err(invalid("源窗口超出素材时长"));
             }
         }
@@ -232,8 +232,15 @@ impl VideoCursor {
     fn at(
         &mut self,
         at: Timestamp,
+        offset_us: i64,
         cancel: &AtomicBool,
     ) -> Result<Option<&VideoFrame>, ConvertError> {
+        let offset = Timestamp::new(offset_us, MICRO);
+        if let Some(start) = self.source.stream.start_time
+            && Timestamp::compare_sum(at, offset, start)?.is_lt()
+        {
+            return Ok(None);
+        }
         loop {
             if self.next.is_none() && !self.ended {
                 match self.source.next(cancel)? {
@@ -258,11 +265,11 @@ impl VideoCursor {
                     }
                 }
             }
-            if self
-                .next
-                .as_ref()
-                .is_some_and(|v| v.pts().is_some_and(|p| Timestamp::compare(p, at).is_le()))
-            {
+            let advance = match self.next.as_ref().and_then(|v| v.pts()) {
+                Some(pts) => Timestamp::compare_sum(at, offset, pts)?.is_ge(),
+                None => false,
+            };
+            if advance {
                 self.held = self.next.take();
             } else {
                 break;
@@ -282,6 +289,8 @@ struct AudioCursor {
     ended: bool,
     rate: u32,
     channels: usize,
+    valid_start: i64,
+    valid_end: Option<i64>,
 }
 impl AudioCursor {
     fn ensure(&mut self, center: i64, cancel: &AtomicBool) -> Result<(), ConvertError> {
@@ -372,6 +381,9 @@ impl AudioCursor {
                 sinc * (0.5 + 0.5 * (std::f64::consts::PI * distance / 16.0).cos()) * cutoff;
             norm += weight;
             let n = center + i64::from(k);
+            if n < self.valid_start || self.valid_end.is_some_and(|end| n >= end) {
+                continue;
+            }
             if i128::from(n) * 1_000_000 < i128::from(lo) * i128::from(self.rate)
                 || i128::from(n) * 1_000_000 >= i128::from(hi) * i128::from(self.rate)
             {
@@ -540,6 +552,20 @@ pub fn render_frames(
                 if ![44100, 48000].contains(&rate) || !(1..=2).contains(&channels) {
                     return Err(invalid("音频支持 44.1/48kHz 单/双声道"));
                 }
+                let sample_clock = Rational::new(1, rate as i32);
+                let valid_start = source.stream.start_time.unwrap_or(Timestamp::new(0, MICRO));
+                let valid_end = source
+                    .stream
+                    .duration
+                    .map(|d| {
+                        d.checked_add(valid_start)?
+                            .rescale_with(sample_clock, ye_time::Rounding::Up)
+                    })
+                    .transpose()?
+                    .map(|t| t.ticks());
+                let valid_start = valid_start
+                    .rescale_with(sample_clock, ye_time::Rounding::Up)?
+                    .ticks();
                 Cursor::Audio(
                     Box::new(AudioCursor {
                         source,
@@ -547,6 +573,8 @@ pub fn render_frames(
                         ended: false,
                         rate,
                         channels,
+                        valid_start,
+                        valid_end,
                     }),
                     m,
                 )
@@ -611,19 +639,17 @@ pub fn render_frames(
                 {
                     continue;
                 }
-                if let Cursor::Video(cursor, t) = &mut c.cursor {
-                    let source_time =
-                        time.checked_add(Timestamp::new(c.source_in - c.start, MICRO))?;
-                    if let Some(source) = cursor.at(source_time, cancel)? {
-                        if matches!(
-                            source.color().transfer,
-                            ColorTransfer::Smpte2084 | ColorTransfer::AribStdB67
-                        ) {
-                            return Err(invalid("暂不支持 HDR 色彩转换"));
-                        }
-                        let rgba = crate::convert::filter_convert(source, PixelFormat::Rgba8)?;
-                        blend(&mut frame, &rgba, *t)?;
+                if let Cursor::Video(cursor, t) = &mut c.cursor
+                    && let Some(source) = cursor.at(time, c.source_in - c.start, cancel)?
+                {
+                    if matches!(
+                        source.color().transfer,
+                        ColorTransfer::Smpte2084 | ColorTransfer::AribStdB67
+                    ) {
+                        return Err(invalid("暂不支持 HDR 色彩转换"));
                     }
+                    let rgba = crate::convert::filter_convert(source, PixelFormat::Rgba8)?;
+                    blend(&mut frame, &rgba, *t)?;
                 }
             }
             sink(Frame::Video(frame))?;

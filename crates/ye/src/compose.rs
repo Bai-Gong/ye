@@ -486,6 +486,7 @@ pub(crate) struct CfrSampler {
     /// 是否已见过窗口内帧（空窗拒绝的依据）。
     saw_any: bool,
     black_leading: bool,
+    valid_from: Option<Timestamp>,
 }
 
 impl CfrSampler {
@@ -529,12 +530,38 @@ impl CfrSampler {
             held: None,
             saw_any: false,
             black_leading: false,
+            valid_from: None,
         })
     }
 
-    pub(crate) fn black_leading(mut self) -> Self {
-        self.black_leading = true;
-        self
+    pub(crate) fn for_duration(
+        duration: Timestamp,
+        rate: Rational,
+        valid_from: Timestamp,
+    ) -> Result<Self, ConvertError> {
+        if duration.ticks() <= 0 || duration.time_base().num() <= 0 || rate.num() <= 0 {
+            return Err(ConvertError::InvalidArguments(
+                "CFR 时长和帧率须为正".into(),
+            ));
+        }
+        let numerator = i128::from(duration.ticks())
+            * i128::from(duration.time_base().num())
+            * i128::from(rate.num());
+        let denominator = i128::from(duration.time_base().den()) * i128::from(rate.den());
+        let count = u64::try_from(ceil_div(numerator, denominator))
+            .map_err(|_| ConvertError::InvalidArguments("CFR 帧数溢出".into()))?;
+        Ok(Self {
+            seg_index: 0,
+            trim_in_us: 0,
+            n_ticks: count,
+            next_tick: 0,
+            rate_num: i64::from(rate.num()),
+            rate_den: i64::from(rate.den()),
+            held: None,
+            saw_any: false,
+            black_leading: true,
+            valid_from: Some(valid_from),
+        })
     }
 
     /// 送入一个窗口内帧（调用方已过滤窗口 + 过链；pts 升序）。触发发射
@@ -573,19 +600,25 @@ impl CfrSampler {
         next: Option<&VideoFrame>,
         emit: &mut dyn FnMut(&VideoFrame) -> Result<(), ConvertError>,
     ) -> Result<(), ConvertError> {
-        let next_pts_us: Option<i64> = match next {
-            Some(frame) => Some(frame_pts_us(self.seg_index, frame.pts())?),
+        let next_pts: Option<Timestamp> = match next {
+            Some(frame) => Some(
+                frame
+                    .pts()
+                    .ok_or_else(|| ConvertError::InvalidData("视频帧缺 PTS".into()))?,
+            ),
             None => None,
         };
         while self.next_tick < self.n_ticks {
-            if let Some(p_us) = next_pts_us {
-                // t_k < p ⟺ trim_in·num + k·den·1e6 < p·num（i128 交叉相乘）。
-                let lhs = i128::from(self.trim_in_us) * i128::from(self.rate_num)
-                    + i128::from(self.next_tick) * i128::from(self.rate_den) * 1_000_000;
-                let rhs = i128::from(p_us) * i128::from(self.rate_num);
-                if lhs >= rhs {
-                    break; // 该 tick 的选择尚未定格（next 可能就是它）。
-                }
+            let tick = Timestamp::from_frame_index(
+                i64::try_from(self.next_tick)
+                    .map_err(|_| ConvertError::InvalidArguments("CFR tick 溢出".into()))?,
+                Rational::new(self.rate_num as i32, self.rate_den as i32),
+            )?;
+            let offset = Timestamp::new(self.trim_in_us, MICRO);
+            if let Some(next_pts) = next_pts
+                && Timestamp::compare_sum(tick, offset, next_pts)?.is_ge()
+            {
+                break; // 该 tick 的选择尚未定格（next 可能就是它）。
             }
             let Some(source) = self.held.as_ref().or(next) else {
                 // finish 路径 held 必在（saw_any 已查）；防御性错误。
@@ -595,7 +628,12 @@ impl CfrSampler {
                     self.next_tick
                 )));
             };
-            if self.black_leading && self.held.is_none() {
+            if (self.black_leading && self.held.is_none())
+                || match self.valid_from {
+                    Some(start) => Timestamp::compare_sum(tick, offset, start)?.is_lt(),
+                    None => false,
+                }
+            {
                 let mut black = source.clone();
                 let luma = if black.color().range == ye_pixfmt::ColorRange::Jpeg {
                     0
@@ -1160,6 +1198,36 @@ impl RenderedOutput<'_> {
 mod tests {
     use super::*;
     use ye_pixfmt::ColorDesc;
+
+    #[test]
+    fn cfr_fractional_clock_preserves_every_frame_and_exact_count() {
+        for rate in [Rational::new(30000, 1001), Rational::new(2997, 100)] {
+            let mut sampler = CfrSampler::for_duration(
+                Timestamp::from_frame_index(11, rate).unwrap(),
+                rate,
+                Timestamp::new(0, MICRO),
+            )
+            .unwrap();
+            let mut marks = Vec::new();
+            for i in 0..11 {
+                let mut frame = mark_frame(i as u8, 0);
+                frame.set_pts(Some(Timestamp::from_frame_index(i, rate).unwrap()));
+                sampler
+                    .push(frame, &mut |f| {
+                        marks.push(f.plane(0)[0]);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            sampler
+                .finish(&mut |f| {
+                    marks.push(f.plane(0)[0]);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(marks, (0..11).collect::<Vec<u8>>(), "rate={rate:?}");
+        }
+    }
 
     /// 造一帧 4x4 gray8 测试帧（luma = 标记，pts 按给定 µs）。
     fn mark_frame(marker: u8, pts_us: i64) -> VideoFrame {

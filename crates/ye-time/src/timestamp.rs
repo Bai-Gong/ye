@@ -152,6 +152,37 @@ impl Timestamp {
         lhs.cmp(&rhs)
     }
 
+    /// 精确比较 a + offset 与 b，不要求三者公分母能装入 Rational 的 i32。
+    /// 用于分数帧时钟加微秒裁剪偏移；极端输入的 i128 溢出明确返回错误。
+    pub fn compare_sum(
+        a: Timestamp,
+        offset: Timestamp,
+        b: Timestamp,
+    ) -> Result<Ordering, TimeError> {
+        if offset.ticks == 0 || offset.time_base.num() == 0 {
+            return Ok(a.compare(b));
+        }
+        let mut denominator = 1u128;
+        for t in [a, offset, b] {
+            let d = t.time_base.den() as u128;
+            denominator = (denominator / gcd_u128(denominator, d))
+                .checked_mul(d)
+                .ok_or(TimeError::Overflow)?;
+        }
+        let value = |t: Timestamp| -> Result<i128, TimeError> {
+            let factor = i128::try_from(denominator / t.time_base.den() as u128)
+                .map_err(|_| TimeError::Overflow)?;
+            i128::from(t.ticks)
+                .checked_mul(i128::from(t.time_base.num()))
+                .and_then(|v| v.checked_mul(factor))
+                .ok_or(TimeError::Overflow)
+        };
+        Ok(value(a)?
+            .checked_add(value(offset)?)
+            .ok_or(TimeError::Overflow)?
+            .cmp(&value(b)?))
+    }
+
     /// 精确加法：结果时基取两时基的公共精确基（速率意义上的 lcm——
     /// 对既约 `n_a/d_a`、`n_b/d_b` 取 `gcd(n_a,n_b)/lcm(d_a,d_b)`，自动既约），
     /// 换算系数为整数，**无舍入**。例：`1@1/2 + 1@1/3 = 5@1/6`。
@@ -252,6 +283,33 @@ fn common_exact_base(a: Rational, b: Rational) -> Result<(Rational, i128, i128),
 mod tests {
     use super::*;
     use crate::CANONICAL_TIME_BASE;
+
+    #[test]
+    fn compare_sum_handles_fractional_frames_and_microseconds_without_rounding() {
+        let frame = Timestamp::from_frame_index(11, Rational::new(2997, 100)).unwrap();
+        let micro = Rational::new(1, 1000000);
+        assert_eq!(
+            Timestamp::compare_sum(frame, Timestamp::new(1, micro), frame),
+            Ok(Ordering::Greater)
+        );
+        assert_eq!(
+            Timestamp::compare_sum(frame, Timestamp::new(-1, micro), frame),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            Timestamp::compare_sum(
+                frame,
+                Timestamp::new(-11, frame.time_base()),
+                Timestamp::new(0, micro)
+            ),
+            Ok(Ordering::Equal)
+        );
+        let huge = |den| Timestamp::new(i64::MAX, Rational::new(i32::MAX, den));
+        assert_eq!(
+            Timestamp::compare_sum(huge(2147483629), huge(2147483587), huge(2147483563)),
+            Err(TimeError::Overflow)
+        );
+    }
 
     fn r(num: i32, den: i32) -> Rational {
         Rational::new(num, den)

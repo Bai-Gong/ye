@@ -126,3 +126,55 @@ fn rational_cfr_and_resampled_mono_audio_have_one_origin() {
     std::fs::remove_file(input).unwrap();
     std::fs::remove_file(output).unwrap();
 }
+
+#[test]
+fn fractional_cfr_does_not_add_a_frame_from_microsecond_rounding() {
+    let Some(input) = common::ensure_vector(
+        "clock-fractional.mp4",
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=32x32:rate=2997/100",
+            "-frames:v",
+            "11",
+            "-c:v",
+            "libx264",
+            "-bf",
+            "2",
+            "-y",
+        ],
+    ) else {
+        return;
+    };
+    let output = input.with_extension("fractional.mp4");
+    let mut containers = ContainerRegistry::new();
+    ye::container::mp4::register_mp4(&mut containers);
+    let mut codecs = CodecRegistry::new();
+    ye::codec_h264::register_h264(&mut codecs);
+    ye::codec_h264::register_h264_encoder(&mut codecs);
+    let stats = convert_with_options(
+        &containers,
+        &codecs,
+        Box::new(File::open(&input).unwrap()),
+        "mp4",
+        Box::new(File::create(&output).unwrap()),
+        Some(&VideoEncodeSettings::default()),
+        &AudioEncodeSettings::Drop,
+        &ConvertOptions {
+            frame_rate: Some(Rational::new(2997, 100)),
+            audio_output: None,
+        },
+        filter_ops(),
+        &|_, _| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(stats.video_frames, 11);
+    let header = ye::media::inspect(Box::new(File::open(&output).unwrap())).unwrap();
+    assert_eq!(header.streams[0].nb_frames, Some(11));
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_file(output).unwrap();
+}

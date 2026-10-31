@@ -271,6 +271,63 @@ fn center_rotation_and_opacity_have_deterministic_pixels() {
 }
 
 #[test]
+fn rounded_full_audio_window_does_not_reject_or_leak_encoder_padding() {
+    let Some(input) = common::ensure_vector(
+        "timeline-fractional-audio.m4a",
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000:duration=1.9791875",
+            "-c:a",
+            "aac",
+            "-aac_pns",
+            "0",
+            "-movie_timescale",
+            "48000",
+            "-y",
+        ],
+    ) else {
+        return;
+    };
+    let header = ye::media::inspect(Box::new(File::open(&input).unwrap())).unwrap();
+    let end = header
+        .duration
+        .unwrap()
+        .rescale(Rational::new(1, 1000000))
+        .unwrap()
+        .ticks();
+    assert_eq!(end, 1979188);
+    let (c, k) = registries();
+    let mut samples = Vec::new();
+    render_frames(
+        &c,
+        &k,
+        vec![clip(&input, 0, end, Layer::Audio(AudioMix::default()))],
+        &settings(),
+        end,
+        &mut |f| {
+            if let Frame::Audio(a) = f {
+                samples.extend(
+                    a.data()
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap())),
+                );
+            }
+            Ok(())
+        },
+        &|_, _| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(samples.len(), 95002 * 2);
+    assert!(samples[samples.len() - 2..].iter().all(|s| s.abs() < 1e-10));
+    std::fs::remove_file(input).unwrap();
+}
+
+#[test]
 fn non_keyframe_windows_seek_and_reorder_b_frames_before_selection() {
     let Some(input) = common::ensure_vector(
         "timeline-seek.mp4",

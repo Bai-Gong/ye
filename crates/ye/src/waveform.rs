@@ -665,7 +665,13 @@ pub fn audio_peaks_aligned_with_count(
             .unwrap_or(ye_time::Timestamp::new(0, source.stream.time_base)),
     )?;
     let time_base = ye_time::Rational::new(1, sample_rate as i32);
-    let total = usize::try_from(end.rescale(time_base)?.ticks())
+    let valid_start = source
+        .stream
+        .start_time
+        .unwrap_or(ye_time::Timestamp::new(0, time_base))
+        .rescale_with(time_base, ye_time::Rounding::Up)?
+        .ticks();
+    let total = usize::try_from(end.rescale_with(time_base, ye_time::Rounding::Up)?.ticks())
         .map_err(|_| ConvertError::InvalidData("无效音频时长".into()))?;
     if total == 0 {
         return Err(ConvertError::InvalidData("音频时长为零".into()));
@@ -707,7 +713,7 @@ pub fn audio_peaks_aligned_with_count(
             .ticks();
         for (i, pcm) in frame.data().chunks_exact(4 * channels).enumerate() {
             let at = start.saturating_add(i as i64);
-            if at < 0 || at < cursor as i64 {
+            if at < valid_start || at < 0 || at < cursor as i64 {
                 continue;
             }
             if at >= total as i64 {

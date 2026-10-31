@@ -626,6 +626,10 @@ pub fn convert_with_options(
         streams_out: 0,
     };
 
+    if !run.lanes.iter().any(|lane| matches!(lane, Lane::Video(_))) {
+        run.open_output_tracks()?;
+    }
+
     while let Some(packet) = demuxer.read_packet()? {
         if cancel.load(Ordering::Relaxed) {
             return Err(ConvertError::Cancelled);
@@ -686,26 +690,20 @@ fn build_video_lane(
         extradata: None,
         out_index: 0,
         sampler: match target_rate {
-            Some(_) => Some(
-                crate::compose::CfrSampler::new(
-                    0,
-                    0,
-                    stream
-                        .duration
-                        .ok_or_else(|| {
-                            ConvertError::InvalidArguments("改帧率要求已知源时长".into())
-                        })?
-                        .checked_add(
-                            stream
-                                .start_time
-                                .unwrap_or(Timestamp::new(0, stream.time_base)),
-                        )?
-                        .rescale(MICRO)?
-                        .ticks(),
-                    frame_rate,
-                )?
-                .black_leading(),
-            ),
+            Some(_) => Some(crate::compose::CfrSampler::for_duration(
+                stream
+                    .duration
+                    .ok_or_else(|| ConvertError::InvalidArguments("改帧率要求已知源时长".into()))?
+                    .checked_add(
+                        stream
+                            .start_time
+                            .unwrap_or(Timestamp::new(0, stream.time_base)),
+                    )?,
+                frame_rate,
+                stream
+                    .start_time
+                    .unwrap_or(Timestamp::new(0, stream.time_base)),
+            )?),
             None => None,
         },
         presentation_duration: target_rate
@@ -954,6 +952,15 @@ fn build_audio_encode_lane(
         source_rate: audio.sample_rate,
         source_channels: source_layout.channels() as usize,
         source_frames: 0,
+        source_start: stream
+            .start_time
+            .unwrap_or(Timestamp::new(0, stream.time_base))
+            .rescale_with(
+                Rational::new(1, audio.sample_rate as i32),
+                ye_time::Rounding::Up,
+            )?
+            .ticks()
+            .max(0),
         source_end: stream
             .duration
             .map(|d| {
@@ -964,7 +971,12 @@ fn build_audio_encode_lane(
                 )
             })
             .transpose()?
-            .map(|d| d.rescale(Rational::new(1, audio.sample_rate as i32)))
+            .map(|d| {
+                d.rescale_with(
+                    Rational::new(1, audio.sample_rate as i32),
+                    ye_time::Rounding::Up,
+                )
+            })
             .transpose()?
             .map(|d| d.ticks()),
     })
@@ -1039,6 +1051,7 @@ struct EncodeAudioLane {
     source_rate: u32,
     source_channels: usize,
     source_frames: i64,
+    source_start: i64,
     source_end: Option<i64>,
 }
 
@@ -1231,12 +1244,13 @@ impl EncodeRun<'_> {
         }
         let has_resampler = matches!(self.lanes.get(index), Some(Lane::Audio(AudioLane::Encode(lane))) if lane.resampler.is_some());
         if has_resampler {
-            let (rate, channels, cursor, end) = match &self.lanes[index] {
+            let (rate, channels, cursor, end, valid_start) = match &self.lanes[index] {
                 Lane::Audio(AudioLane::Encode(lane)) => (
                     lane.source_rate,
                     lane.source_channels,
                     lane.source_frames,
                     lane.source_end,
+                    lane.source_start,
                 ),
                 _ => return Ok(()),
             };
@@ -1249,7 +1263,7 @@ impl EncodeRun<'_> {
                 return Err(ConvertError::InvalidData("音频采样声道布局损坏".into()));
             }
             // Fill genuine timestamp gaps in bounded blocks. Negative priming is decoded then discarded.
-            let gap_end = start.min(end.unwrap_or(i64::MAX));
+            let gap_end = start.max(valid_start).min(end.unwrap_or(i64::MAX));
             let mut at = cursor;
             while at < gap_end {
                 let n = (gap_end - at).min(1024) as usize;

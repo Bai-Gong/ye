@@ -379,32 +379,20 @@ fn 基线向量解码yuv逐帧与ffmpeg参考一致() {
     );
 }
 
-/// vec-video-multi.mp4（视频可解 + 6 声道不可解音轨）：ye 侧**整体 Err**
-/// （泵给每条流建解码器，AAC 多声道解码 Err 打回整个抽帧——§2.2 行为
-/// 锁定，`aac` feature 开启时锁的是「多声道拒收」本义路径；未开 aac 时
-/// 同一向量经 `NotRegistered` 同样整体打回，frame_grab 模块文档已述）；
-/// ffmpeg 参考侧可正常出帧——差异即「该类素材走 ffmpeg 回退」的依据，
-/// 不做像素对拍。
+/// 无关的六声道音轨不阻塞视频抽帧；视频仍使用相同像素门限验收。
 #[cfg(feature = "aac")]
 #[test]
-fn 不可解音轨向量ye侧整体打回() {
+fn 不可解音轨不阻塞视频抽帧() {
     let Some(path) = common::ensure_vector("vec-video-multi.mp4", VEC_MULTI_ARGS) else {
-        return; // 定位器落空：合法 skip。
+        return;
     };
-    let exe = common::ffmpeg_exe().expect("定位器已命中（向量已生成）");
+    let exe = common::ffmpeg_exe().unwrap();
     let t = point_us(45);
-    let err = decode_frame_rgba(open_vector(&path), t)
-        .expect_err("含不可解音轨的素材，ye 侧应整体 Err（不静默丢帧）");
-    assert!(
-        err.to_string().contains("channelConfiguration=6"),
-        "打回原因应述多声道能力面外：{err}"
-    );
-    eprintln!("frame_grab_oracle[vec-video-multi]：ye 侧整体 Err（{err}）");
-    // 参考侧对照：ffmpeg 同点位可正常出帧（行为差异即回退依据；仅断言
-    // 非空尺寸，不做像素对拍——§3.3）。
+    let got = decode_frame_rgba(open_vector(&path), t).unwrap();
     let reference = reference_frame(&exe, &path, t, "multi-f45");
-    assert_eq!(reference.len(), (W * H * 4) as usize, "参考侧可正常出帧");
-    let _ = std::fs::remove_file(&path); // 用后即删。
+    assert_eq!((got.width, got.height), (W, H));
+    assert_pixels_close(&got.rgba, &reference, "multi-f45");
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

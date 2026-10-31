@@ -1,74 +1,18 @@
-//! 抽帧门面：`convert_frames` 泵 + yuv420p→rgba8 链 → 单帧 RGBA / PNG
-//! （剪的缩略图管线出口，m2-jian-plan §2.2）。
-//!
-//! ## 两个入口
-//!
-//! - [`decode_frame_rgba`]：打开输入 → [`convert_frames`] 逐帧解码（链
-//!   yuv420p→rgba8、size 缺省保持原尺寸）→ 取**首个 pts ≥ time_us** 的
-//!   视频帧（紧致 rgba8 字节）；
-//! - [`grab_frame_png`]：[`decode_frame_rgba`] → [`crate::png::encode_rgba`]
-//!   一步出口（png.rs 定位的「最后一环」）。
-//!
-//! ## 取帧时序（取到即停，勿把自然 EOF 误译成功）
-//!
-//! 取到目标帧的 sink 回调内**立即置位内部 cancel 旗标**：泵在下一包
-//! 检查点返回 [`ConvertError::Cancelled`]，门面翻译为**成功**；目标帧
-//! 恰在末包时泵走自然收尾（排空段不检 cancel）返回 `Ok`，同为成功。
-//! 两条路径统一按「帧已在手」判定——cancel 生效前同包残余帧与排空段
-//! 帧被忽略，cancel 点之后泵的失败不追溯（目标帧已完整在手；对照
-//! `ffmpeg -ss T -frames:v 1` 取到即止的语义）。相对地，**未取到帧时
-//! 泵的 `Ok` 是自然 EOF → 明确 `Err`**（见下），绝不误译成功。
-//!
-//! ## 时点语义
-//!
-//! - `time_us` 负值钳 0（与 jian ffmpeg 轨 ffmpeg.rs:127 同语义）；
-//! - 判定域：帧 pts 重标度到 µs 后与 `time_us` 比较（`pts ≥ time_us`）；
-//! - **pts 缺失的帧**：跳过时点判定但计数——若整个素材无任何带 pts
-//!   的视频帧 → 明确 `Err`（不猜帧序）；
-//! - EOF 仍未取到 → 明确 `Err`（区分三形：无视频帧送达 / 全帧无 pts /
-//!   时点超出最晚 pts，文案各述其因）。
-//!
-//! ## 前置流布局校验（与 [`crate::waveform`] 同动机）
-//!
-//! [`convert_frames`] 给每条音/视频流都建解码器、[`Frame`] 不携带流
-//! 标识——多视频流素材若不前置校验，「首个 pts ≥ 时点」可能落在任意
-//! 一路的帧上，是静默错帧。故喂泵前经 [`ContainerRegistry::probe`] 读
-//! [`MediaHeader`]，要求**恰一条视频流**（0 条 → Err，≥2 条 → 明确
-//! Err）。probe 按值消费输入，底层输入经 [`SharedInput`]（`Arc<Mutex>`
-//! 共享）同时供 probe 与泵持有；probe 后游标显式回卷 0 再喂泵（与
-//! waveform 同法）。
-//!
-//! ## 音轨行为（写明；行为锁定归 T3 向量）
-//!
-//! 泵给**每条**音频流也建解码器（convert.rs 主循环逐流 `create_decoder`）：
-//! 本门面的解码注册表只装 H.264（`aac` feature 开启时顺带 AAC，解码后
-//! 帧在 sink 丢弃）——**含不可解音轨的 mp4（AAC 能力面外如多声道，或
-//! `aac` 未开启时的任何 AAC 音轨）会因音频解码器 Err 使整个抽帧调用
-//! 打回**，即使视频轨本身完全可解。行为可兜（回退归 jian 命令层），
-//! 由 T3 的「视频+不可解音轨」向量（vec-video-multi）锁定；泵级选流
-//! 绕行归 M4（m2-jian-plan §6）。
-//!
-//! ## 能力面外
-//!
-//! High/CABAC 等解码能力面外的素材：解码 Err 原样透传（全程 `?` 无
-//! 兜底分支），回退归 jian 命令层。
-//!
-//! ## 全库约定
-//!
-//! 零第三方依赖（仅 std + workspace crate）、不含 unsafe；数据驱动失败
-//! 一律 `Result`，无 panic 路径；错误复用 [`ConvertError`]（手写
-//! `Display`/`Error` 见 convert 模块），doc 注释中文并写明 derive 清单。
+//! Unified frame grab: display-time keyframe seek, video-only decode, RGBA/PNG.
+//! Select the first frame whose exact PTS reaches time_us; negative targets clamp
+//! to zero, targets beyond EOF fail. Unrelated audio is not required to decode.
+//! The same selected-stream cursor is used by timeline rendering.
 
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use ye_codec::{CodecId, CodecRegistry, Frame, MediaType, VideoFrame};
-use ye_container::{ContainerError, ContainerRegistry, MediaHeader, ReadSeek};
+#[cfg(test)]
+use ye_container::MediaHeader;
+use ye_container::{ContainerRegistry, ReadSeek};
 use ye_pixfmt::PixelFormat;
 use ye_time::Rational;
 
-use crate::convert::{ConvertError, VideoChain, convert_frames, filter_ops};
+use crate::convert::{ConvertError, filter_convert};
 
 /// 微秒时基（`time_us` 参数与帧 pts 比较的公共域）。
 const MICRO: Rational = Rational::new(1, 1_000_000);
@@ -87,59 +31,17 @@ pub struct GrabbedFrame {
     pub rgba: Vec<u8>,
 }
 
-/// 共享输入句柄：同一底层输入（`Arc<Mutex>`）供 probe 与解码泵各持
-/// 一份克隆——probe 按值消费 `Box<dyn ReadSeek>`，不经共享则喂泵前
-/// 无法回卷（模块文档「前置流布局校验」）。与 [`crate::waveform`]
-/// 的同构私有件（顺序使用，锁无竞争）。
-struct SharedInput {
-    /// 底层输入。
-    inner: Arc<Mutex<Box<dyn ReadSeek>>>,
-}
-
-impl SharedInput {
-    /// 包一份底层输入的克隆视图（喂给 probe / 泵的 `Box<dyn ReadSeek>`）。
-    fn share(inner: &Arc<Mutex<Box<dyn ReadSeek>>>) -> Box<dyn ReadSeek> {
-        Box::new(SharedInput {
-            inner: inner.clone(),
-        })
-    }
-}
-
-impl Read for SharedInput {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        lock_input(&self.inner).read(buf)
-    }
-}
-
-impl Seek for SharedInput {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        lock_input(&self.inner).seek(pos)
-    }
-}
-
-/// 锁底层输入（中毒容忍：read/seek 无 panic 路径，锁中毒仅因其它线程
-/// panic 中断 IO——输入是纯数据游标，无不变式可破坏，取内部句柄续用）。
-fn lock_input(shared: &Arc<Mutex<Box<dyn ReadSeek>>>) -> MutexGuard<'_, Box<dyn ReadSeek>> {
-    shared
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// 抽帧解码注册表：容器 MP4 + 解码 H.264（`aac` 开启时顺带 AAC——可解
-/// 音轨解码后帧在 sink 丢弃；未开/不可解音轨整体打回，见模块文档
-/// 「音轨行为」）。
+/// 抽帧只注册视频解码器，不要求无关音轨具备解码能力。
 fn decode_registries() -> (ContainerRegistry, CodecRegistry) {
     let mut containers = ContainerRegistry::new();
     crate::container::mp4::register_mp4(&mut containers);
     let mut codecs = CodecRegistry::new();
     codecs.register_decoder(CodecId::H264, crate::codec_h264::decoder_factory);
-    #[cfg(feature = "aac")]
-    codecs.register_decoder(CodecId::Aac, crate::codec_aac::decoder_factory);
     (containers, codecs)
 }
 
-/// 前置流布局校验：**恰一条视频流**（模块文档「前置流布局校验」；
-/// 音频流不在此拒——音轨能否解码由泵的解码器创建裁决，见「音轨行为」）。
+/// 校验单视频流布局；音轨不参与抽帧。
+#[cfg(test)]
 fn validate_single_video_stream(header: &MediaHeader) -> Result<(), ConvertError> {
     let video = header
         .streams
@@ -156,24 +58,6 @@ fn validate_single_video_stream(header: &MediaHeader) -> Result<(), ConvertError
             "抽帧要求恰一条视频流，检测到 {n} 条（Frame 不带流标识，多路会静默错帧——拒绝）"
         ))),
     }
-}
-
-/// 公共前奏：probe 校验流布局 → 共享游标回卷 0（喂泵前）。
-///
-/// 返回共享句柄（供 [`convert_frames`] 经 [`SharedInput::share`] 持有）。
-fn probe_and_rewind(
-    containers: &ContainerRegistry,
-    input: Box<dyn ReadSeek>,
-) -> Result<Arc<Mutex<Box<dyn ReadSeek>>>, ConvertError> {
-    let shared = Arc::new(Mutex::new(input));
-    let (_format, header) = containers.probe(SharedInput::share(&shared))?;
-    validate_single_video_stream(&header)?;
-    // probe 读头后游标停在头解析处：显式回卷 0 再喂泵（泵内 probe 窗口
-    // 从当前位置读起，不回卷会拿 mdat 中段当探查窗口）。
-    lock_input(&shared)
-        .seek(SeekFrom::Start(0))
-        .map_err(|err| ConvertError::Container(ContainerError::Io(err)))?;
-    Ok(shared)
 }
 
 /// 抽帧泵内游标：时点判定 + 已取帧 + pts 计数（EOF 判 Err 的依据）。
@@ -194,17 +78,15 @@ impl GrabState {
     /// 喂一帧（泵的 sink 回调体）。
     ///
     /// 音频帧丢弃；视频帧做时点判定——首个 pts ≥ `time_us` 即取帧并
-    /// 置 cancel（模块文档「取帧时序」）。
+    /// 置 cancel，调用方随即返回。
     fn feed(&mut self, frame: Frame, cancel: &AtomicBool) -> Result<(), ConvertError> {
         let Frame::Video(video) = frame else {
-            // 音频帧解码后直通 sink：抽帧不消费，丢弃（音轨本身能否解码
-            // 泵已先行裁决，见模块文档「音轨行为」）。
+            // 防御性忽略非视频帧。
             return Ok(());
         };
         self.frames_seen += 1;
         if self.grabbed.is_some() {
-            // 已取帧：cancel 生效前的同包残余/排空段帧，忽略（模块文档
-            // 「取帧时序」）。
+            // 已取得的帧不被后续调用覆盖。
             return Ok(());
         }
         if video.format() != PixelFormat::Rgba8 {
@@ -220,10 +102,9 @@ impl GrabState {
         let pts_us = pts.rescale(MICRO)?.ticks();
         self.saw_pts = true;
         self.latest_pts_us = Some(self.latest_pts_us.map_or(pts_us, |old| old.max(pts_us)));
-        if pts_us >= self.time_us {
+        if ye_time::Timestamp::compare(pts, ye_time::Timestamp::new(self.time_us, MICRO)).is_ge() {
             self.grabbed = Some(tight_rgba(&video));
-            // 取帧即置 cancel：泵在下一包检查点返回 Cancelled（门面翻译
-            // 为成功）；末包命中时泵自然收尾，同为成功。
+            // 通知调用方停止读取后续包。
             cancel.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -271,8 +152,7 @@ fn eof_error(state: &GrabState) -> ConvertError {
 /// 抽帧门面·RGBA 出口：解码取**首个 pts ≥ `time_us`** 的视频帧
 /// （链 yuv420p→rgba8，宽高保持原尺寸）。
 ///
-/// 行为契约见模块文档（取帧时序 / 时点语义 / 前置流布局校验 / 音轨
-/// 行为 / 能力面外）。
+/// 从显示时点前的关键帧解码，保留重排后的精确 PTS；忽略无关音轨。
 ///
 /// # Errors
 ///
@@ -280,16 +160,21 @@ fn eof_error(state: &GrabState) -> ConvertError {
 ///   [`ConvertError::InvalidArguments`]；
 /// - EOF 未取到（无视频帧 / 全帧无 pts / 时点超出最晚 pts）→
 ///   [`ConvertError::InvalidData`]；
-/// - 解封装/解码失败（High/CABAC 能力面外、不可解音轨打回等）原样
-///   透传，不兜底。
+/// - 所选视频流的解封装或解码失败原样透传。
 pub fn decode_frame_rgba(
     input: Box<dyn ReadSeek>,
     time_us: i64,
 ) -> Result<GrabbedFrame, ConvertError> {
-    // 负值钳 0（模块文档「时点语义」）。
     let time_us = time_us.max(0);
     let (containers, codecs) = decode_registries();
-    let shared = probe_and_rewind(&containers, input)?;
+    let mut source = crate::timeline::Source::open(
+        &containers,
+        &codecs,
+        input,
+        MediaType::Video,
+        time_us,
+        None,
+    )?;
     let cancel = AtomicBool::new(false);
     let mut state = GrabState {
         time_us,
@@ -298,31 +183,21 @@ pub fn decode_frame_rgba(
         saw_pts: false,
         latest_pts_us: None,
     };
-    let mut sink = |frame: Frame| state.feed(frame, &cancel);
-    let result = convert_frames(
-        &containers,
-        &codecs,
-        SharedInput::share(&shared),
-        VideoChain {
-            format: Some(PixelFormat::Rgba8),
-            size: None,
-        },
-        filter_ops(),
-        &mut sink,
-        &|_processed, _total| {},
-        &cancel,
-    );
-    // 帧已在手即成功（泵 Cancelled 的翻译 + 末包自然收尾 + cancel 点
-    // 之后不追溯，见模块文档「取帧时序」）；未取到时泵结果原样定夺：
-    // Ok 是自然 EOF → 明确 Err；Err 透传（Cancelled 不可能在此出现
-    // ——旗标本轮私有且仅取帧后置位）。
-    if let Some(frame) = state.grabbed {
-        return Ok(frame);
+    while let Some(frame) = source.next(&cancel)? {
+        let Frame::Video(video) = frame else {
+            return Err(ConvertError::InvalidData(
+                "video decoder returned audio".into(),
+            ));
+        };
+        state.feed(
+            Frame::Video(filter_convert(&video, PixelFormat::Rgba8)?),
+            &cancel,
+        )?;
+        if let Some(frame) = state.grabbed.take() {
+            return Ok(frame);
+        }
     }
-    match result {
-        Ok(_) => Err(eof_error(&state)),
-        Err(err) => Err(err),
-    }
+    Err(eof_error(&state))
 }
 
 /// 抽帧门面·PNG 出口：[`decode_frame_rgba`] → [`crate::png::encode_rgba`]
