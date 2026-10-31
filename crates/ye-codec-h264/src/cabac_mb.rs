@@ -49,18 +49,6 @@ const CTX_CBP_CHROMA: usize = 77;
 const CTX_T8X8: usize = 399;
 
 /// coded_block_flag 基址（FFmpeg get_cabac_cbf_ctx 的 base_ctx[14]）。
-// —— 变异扫描（临时诊断，不入库）：YE_CABAC_MUTATE=<n> 选中一个语义位点
-// 翻转，其余位点保持原语义。0/缺省 = 无变异（对照）。
-pub(crate) fn mutation(n: u8) -> bool {
-    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("YE_CABAC_MUTATE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    }) == n
-}
-
 const CBF_BASE: [usize; 14] = [
     85, 89, 93, 97, 101, 1012, 460, 464, 468, 1016, 472, 476, 480, 1020,
 ];
@@ -150,7 +138,7 @@ pub(crate) fn decode_residual(
             }
         }
     }
-    if !last_flag_hit && !mutation(1) {
+    if !last_flag_hit {
         index[coeff_count] = max_coeff - 1;
         coeff_count += 1;
     }
@@ -225,22 +213,16 @@ fn store_levels(
             // （GT1[old] ≠ GT1[TRANS[1][old]]），引擎整体脱轨。
             // （缺陷修复登记 2026-10-26：真流对拍首轮定位——首个
             // 4x4 块第二个系数起 ctxIdx 即偏 +1。）
-            let gt1_base = if mutation(2) {
-                node_ctx = ABS_TRANSITION[1][node_ctx];
-                abs_base + ABS_LEVELGT1_CTX[node_ctx]
-            } else {
-                let b = abs_base + ABS_LEVELGT1_CTX[node_ctx];
-                node_ctx = ABS_TRANSITION[1][node_ctx];
-                b
-            };
+            let gt1_base = abs_base + ABS_LEVELGT1_CTX[node_ctx];
+            node_ctx = ABS_TRANSITION[1][node_ctx];
             let mut abs: i32 = 2;
-            let unary_cap = if mutation(8) { 14 } else { 15 };
+            let unary_cap = 15;
             while abs < unary_cap && r.bin(gt1_base) == 1 {
                 abs += 1;
             }
             if abs >= 15 {
                 let mut k = 0i32;
-                let k_limit = if mutation(7) { 16 } else { 16 + 7 };
+                let k_limit = 16 + 7;
                 while r.cabac.bypass() == 1 && k < k_limit {
                     k += 1;
                 }
@@ -267,57 +249,6 @@ fn store_levels(
     Ok(())
 }
 
-// 临时诊断（提交前剥离）：YE_MB_COEFFS="mbx,mby" 时转储该 MB 的
-// 反量化系数（4x4 块按栅格索引；系数项 = 栅格位置:值）。
-fn dump_mb_coeffs(
-    mbx: usize,
-    mby: usize,
-    qp: u8,
-    mb: &crate::macroblock::Macroblock,
-    luma_blocks: &[[i16; 16]; 16],
-    luma8_blocks: &[[i16; 64]; 4],
-    chroma_blocks: &[[[i16; 16]; 4]; 2],
-) {
-    use std::sync::OnceLock;
-    static TARGET: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-    let target = TARGET.get_or_init(|| {
-        std::env::var("YE_MB_COEFFS").ok().and_then(|s| {
-            let (a, b) = s.split_once(',')?;
-            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-        })
-    });
-    if *target != Some((mbx, mby)) {
-        return;
-    }
-    eprintln!(
-        "COEFF mb=({mbx},{mby}) qp={qp} kind={:?} t8={} cbp={:#04x} i16={} i4={:?} cmode={} nnz={:?} cdc={:?}",
-        mb.kind, mb.transform_8x8, mb.cbp, mb.i16_mode, mb.i4_modes, mb.chroma_mode, mb.nnz,
-        mb.nnz_chroma_dc
-    );
-    let sparse = |blk: &[i16]| -> String {
-        blk.iter()
-            .enumerate()
-            .filter(|(_, v)| **v != 0)
-            .map(|(j, v)| format!("{j}:{v}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    if mb.transform_8x8 {
-        for (q, blk) in luma8_blocks.iter().enumerate() {
-            eprintln!("  Q{q}[{}]", sparse(blk));
-        }
-    } else {
-        for (b, blk) in luma_blocks.iter().enumerate() {
-            eprintln!("  B{b:02}[{}]", sparse(blk));
-        }
-    }
-    for (p, cblocks) in chroma_blocks.iter().enumerate() {
-        for (i, blk) in cblocks.iter().enumerate() {
-            eprintln!("  C{p}{i}[{}]", sparse(blk));
-        }
-    }
-}
-
 /// 反量化融合（FFmpeg：DC 原值；AC `(sign·abs·qmul[j] + 32) >> 6`）。
 fn dequant_level(v: i32, qmul: Option<&[u32]>, j: usize) -> i32 {
     match qmul {
@@ -335,9 +266,8 @@ fn decode_skip(r: &mut CabacReader<'_>, pic: &Picture, mbx: usize, mby: usize, i
     let mb_xy = mby * pic.mb_width + mbx;
     let mut ctx = 0usize;
     // FFmpeg decode_cabac_mb_skip / spec 9.3.3.1.1：左、上各 ctx++。
-    // 左邻是 flat 索引 mb_xy-1（h264_cabac.c:1350——行首的"左邻"即
-    // 上一行行末宏块，同片且已解码即计入）；上邻 mb_xy-mb_width。
-    if mb_xy > 0 {
+    // 本实现无 FFmpeg 的填充边列，行首必须显式排除左邻。
+    if mbx > 0 {
         let l = &pic.mbs[mb_xy - 1];
         if l.decoded && !l.skipped {
             ctx += 1;
@@ -607,7 +537,7 @@ fn decode_dqp(
         return Ok(());
     }
     let mut val = 1i32;
-    let mut ctx = if mutation(4) { 1usize } else { 2usize };
+    let mut ctx = 2usize;
     while r.bin(CTX_DQP + ctx) == 1 {
         ctx = 3;
         val += 1;
@@ -746,7 +676,11 @@ impl RefMvdEdge {
             if !mb.decoded {
                 return (-2, [0; 2], false);
             }
-            let direct = mb.direct || mb.sub_shape.get(b / 4) == Some(&255);
+            let q = (b / 8) * 2 + (b % 4) / 2;
+            let direct = mb.direct
+                || (mb.kind == MbKind::InterB
+                    && mb.shape == InterShape::P8x8
+                    && mb.sub_shape[q] == 0);
             match mb.kind {
                 MbKind::InterP if list == 0 => (mb.ref_idx[b], mb.mvd[b], direct),
                 MbKind::InterB => {
@@ -815,7 +749,10 @@ impl RefMvdEdge {
                 // FFmpeg mvd_cache 存**幅度** mvda（decode_cabac_mb_mvd 的
                 // *mvda = mvd<70 ? mvd : 70，符号无关）——amvd 上下文用幅度
                 // 求和；此前误存带符号差，负向 mvd 邻块的首 bin 槽位偏档。
-                self.cur_mvd[b] = [mvd[0].unsigned_abs().min(70) as i16, mvd[1].unsigned_abs().min(70) as i16];
+                self.cur_mvd[b] = [
+                    mvd[0].unsigned_abs().min(70) as i16,
+                    mvd[1].unsigned_abs().min(70) as i16,
+                ];
                 self.cur_direct[b] = direct;
             }
         }
@@ -844,7 +781,7 @@ impl RefMvdEdge {
 fn read_partition_mvd(
     r: &mut CabacReader<'_>,
     edge: &mut RefMvdEdge,
-    grid: &MvGrid,
+    grid: &mut MvGrid,
     bx: i32,
     by: i32,
     w: i32,
@@ -859,6 +796,7 @@ fn read_partition_mvd(
         (i32::from(mvp[1]) + i32::from(dy)) as i16,
     ];
     edge.set_rect(bx, by, w, h, ref_idx, [dx, dy], false);
+    grid.set_rect(bx, by, w, h, mv, ref_idx);
     Ok(mv)
 }
 
@@ -909,51 +847,6 @@ pub(crate) fn decode_mb_cabac(
     ictx: Option<&InterCtx<'_>>,
     is_b_slice: bool,
 ) -> Result<(), H264Error> {
-    let mb_xy = mby * pic.mb_width + mbx;
-    let is_inter_slice = ictx.is_some();
-    let dump = std::env::var_os("YE_MB_DUMP").is_some();
-    let result = decode_mb_cabac_inner(
-        r,
-        pic,
-        mbx,
-        mby,
-        pps,
-        slice_id,
-        qp,
-        last_qscale_diff,
-        ictx,
-        is_b_slice,
-    );
-    if dump {
-        let mb = &pic.mbs[mb_xy];
-        eprintln!(
-            "MB({mbx},{mby}) kind={:?} cbp={:#x} qp={qp} chroma={} i4={:?} nnzsum={} cdc={:?} ldc={}",
-            mb.kind,
-            mb.cbp,
-            mb.chroma_mode,
-            mb.i4_modes,
-            mb.nnz.iter().map::<u32, _>(|v| u32::from(*v)).sum::<u32>(),
-            mb.nnz_chroma_dc,
-            mb.luma_dc_coded
-        );
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_mb_cabac_inner(
-    r: &mut CabacReader<'_>,
-    pic: &mut Picture,
-    mbx: usize,
-    mby: usize,
-    pps: &Pps,
-    slice_id: u16,
-    qp: &mut u8,
-    last_qscale_diff: &mut i32,
-    ictx: Option<&InterCtx<'_>>,
-    is_b_slice: bool,
-) -> Result<(), H264Error> {
-    crate::cabac::binlog::marker(&format!("{mbx},{mby}"));
     let mb_xy = mby * pic.mb_width + mbx;
     let is_inter_slice = ictx.is_some();
 
@@ -1193,15 +1086,6 @@ fn decode_mb_cabac_inner(
             left_mb,
             top_mb,
         )?;
-        dump_mb_coeffs(
-            mbx,
-            mby,
-            *qp,
-            &mb,
-            &luma_blocks,
-            &luma8_blocks,
-            &chroma_blocks,
-        );
         reconstruct_intra(
             pic,
             mbx,
@@ -1222,9 +1106,9 @@ fn decode_mb_cabac_inner(
     let ctx = ictx.expect("inter slice");
     let (is_b, t) = inter_t.expect("inter path");
     let mut parts: Vec<MvPart> = Vec::new();
-    let grid0 = build_mv_grid_list(pic, mbx, mby, 0);
+    let mut grid0 = build_mv_grid_list(pic, mbx, mby, 0);
     let mut edge0 = RefMvdEdge::new(pic, mbx, mby, 0);
-    let (grid1, mut edge1) = if is_b {
+    let (mut grid1, mut edge1) = if is_b {
         (
             Some(build_mv_grid_list(pic, mbx, mby, 1)),
             Some(RefMvdEdge::new(pic, mbx, mby, 1)),
@@ -1255,13 +1139,13 @@ fn decode_mb_cabac_inner(
                 let (bx, by, _w, _h) = p_part_pos(t, i);
                 let (w, h) = (_w, _h);
                 let mv = if t == 0 {
-                    read_partition_mvd(r, &mut edge0, &grid0, bx, by, w, h, ri)?
+                    read_partition_mvd(r, &mut edge0, &mut grid0, bx, by, w, h, ri)?
                 } else if t == 1 {
                     let mvp = pred_16x8(&grid0, by, ri);
-                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, ri, mvp)?
+                    read_partition_mvd_pred(r, &mut edge0, &mut grid0, bx, by, w, h, ri, mvp)?
                 } else {
                     let mvp = pred_8x16(&grid0, bx, ri);
-                    read_partition_mvd_pred(r, &mut edge0, &grid0, bx, by, w, h, ri, mvp)?
+                    read_partition_mvd_pred(r, &mut edge0, &mut grid0, bx, by, w, h, ri, mvp)?
                 };
                 parts.push(MvPart {
                     bx,
@@ -1288,7 +1172,8 @@ fn decode_mb_cabac_inner(
             for i8x8 in 0..4usize {
                 let (x0, y0) = (((i8x8 & 1) * 2) as i32, ((i8x8 >> 1) * 2) as i32);
                 for (bx, by, w, h) in p_sub_geometry(subs[i8x8], x0, y0) {
-                    let mv = read_partition_mvd(r, &mut edge0, &grid0, bx, by, w, h, refs[i8x8])?;
+                    let mv =
+                        read_partition_mvd(r, &mut edge0, &mut grid0, bx, by, w, h, refs[i8x8])?;
                     parts.push(MvPart {
                         bx,
                         by,
@@ -1323,6 +1208,16 @@ fn decode_mb_cabac_inner(
                 *s = decode_b_sub_type(r) as u8;
                 any_direct |= *s == 0;
             }
+            mb.sub_shape = subs;
+            for (q, &sub) in subs.iter().enumerate() {
+                let (x, y) = (((q & 1) * 2) as i32, ((q >> 1) * 2) as i32);
+                if matches!(sub, 2 | 5 | 8 | 11) {
+                    grid0.set_rect(x, y, 2, 2, [0; 2], -1);
+                }
+                if matches!(sub, 1 | 4 | 7 | 10) {
+                    grid1.as_mut().expect("b").set_rect(x, y, 2, 2, [0; 2], -1);
+                }
+            }
             // 直接象限（FFmpeg：pred_direct 在 ref/mvd 解析前填充）
             if any_direct {
                 let mut direct_parts = Vec::new();
@@ -1331,7 +1226,23 @@ fn decode_mb_cabac_inner(
                 } else {
                     crate::inter::pred_temp_direct(ctx, pic, mbx, mby, true, &mut direct_parts)?;
                 }
-                parts.extend(direct_parts);
+                for p in direct_parts {
+                    let q = (p.by as usize / 2) * 2 + p.bx as usize / 2;
+                    if subs[q] != 0 {
+                        continue;
+                    }
+                    for list in 0..2 {
+                        let (edge, grid, value) = if list == 0 {
+                            (&mut edge0, &mut grid0, p.l0)
+                        } else {
+                            (edge1.as_mut().expect("b"), grid1.as_mut().expect("b"), p.l1)
+                        };
+                        let (ri, mv) = value.unwrap_or((-1, [0; 2]));
+                        edge.set_rect(p.bx, p.by, p.w, p.h, ri, [0; 2], true);
+                        grid.set_rect(p.bx, p.by, p.w, p.h, mv, ri);
+                    }
+                    parts.push(p);
+                }
             }
             // refs（FFmpeg list 外层 → 象限内层；象限内按 8x8 粒度先读）
             let mut refs = [[0i8; 2]; 4]; // [quad][list]
@@ -1355,7 +1266,12 @@ fn decode_mb_cabac_inner(
                         2 | 5 | 8 | 11 => list == 1,
                         _ => true,
                     };
-                    if !uses || n <= 1 {
+                    if !uses {
+                        let (x, y) = (((i8x8 & 1) * 2) as i32, ((i8x8 >> 1) * 2) as i32);
+                        edge.set_rect(x, y, 2, 2, -1, [0; 2], false);
+                        continue;
+                    }
+                    if n <= 1 {
                         continue;
                     }
                     let (x0, y0) = (((i8x8 & 1) * 2) as i32, ((i8x8 >> 1) * 2) as i32);
@@ -1387,9 +1303,9 @@ fn decode_mb_cabac_inner(
                     edge1.as_mut().expect("b slice")
                 };
                 let grid = if list == 0 {
-                    &grid0
+                    &mut grid0
                 } else {
-                    grid1.as_ref().expect("b slice")
+                    grid1.as_mut().expect("b slice")
                 };
                 for i8x8 in 0..4usize {
                     let s = subs[i8x8];
@@ -1434,6 +1350,15 @@ fn decode_mb_cabac_inner(
                     ((i * 2) as i32, 0, 2, 4)
                 }
             };
+            for (i, uses) in lists.iter().enumerate().take(n_parts) {
+                let (x, y, w, h) = part_pos(i);
+                if !uses[0] {
+                    grid0.set_rect(x, y, w, h, [0; 2], -1);
+                }
+                if !uses[1] {
+                    grid1.as_mut().expect("b").set_rect(x, y, w, h, [0; 2], -1);
+                }
+            }
             // refs：list 外层 → 分区内层
             let mut refs = [[0i8; 2]; 2];
             for list in 0..2usize {
@@ -1468,9 +1393,9 @@ fn decode_mb_cabac_inner(
                     edge1.as_mut().expect("b slice")
                 };
                 let grid = if list == 0 {
-                    &grid0
+                    &mut grid0
                 } else {
-                    grid1.as_ref().expect("b slice")
+                    grid1.as_mut().expect("b slice")
                 };
                 for i in 0..n_parts {
                     if !lists[i][list] {
@@ -1492,23 +1417,23 @@ fn decode_mb_cabac_inner(
         }
     }
 
-/// FFmpeg `get_dct8x8_allowed`（ff_h264dec.h:810-820）：8x8 变换 flag 的
-/// 读取门——sub_mb_type 内部位（ff_h264_p/b_sub_mb_type_info）任含
-/// 16x8/8x16/8x8（inference=0 时另含 DIRECT2）即不允许。
-/// 按 spec 子类型码：P 片仅 0（8x8 sub，内部 16x16 型）允许；
-/// B 片 0（direct，inference=1 时）/1/2/3（8x8 族，16x16 型）允许。
-fn sub_types_allow_8x8(sub_shape: &[u8; 4], direct_8x8_inference: bool, is_b: bool) -> bool {
-    if !is_b {
-        // P 片：仅 8x8 sub（码 0，内部 16x16 型）允许
-        sub_shape.iter().all(|&s| s == 0)
-    } else if direct_8x8_inference {
-        sub_shape.iter().all(|&s| s <= 3)
-    } else {
-        sub_shape.iter().all(|&s| (1..=3).contains(&s))
+    /// FFmpeg `get_dct8x8_allowed`（ff_h264dec.h:810-820）：8x8 变换 flag 的
+    /// 读取门——sub_mb_type 内部位（ff_h264_p/b_sub_mb_type_info）任含
+    /// 16x8/8x16/8x8（inference=0 时另含 DIRECT2）即不允许。
+    /// 按 spec 子类型码：P 片仅 0（8x8 sub，内部 16x16 型）允许；
+    /// B 片 0（direct，inference=1 时）/1/2/3（8x8 族，16x16 型）允许。
+    fn sub_types_allow_8x8(sub_shape: &[u8; 4], direct_8x8_inference: bool, is_b: bool) -> bool {
+        if !is_b {
+            // P 片：仅 8x8 sub（码 0，内部 16x16 型）允许
+            sub_shape.iter().all(|&s| s == 0)
+        } else if direct_8x8_inference {
+            sub_shape.iter().all(|&s| s <= 3)
+        } else {
+            sub_shape.iter().all(|&s| (1..=3).contains(&s))
+        }
     }
-}
 
-// ---- cbp / dqp（inter；FFmpeg：非 intra16 都读 cbp）----
+    // ---- cbp / dqp（inter；FFmpeg：非 intra16 都读 cbp）----
     let left_mb = if mbx > 0 && pic.mbs[mb_xy - 1].decoded {
         Some(&pic.mbs[mb_xy - 1])
     } else {
@@ -1567,15 +1492,6 @@ fn sub_types_allow_8x8(sub_shape: &[u8; 4], direct_8x8_inference: bool, is_b: bo
         left_mb,
         top_mb,
     )?;
-    dump_mb_coeffs(
-        mbx,
-        mby,
-        *qp,
-        &mb,
-        &luma_blocks,
-        &luma8_blocks,
-        &chroma_blocks,
-    );
 
     // ---- MC + 残差叠加 + 落库 ----
     apply_parts(ctx, pic, mbx, mby, &parts)?;
@@ -1644,7 +1560,7 @@ fn p_sub_geometry(s: u8, x0: i32, y0: i32) -> Vec<(i32, i32, i32, i32)> {
 fn read_partition_mvd_pred(
     r: &mut CabacReader<'_>,
     edge: &mut RefMvdEdge,
-    _grid: &MvGrid,
+    grid: &mut MvGrid,
     bx: i32,
     by: i32,
     w: i32,
@@ -1659,6 +1575,7 @@ fn read_partition_mvd_pred(
         (i32::from(mvp[1]) + i32::from(dy)) as i16,
     ];
     edge.set_rect(bx, by, w, h, ref_idx, [dx, dy], false);
+    grid.set_rect(bx, by, w, h, mv, ref_idx);
     Ok(mv)
 }
 
@@ -1778,7 +1695,7 @@ fn decode_residual_mb(
     let cur_intra = matches!(mb.kind, MbKind::Intra4x4 | MbKind::Intra16x16 | MbKind::Pcm);
     let lw = left_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
     let tw = top_mb.map(cbp_word).unwrap_or(cbp_unavailable(cur_intra));
-    let nnz_unavail: u8 = if cur_intra && !mutation(5) { 64 } else { 0 };
+    let nnz_unavail: u8 = if cur_intra { 64 } else { 0 };
     // 邻块 nnz 查询（luma 4x4 块 b 的左/上）
     let luma_nnz = |nnz: &[u8; 24], b: usize| -> (u8, u8) {
         let (cx, cy) = (b % 4, b / 4);
@@ -1937,9 +1854,9 @@ fn decode_residual_mb(
                 &mut buf,
             )?;
             mb.nnz_chroma_dc[plane] = n as u8;
-            let x = [buf[0], buf[1], buf[4], buf[5]];
+            let x = [buf[0], buf[1], buf[2], buf[3]];
             let qpc = if plane == 0 { qpc_cb } else { qpc_cr };
-            let dcs = chroma_dc_dequant(&x, pps.dequant4_coeff(qpc, 1 + plane)[0])?;
+            let dcs = chroma_dc_dequant(&x, pps.dequant4_coeff(qpc, list + 1 + plane)[0])?;
             for (cblk, &dc) in cblocks.iter_mut().zip(dcs.iter()) {
                 cblk[0] = dc;
             }
@@ -1949,7 +1866,7 @@ fn decode_residual_mb(
     if mb.cbp & 0x20 != 0 {
         for (plane, cblocks) in chroma_blocks.iter_mut().enumerate() {
             let qpc = if plane == 0 { qpc_cb } else { qpc_cr };
-            let qmul = pps.dequant4_coeff(qpc, 1 + plane);
+            let qmul = pps.dequant4_coeff(qpc, list + 1 + plane);
             for (i, cblk) in cblocks.iter_mut().enumerate() {
                 let base = 16 + plane * 4;
                 let nnz_snap = mb.nnz;

@@ -12,7 +12,7 @@
 //! - 左上：(0,0) 需左上宏块、(1,0) 需顶宏块、(0,1) 需左宏块、
 //!   (1,1) 恒可用；
 //! - 右上（DDL/VL 的 t8..t15）：(0,0) 需顶宏块、(1,0) 需右上宏块、
-//!   qy==1 恒不可得（右宏块未解码）——不可得时按 FFmpeg
+//!   左下象限可用（右上象限已重建）、右下象限不可得——不可得时按 FFmpeg
 //!   `has_topright=0` 复制 t7；
 //! - 模式改写沿用 4x4 族的规则（FFmpeg check_intra8x8_pred_mode
 //!   同族语义）：缺顶 → 仅 H/HU 存留、DC→LEFT；缺左 → V/DDL/VL
@@ -55,6 +55,7 @@ pub(crate) fn quad_avail(avail: &NeighAvail, qx: usize, qy: usize) -> QuadAvail 
         topright: match (qx, qy) {
             (0, 0) => avail.top,
             (1, 0) => avail.er,
+            (0, 1) => true,
             _ => false,
         },
     }
@@ -98,56 +99,6 @@ pub(crate) fn rewrite_8x8_mode(mode: u8, q: &QuadAvail) -> Result<u8, H264Error>
         ));
     }
     Ok(m)
-}
-
-/// 象限 q 的邻块 8x8 模式（side：0=左、1=上；FFmpeg
-/// pred_intra_mode 于象限左上 4x4 的缓存位——8x8 邻块象限模式已按
-/// 象限复制到 i4_modes，4x4 邻块按对应块位读取，非 I4x4 → DC）。
-pub(crate) fn neighbor_i8_mode_quads(
-    pic: &Picture,
-    mbx: usize,
-    mby: usize,
-    q: usize,
-    side: usize,
-) -> u8 {
-    use crate::macroblock::MbKind;
-    let (w, mb_xy) = (pic.mb_width, mby * pic.mb_width + mbx);
-    let nb = if side == 0 {
-        if mbx == 0 {
-            None
-        } else {
-            Some(&pic.mbs[mb_xy - 1])
-        }
-    } else if mby == 0 {
-        None
-    } else {
-        Some(&pic.mbs[mb_xy - w])
-    };
-    let Some(nb) = nb else { return 2 };
-    if nb.kind != MbKind::Intra4x4 {
-        return 2;
-    }
-    // 左：右列块 3 + 8·(q>>1)；上：底行块 12 + 2·(q&1)
-    let b = if side == 0 {
-        3 + 8 * (q >> 1)
-    } else {
-        12 + 2 * (q & 1)
-    };
-    nb.i4_modes[b]
-}
-
-/// 邻块贡献的 8x8 模式（非 I8x8 邻块贡献 2=DC——与 4x4 族同语义）。
-// M2 WIP（CABAC 对拍收尾）：邻块取值改走象限版 neighbor_i8_mode_quads
-// 后保留的标量形态变体，收尾轮定去留。
-#[allow(dead_code)]
-pub(crate) fn neighbor_i8_mode(pic: &Picture, mb_xy: usize, quad: usize) -> u8 {
-    use crate::macroblock::MbKind;
-    let mb = &pic.mbs[mb_xy];
-    if mb.kind == MbKind::Intra4x4 && mb.transform_8x8 {
-        mb.i4_modes[quad * 4]
-    } else {
-        2
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +471,7 @@ fn pred_8x8l(mode: u8, e: &Edge8, q: &QuadAvail, out: &mut [u8], stride: usize) 
             put(out, stride, 6, 2, v);
             put(out, stride, 7, 4, v);
             put(out, stride, 6, 1, f(t[4], t[5], t[6]));
+            put(out, stride, 7, 3, f(t[4], t[5], t[6]));
             let v = f1(t[5], t[6]);
             put(out, stride, 6, 0, v);
             put(out, stride, 7, 2, v);
@@ -707,63 +659,18 @@ fn pred_8x8l(mode: u8, e: &Edge8, q: &QuadAvail, out: &mut [u8], stride: usize) 
             put(out, stride, 7, 7, f(tt(10), tt(11), tt(12)));
         }
         8 => {
-            // HU（FFmpeg pred8x8l_horizontal_up 逐字展开；只用左）
             let l = load_left(e, q);
-            let f = |a: i32, b: i32, c: i32| (a + 2 * b + c + 2) >> 2;
-            let f1 = |a: i32, b: i32| (a + b + 1) >> 1;
-            put(out, stride, 0, 0, f1(l[0], l[1]));
-            put(out, stride, 1, 0, f(l[0], l[1], l[2]));
-            let v = f1(l[1], l[2]);
-            put(out, stride, 2, 0, v);
-            put(out, stride, 0, 1, v);
-            let v = f(l[1], l[2], l[3]);
-            put(out, stride, 3, 0, v);
-            put(out, stride, 1, 1, v);
-            let v = f1(l[2], l[3]);
-            put(out, stride, 2, 1, v);
-            put(out, stride, 0, 2, v);
-            let v = f(l[2], l[3], l[4]);
-            put(out, stride, 3, 1, v);
-            put(out, stride, 1, 2, v);
-            let v = f1(l[3], l[4]);
-            put(out, stride, 2, 2, v);
-            put(out, stride, 0, 3, v);
-            let v = f(l[3], l[4], l[5]);
-            put(out, stride, 3, 2, v);
-            put(out, stride, 1, 3, v);
-            let v = f1(l[4], l[5]);
-            put(out, stride, 2, 3, v);
-            put(out, stride, 0, 4, v);
-            let v = f(l[4], l[5], l[6]);
-            put(out, stride, 3, 3, v);
-            put(out, stride, 1, 4, v);
-            let v = f1(l[5], l[6]);
-            put(out, stride, 2, 4, v);
-            put(out, stride, 0, 5, v);
-            let v = f(l[5], l[6], l[7]);
-            put(out, stride, 3, 4, v);
-            put(out, stride, 1, 5, v);
-            let v = f1(l[6], l[7]);
-            put(out, stride, 2, 5, v);
-            put(out, stride, 0, 6, v);
-            let v = f(l[6], l[7], l[7]);
-            put(out, stride, 3, 5, v);
-            put(out, stride, 1, 6, v);
-            // 右半与底行：l7 复制（FFmpeg pred8x8l_horizontal_up 的
-            // SRC(x,7)=SRC(7,y)=l7 族展开）
-            put(out, stride, 3, 6, l[7]);
-            put(out, stride, 2, 6, l[7]);
-            put(out, stride, 1, 7, l[7]);
-            put(out, stride, 0, 7, l[7]);
-            put(out, stride, 3, 7, l[7]);
-            put(out, stride, 2, 7, l[7]);
-            put(out, stride, 4, 0, l[7]);
-            put(out, stride, 5, 0, l[7]);
-            put(out, stride, 6, 0, l[7]);
-            put(out, stride, 7, 0, l[7]);
-            for y in 1..8 {
-                for x in 4..8 {
-                    put(out, stride, x, y, l[7]);
+            for y in 0..8 {
+                for x in 0..8 {
+                    let k = y + x / 2;
+                    let a = l[k.min(7)];
+                    let b = l[(k + 1).min(7)];
+                    let value = if x & 1 == 0 {
+                        (a + b + 1) >> 1
+                    } else {
+                        (a + 2 * b + l[(k + 2).min(7)] + 2) >> 2
+                    };
+                    put(out, stride, x as i32, y as i32, value);
                 }
             }
         }
@@ -779,9 +686,9 @@ fn pred_8x8l(mode: u8, e: &Edge8, q: &QuadAvail, out: &mut [u8], stride: usize) 
 /// 区域左上角。
 pub(crate) fn idct8x8_add(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
     block[0] += 32;
-    // 垂直 pass（列）
+    // 水平 pass（行）
     for i in 0..8usize {
-        let g = |k: usize| i32::from(block[i + k * 8]);
+        let g = |k: usize| i32::from(block[i * 8 + k]);
         let a0 = g(0) + g(4);
         let a2 = g(0) - g(4);
         let a4 = (g(2) >> 1) - g(6);
@@ -809,12 +716,12 @@ pub(crate) fn idct8x8_add(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) 
             b0 - b7,
         ];
         for (k, &v) in outs.iter().enumerate() {
-            block[i + k * 8] = v as i16;
+            block[i * 8 + k] = v as i16;
         }
     }
-    // 水平 pass（行）+ 叠加
+    // 垂直 pass（列）+ 叠加
     for i in 0..8usize {
-        let g = |k: usize| i32::from(block[k + i * 8]);
+        let g = |k: usize| i32::from(block[k * 8 + i]);
         let a0 = g(0) + g(4);
         let a2 = g(0) - g(4);
         let a4 = (g(2) >> 1) - g(6);
@@ -842,8 +749,8 @@ pub(crate) fn idct8x8_add(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) 
             b0 - b7,
         ];
         for (k, &v) in outs.iter().enumerate() {
-            let d = i32::from(dst[i * stride + k]) + (v >> 6);
-            dst[i * stride + k] = d.clamp(0, 255) as u8;
+            let d = i32::from(dst[k * stride + i]) + (v >> 6);
+            dst[k * stride + i] = d.clamp(0, 255) as u8;
         }
     }
 }
@@ -930,8 +837,14 @@ mod tests {
             topright: true,
         };
         let mut out = [0u8; 64];
-        pred_8x8l(2, &e, &q, &mut out, 8);
-        assert!(out.iter().all(|&v| v == 16));
+        for mode in 0..=8 {
+            out.fill(0);
+            pred_8x8l(mode, &e, &q, &mut out, 8);
+            assert!(
+                out.iter().all(|&v| v == 16),
+                "mode {mode} must write every pixel"
+            );
+        }
     }
 
     /// idct8：仅 DC=64 → 每样本 +1（(64+32)>>6 = 1）。

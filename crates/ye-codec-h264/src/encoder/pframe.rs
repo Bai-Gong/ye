@@ -389,6 +389,7 @@ pub(crate) fn encode_p_frame(
     let l0 = [refp.clone()];
     let ictx = InterCtx {
         wp: crate::slice::WpTables::default(),
+        implicit_bipred: false,
         l0: &l0,
         l1: &[],
         constrained: false,

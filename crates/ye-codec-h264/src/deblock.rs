@@ -170,30 +170,42 @@ pub(crate) fn boundary_strength(
     if p_mb.nnz[p_blk] != 0 || q_mb.nnz[q_blk] != 0 {
         return 2;
     }
-    let cmp_list = |pm: &Macroblock, qm: &Macroblock, pb: usize, qb: usize, l1: bool| -> bool {
-        let (pr, qr) = if l1 {
-            (pm.ref_idx_l1[pb], qm.ref_idx_l1[qb])
+    let matches = |pl: usize, ql: usize| {
+        let pr = if pl == 0 {
+            p_mb.ref_idx[p_blk]
         } else {
-            (pm.ref_idx[pb], qm.ref_idx[qb])
+            p_mb.ref_idx_l1[p_blk]
         };
-        if pr < 0 && qr < 0 {
-            return false; // 两侧均未用该列表
-        }
-        if pr != qr {
-            return true;
-        }
-        let (pmv, qmv) = if l1 {
-            (pm.mv_l1[pb], qm.mv_l1[qb])
+        let qr = if ql == 0 {
+            q_mb.ref_idx[q_blk]
         } else {
-            (pm.mv[pb], qm.mv[qb])
+            q_mb.ref_idx_l1[q_blk]
         };
-        let dmvx = i32::from(pmv[0]) - i32::from(qmv[0]);
-        let dmvy = i32::from(pmv[1]) - i32::from(qmv[1]);
-        dmvx.abs() >= 4 || dmvy.abs() >= 4
+        if pr < 0 || qr < 0 {
+            return pr < 0 && qr < 0;
+        }
+        let same_ref = match (p_mb.ref_poc[pl][p_blk], q_mb.ref_poc[ql][q_blk]) {
+            (Some(p), Some(q)) => p == q,
+            _ => pl == ql && pr == qr,
+        };
+        let pm = if pl == 0 {
+            p_mb.mv[p_blk]
+        } else {
+            p_mb.mv_l1[p_blk]
+        };
+        let qm = if ql == 0 {
+            q_mb.mv[q_blk]
+        } else {
+            q_mb.mv_l1[q_blk]
+        };
+        same_ref
+            && (i32::from(pm[0]) - i32::from(qm[0])).abs() < 4
+            && (i32::from(pm[1]) - i32::from(qm[1])).abs() < 4
     };
-    if cmp_list(p_mb, q_mb, p_blk, q_blk, false) || cmp_list(p_mb, q_mb, p_blk, q_blk, true) {
+    if !(matches(0, 0) && matches(1, 1) || matches(0, 1) && matches(1, 0)) {
         return 1;
     }
+
     0
 }
 

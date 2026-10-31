@@ -87,6 +87,8 @@ struct PictureCtx {
     pic: Arc<Picture>,
     sps_id: u8,
     frame_num: u32,
+    /// PPS、IDR id 与 POC 语法字段；非参考 B 帧可复用 frame_num。
+    identity: (u8, u32, u32, i32, [i32; 2]),
     idr: bool,
     /// nal_ref_idc != 0（本图是否入参考窗）。
     is_ref: bool,
@@ -290,19 +292,30 @@ impl H264Decoder {
         }
 
         // ---- 访问单元边界（I/P 通用）----
-        // IDR 恒为新图；非 IDR 以帧号变化判定。P 帧断号属错误处理（②c），
+        // 非参考 B 帧可复用帧号，必须同时比较 POC 与参考标记。断号属错误处理，
         // 当前如实收紧为 Unsupported。
         let max_fn = 1u32 << u32::from(sps.log2_max_frame_num_minus4 + 4);
         if self.cur.is_some() && sh.first_mb_in_slice == 0 {
             let cur = self.cur.as_ref().expect("checked non-empty");
-            let new_pic = is_idr || cur.frame_num != sh.frame_num || cur.idr != is_idr;
+            let identity = (
+                sh.pps_id,
+                sh.idr_pic_id,
+                sh.poc_lsb,
+                sh.delta_poc_bottom,
+                sh.delta_poc,
+            );
+            let new_pic = is_idr
+                || cur.frame_num != sh.frame_num
+                || cur.idr != is_idr
+                || cur.identity != identity
+                || cur.is_ref != (header.nal_ref_idc != 0);
             if !new_pic {
                 return Err(CodecError::InvalidData(format!(
                     "duplicate picture start (frame_num {}, idr {is_idr})",
                     sh.frame_num
                 )));
             }
-            if !is_idr && sh.frame_num != (cur.frame_num + 1) % max_fn {
+            if !is_idr && sh.frame_num != (cur.frame_num + u32::from(cur.is_ref)) % max_fn {
                 return Err(CodecError::UnsupportedStub(
                     "frame_num gap (error concealment lands in a later stage)",
                 ));
@@ -337,6 +350,13 @@ impl H264Decoder {
                 pic,
                 sps_id: sps.seq_parameter_set_id,
                 frame_num: sh.frame_num,
+                identity: (
+                    sh.pps_id,
+                    sh.idr_pic_id,
+                    sh.poc_lsb,
+                    sh.delta_poc_bottom,
+                    sh.delta_poc,
+                ),
                 idr: is_idr,
                 is_ref: header.nal_ref_idc != 0,
                 long_term_reference_flag: sh.long_term_reference_flag,
@@ -371,7 +391,7 @@ impl H264Decoder {
                     &self.short_ref_with_poc(),
                     &self.long_ref,
                     cur_poc,
-                    sh.num_ref_l0.max(1),
+                    sh.num_ref_l0.max(sh.num_ref_l1).max(1),
                 );
                 // 长窗 POC 由 Picture 自带（build_b_lists 以 pic.poc 读取）
                 // 长窗补位（build_b_lists 内已含；重排在后）
@@ -404,6 +424,7 @@ impl H264Decoder {
                 SliceType::P => Some(InterCtx {
                     l0: &list0,
                     wp: sh.wp.clone(),
+                    implicit_bipred: pps.weighted_bipred_idc == 2,
                     l1: &[],
                     constrained: pps.constrained_intra_pred_flag,
                     direct_spatial: true,
@@ -443,6 +464,7 @@ impl H264Decoder {
                         l0: &list0,
                         l1: &list1,
                         wp: sh.wp.clone(),
+                        implicit_bipred: pps.weighted_bipred_idc == 2,
                         constrained: pps.constrained_intra_pred_flag,
                         direct_spatial: sh.direct_spatial_mv_pred,
                         cur_poc,
@@ -469,6 +491,20 @@ impl H264Decoder {
             )
             .map_err(codec_err)?
         };
+        if let Some(pic) = Arc::get_mut(&mut ctx.pic) {
+            for mb in &mut pic.mbs[sh.first_mb_in_slice..end] {
+                for b in 0..16 {
+                    mb.ref_poc[0][b] = usize::try_from(mb.ref_idx[b])
+                        .ok()
+                        .and_then(|i| list0.get(i))
+                        .map(|p| p.poc);
+                    mb.ref_poc[1][b] = usize::try_from(mb.ref_idx_l1[b])
+                        .ok()
+                        .and_then(|i| list1.get(i))
+                        .map(|p| p.poc);
+                }
+            }
+        }
         ctx.decoded_mb_count += end - sh.first_mb_in_slice;
         Ok(())
     }
@@ -479,7 +515,7 @@ impl H264Decoder {
             return Ok(());
         };
         let total = ctx.mb_total();
-        if ctx.decoded_mb_count != total && std::env::var_os("YE_CABAC_SALVAGE").is_none() {
+        if ctx.decoded_mb_count != total {
             return Err(CodecError::InvalidData(format!(
                 "incomplete picture: {} of {total} macroblocks decoded",
                 ctx.decoded_mb_count
@@ -857,21 +893,23 @@ impl H264Decoder {
     fn build_list0(&self, sh: &SliceHeader) -> Result<Vec<Arc<Picture>>, CodecError> {
         let num_ref = sh.num_ref_l0.max(1);
         // (pic, is_long, pic_id)：pic_id 短=frame_num、长=LongTermFrameIdx
-        let mut list: Vec<(Arc<Picture>, bool, u32)> = self
+        let mut list: Vec<(Arc<Picture>, bool, u32, bool)> = self
             .short_ref
             .iter()
-            .map(|(p, fn_)| (p.clone(), false, *fn_))
+            .map(|(p, fn_)| (p.clone(), false, *fn_, true))
             .collect();
         for (i, l) in self.long_ref.iter().enumerate() {
             if let Some(p) = l {
-                list.push((p.clone(), true, i as u32));
+                list.push((p.clone(), true, i as u32, true));
             }
         }
-        if list.len() < num_ref {
-            return Err(CodecError::InvalidData(format!(
-                "not enough reference pictures ({} < {num_ref})",
-                list.len()
-            )));
+        if list.is_empty() {
+            return Err(CodecError::InvalidData("no reference pictures".into()));
+        }
+        while list.len() < num_ref {
+            let mut placeholder = list[0].clone();
+            placeholder.3 = false;
+            list.push(placeholder);
         }
         let max_pic_num = 1u32 << u32::from(self.log2_max_frame_num);
         let mut pred = sh.frame_num;
@@ -881,7 +919,7 @@ impl H264Decoder {
                     "ref list modification count overflow".into(),
                 ));
             }
-            let entry: (Arc<Picture>, bool, u32) = match op {
+            let entry: (Arc<Picture>, bool, u32, bool) = match op {
                 0 | 1 => {
                     let abs_diff = val + 1;
                     if abs_diff > u64::from(max_pic_num) {
@@ -898,7 +936,7 @@ impl H264Decoder {
                         .iter()
                         .rev()
                         .find(|(_, fn_)| *fn_ == pred)
-                        .map(|(p, _)| (p.clone(), false, pred));
+                        .map(|(p, _)| (p.clone(), false, pred, true));
                     let Some(e) = found else {
                         return Err(CodecError::InvalidData(
                             "reference picture missing during reorder".into(),
@@ -915,7 +953,7 @@ impl H264Decoder {
                         .long_ref
                         .get(li)
                         .and_then(|p| p.as_ref())
-                        .map(|p| (p.clone(), true, li as u32));
+                        .map(|p| (p.clone(), true, li as u32, true));
                     let Some(e) = found else {
                         return Err(CodecError::InvalidData(
                             "reference picture missing during reorder".into(),
@@ -940,7 +978,16 @@ impl H264Decoder {
             }
             list[index] = entry;
         }
-        Ok(list.into_iter().take(num_ref).map(|(p, _, _)| p).collect())
+        if list.iter().take(num_ref).any(|e| !e.3) {
+            return Err(CodecError::InvalidData(
+                "active reference slot missing after reorder".into(),
+            ));
+        }
+        Ok(list
+            .into_iter()
+            .take(num_ref)
+            .map(|(p, _, _, _)| p)
+            .collect())
     }
 }
 
@@ -1027,20 +1074,6 @@ fn build_frame(pic: &Picture, pts: Option<Timestamp>) -> Result<VideoFrame, H264
     copy_in(vf.plane_mut(0), ls, &pic.luma, pic.luma_stride(), h, w);
     copy_in(vf.plane_mut(1), cs, &pic.cb, pic.chroma_stride(), ch, cw);
     copy_in(vf.plane_mut(2), cs, &pic.cr, pic.chroma_stride(), ch, cw);
-    // 临时诊断（提交前剥离）：YE_DUMP_Y=<n> 落盘前 n 帧 luma 原始面
-    //（与 ffmpeg rawvideo 口径对拍用，stride 紧致）。
-    if let Ok(n) = std::env::var("YE_DUMP_Y") {
-        if let Ok(n) = n.parse::<usize>() {
-            static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let k = IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if k < n {
-                let _ = std::fs::write(
-                    std::env::temp_dir().join(format!("ye-dump-f{k}.y")),
-                    &pic.luma[..h * pic.luma_stride()],
-                );
-            }
-        }
-    }
     Ok(vf)
 }
 

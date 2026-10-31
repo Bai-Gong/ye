@@ -690,6 +690,8 @@ pub(crate) struct Macroblock {
     pub mv_l1: [[i16; 2]; 16],
     /// list1 参考索引（B 片未用块 = −1）。
     pub ref_idx_l1: [i8; 16],
+    /// 去块比较实际参考图身份，允许 B 双列表交换；缺席时保留索引比较。
+    pub ref_poc: [[Option<i32>; 16]; 2],
     /// list0 mvd（mv−mvp；CABAC 邻块上下文；无邻语义 = 0）。
     pub mvd: [[i16; 2]; 16],
     /// list1 mvd。
@@ -727,6 +729,7 @@ impl Default for Macroblock {
             ref_idx: [-1; 16],
             mv_l1: [[0; 2]; 16],
             ref_idx_l1: [-1; 16],
+            ref_poc: [[None; 16]; 2],
             mvd: [[0; 2]; 16],
             mvd_l1: [[0; 2]; 16],
             transform_8x8: false,
@@ -1026,7 +1029,12 @@ pub(crate) fn nc_chroma_dc(left: Option<u8>, top: Option<u8>) -> u8 {
 /// 变体后 prev 随之漂移，预测错位。）
 pub(crate) fn neighbor_i4_mode(mb: &Macroblock, slot: usize) -> u8 {
     if mb.kind == MbKind::Intra4x4 {
-        mb.i4_syntax[slot]
+        let index = if mb.transform_8x8 {
+            ((slot / 8) * 2 + (slot % 4) / 2) * 4
+        } else {
+            slot
+        };
+        mb.i4_syntax[index]
     } else {
         2
     }

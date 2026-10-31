@@ -1073,3 +1073,11 @@ add_stream 顺序，缺省字段全 0））→ (moof + mdat)*`，free 不写
   default_base_moof 与显式 base_data_offset 两种 fMP4 源 → Fragmented
   重封装 → ffprobe streams/packets 单位域严格对拍 + flags=K + 解码冒烟
   + moof≥2；skip 规则同前）。
+
+
+## CABAC 解码收口（2026-10-31）
+
+- 范围：H.264 progressive、8-bit、4:2:0 的 High/CABAC，全 I、I/P、B 金字塔；包含 8×8 变换、双列表参考、空间直接预测、隐式双向加权与 B 帧去块。
+- `cabac_oracle` 自动生成五组 45 帧素材（全 I、I/P、B、B 禁用去块、B 禁用加权），Y/Cb/Cr 三平面逐帧 **bit-exact** 对比系统 FFmpeg；工具在场时生成、解码或比对失败均报错。
+- 临时 bin 注入、变异开关、残帧放行与全局落盘钩子已删除，产品解码不得绕过不完整图片检查。
+- 这是库内上述回归范围的收口，不代表所有 High 形态均支持；10-bit、4:2:2/4:4:4、隔行与显式 B 加权仍不在本次交付范围。剪/锻的导入放行和调用侧验证另行推进。

@@ -33,7 +33,7 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
   oracle 对拍通过；`ye probe` / `ye remux` 可用。收口准入达成：剪的素材
   导入 probe 换 ye（双引擎，ffprobe 留作 oracle 与回退）。
 - **M2 解码——服务剪的抽帧与波形（2026-10-27 收口）**：H.264 解码
-  （Baseline 收口；High/CABAC 真流对拍沿收口轨道开放，见
+  （Baseline 收口；High/CABAC progressive 8-bit 4:2:0 真流对拍已于 2026-10-31 收口，见
   [waitlist.md](waitlist.md) 第 1 行）、AAC-LC 解码、yuv→rgb 与 scale、
   PNG 编码、波形峰值、抽帧门面；oracle 对拍与同日解码器分歧修复收口
   （去块延后图级 + chroma QP 偏移 + pred_8x16 C→D 回退，`ip30` 回归集
@@ -79,6 +79,8 @@ Rust 后端的媒体任务（probe / 抽帧 / 波形 / 导出 / 代理），不�
   对拍"兜底。
 
 ## 修订记录
+
+- 2026-10-31：CABAC 库内收口——修正预测模式索引、分区 MV 缓存、行首 skip 上下文、色度 DC、B 参考列表/帧边界/隐式加权/去块；五组 45 帧 Y/Cb/Cr bit-exact 对拍通过，临时诊断钩子删除。消费方导入放行仍需单独验证。
 
 - 2026-10-27：M2 收口——剪接入（m2-jian-plan T1–T8）+ 同日解码器分歧
   修复收口，两仓门禁全绿。详录见 [m2-jian-plan.md](m2-jian-plan.md)。

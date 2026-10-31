@@ -28,6 +28,8 @@ pub(crate) struct InterCtx<'a> {
     pub l0: &'a [Arc<Picture>],
     /// 加权预测表（恒等权重时 MC 走原路径）。
     pub wp: crate::slice::WpTables,
+    /// PPS weighted_bipred_idc=2：按两参考图与当前图 POC 推导权重。
+    pub implicit_bipred: bool,
     /// List1（B 片）。
     pub l1: &'a [Arc<Picture>],
     /// constrained_intra_pred_flag。
@@ -59,7 +61,7 @@ pub(crate) struct InterCtx<'a> {
 }
 
 /// 分区描述（语法层解析产物；MC 应用与 MB 存储的公共形态）。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MvPart {
     /// 4x4 块锚点（宏块内）。
     pub bx: i32,
@@ -217,24 +219,17 @@ pub(crate) fn pred_spatial_direct(
     let quad_part = |x8: i32, y8: i32, zero_flag: bool| -> MvPart {
         /// 单列表的 (ref, mv) 贡献。
         type ListMv = Option<(i8, [i16; 2])>;
-        let (a, b): (ListMv, ListMv) = if zero_flag {
-            // col_zero：ref>0 才用 mv，ref==0 → 0
-            (
-                Some((
-                    refs[0].max(0) as i8,
-                    if refs[0] > 0 { mvs[0] } else { [0; 2] },
-                )),
-                Some((
-                    refs[1].max(0) as i8,
-                    if refs[1] > 0 { mvs[1] } else { [0; 2] },
-                )),
-            )
-        } else {
-            (
-                Some((refs[0].max(0) as i8, mvs[0])),
-                Some((refs[1].max(0) as i8, mvs[1])),
-            )
+        let value = |list: usize| -> ListMv {
+            (refs[list] >= 0).then_some((
+                refs[list] as i8,
+                if zero_flag && refs[list] == 0 {
+                    [0; 2]
+                } else {
+                    mvs[list]
+                },
+            ))
         };
+        let (a, b) = (value(0), value(1));
         MvPart {
             bx: x8 * 2,
             by: y8 * 2,
@@ -295,7 +290,7 @@ fn col_zero_flag(col_mb: &crate::macroblock::Macroblock, b: usize, col_is_long: 
 
 /// 象限 (x8, y8) 的中心 4x4 块下标（光栅）。
 fn quad_center_block(x8: i32, y8: i32) -> usize {
-    (8 * y8 + 2 * x8 + 5) as usize
+    (12 * y8 + 3 * x8) as usize
 }
 
 /// 时间直接预测（progressive 帧图；FFmpeg pred_temp_direct_motion）。
@@ -534,10 +529,23 @@ pub(crate) fn apply_parts(
                 .get(ri as usize)
                 .ok_or_else(|| H264Error::InvalidData(format!("ref_idx l1 {ri} out of range")))?
                 .clone();
-            if p.l0.is_some() {
+            if let Some((ri0, _)) = p.l0 {
                 // B 双向显式加权（idc==2）需要 biweight 组合——本路径覆盖
                 // idc==0 的 rnd 平均（x264 默认）；显式加权流会在此前被拒。
-                mc_partition_avg(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv)?;
+                let mut w1 = 32;
+                let ref0 = &ctx.l0[ri0 as usize];
+                if ctx.implicit_bipred && !ref0.is_long_term && !refp.is_long_term {
+                    let td = (refp.poc - ref0.poc).clamp(-128, 127);
+                    let tb = (ctx.cur_poc - ref0.poc).clamp(-128, 127);
+                    if td != 0 {
+                        let tx = (16384 + (td.abs() >> 1)) / td;
+                        let scale = (tb * tx + 32) >> 8;
+                        if (-64..=128).contains(&scale) {
+                            w1 = scale;
+                        }
+                    }
+                }
+                mc_partition_avg(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv, w1)?;
             } else {
                 mc_partition(pic, &refp, mbx, mby, p.bx, p.by, p.w, p.h, mv)?;
                 if !ctx.wp.is_identity() {
@@ -569,8 +577,13 @@ fn weight_partition(
     let lx = (mbx as i32 * 16 + bx * 4) as usize;
     let ly = (mby as i32 * 16 + by * 4) as usize;
     let (wpx, hpx) = ((w * 4) as usize, (h * 4) as usize);
-    let apply = |plane: &mut [u8], stride: usize, base: usize, pw: usize, ph: usize,
-                 (wt, off): (i32, i32), ld: u32| {
+    let apply = |plane: &mut [u8],
+                 stride: usize,
+                 base: usize,
+                 pw: usize,
+                 ph: usize,
+                 (wt, off): (i32, i32),
+                 ld: u32| {
         if wt == (1i32 << ld) && off == 0 {
             return;
         }
@@ -586,11 +599,35 @@ fn weight_partition(
             }
         }
     };
-    apply(&mut pic.luma, ls, ly * ls + lx, wpx, hpx, wt.y, tab.luma_log2_denom);
+    apply(
+        &mut pic.luma,
+        ls,
+        ly * ls + lx,
+        wpx,
+        hpx,
+        wt.y,
+        tab.luma_log2_denom,
+    );
     let (cx, cy) = (lx / 2, ly / 2);
     let cbase = cy * cs + cx;
-    apply(&mut pic.cb, cs, cbase, wpx / 2, hpx / 2, wt.u, tab.chroma_log2_denom);
-    apply(&mut pic.cr, cs, cbase, wpx / 2, hpx / 2, wt.v, tab.chroma_log2_denom);
+    apply(
+        &mut pic.cb,
+        cs,
+        cbase,
+        wpx / 2,
+        hpx / 2,
+        wt.u,
+        tab.chroma_log2_denom,
+    );
+    apply(
+        &mut pic.cr,
+        cs,
+        cbase,
+        wpx / 2,
+        hpx / 2,
+        wt.v,
+        tab.chroma_log2_denom,
+    );
 }
 
 /// avg 变体分区 MC（luma/chroma 均与现值 rnd 平均）。
@@ -605,54 +642,64 @@ fn mc_partition_avg(
     w: i32,
     h: i32,
     mv: [i16; 2],
+    w1: i32,
 ) -> Result<(), H264Error> {
-    let ls = pic.luma_stride();
-    let cs = pic.chroma_stride();
     let lx = (mbx as i32 * 16 + bx * 4) as usize;
     let ly = (mby as i32 * 16 + by * 4) as usize;
     let qx = lx as i64 * 4 + i64::from(mv[0]);
     let qy = ly as i64 * 4 + i64::from(mv[1]);
-    let (wpx, hpx) = ((w * 4) as usize, (h * 4) as usize);
-    let base = ly * ls + lx;
-    mc::mc_luma_avg(
-        &mut pic.luma[base..],
-        ls,
-        &refp.luma,
-        refp.luma_stride(),
-        refp.mb_width * 16,
-        refp.mb_height * 16,
-        qx,
-        qy,
-        wpx,
-        hpx,
-    );
-    let cx = lx / 2;
-    let cy = ly / 2;
-    let cbase = cy * cs + cx;
-    mc::mc_chroma_avg(
-        &mut pic.cb[cbase..],
-        cs,
-        &refp.cb,
-        refp.chroma_stride(),
-        refp.mb_width * 8,
-        refp.mb_height * 8,
-        qx,
-        qy,
-        wpx / 2,
-        hpx / 2,
-    );
-    mc::mc_chroma_avg(
-        &mut pic.cr[cbase..],
-        cs,
-        &refp.cr,
-        refp.chroma_stride(),
-        refp.mb_width * 8,
-        refp.mb_height * 8,
-        qx,
-        qy,
-        wpx / 2,
-        hpx / 2,
-    );
+    let ls = pic.luma_stride();
+    let cs = pic.chroma_stride();
+    for (dst, src, stride, src_stride, sw, sh, unit, chroma) in [
+        (
+            &mut pic.luma,
+            &refp.luma,
+            ls,
+            refp.luma_stride(),
+            refp.mb_width * 16,
+            refp.mb_height * 16,
+            4usize,
+            false,
+        ),
+        (
+            &mut pic.cb,
+            &refp.cb,
+            cs,
+            refp.chroma_stride(),
+            refp.mb_width * 8,
+            refp.mb_height * 8,
+            2usize,
+            true,
+        ),
+        (
+            &mut pic.cr,
+            &refp.cr,
+            cs,
+            refp.chroma_stride(),
+            refp.mb_width * 8,
+            refp.mb_height * 8,
+            2usize,
+            true,
+        ),
+    ] {
+        let (pw, ph) = (w as usize * unit, h as usize * unit);
+        let mut tmp = [0u8; 256];
+        if chroma {
+            mc::mc_chroma_put(&mut tmp, pw, src, src_stride, sw, sh, qx, qy, pw, ph);
+        } else {
+            mc::mc_luma_put(&mut tmp, pw, src, src_stride, sw, sh, qx, qy, pw, ph);
+        }
+        let base =
+            (mby * 4 * unit + by as usize * unit) * stride + mbx * 4 * unit + bx as usize * unit;
+        for y in 0..ph {
+            for x in 0..pw {
+                let i = base + y * stride + x;
+                dst[i] = ((i32::from(dst[i]) * (64 - w1) + i32::from(tmp[y * pw + x]) * w1 + 32)
+                    >> 6)
+                    .clamp(0, 255) as u8;
+            }
+        }
+    }
     Ok(())
 }
 
