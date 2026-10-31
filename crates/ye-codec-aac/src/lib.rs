@@ -33,8 +33,8 @@
 //! ## 形态边界（如实报错，绝不静默错帧）
 //!
 //! 解码支持：AAC-LC（objectType 2）、1/2 声道、1024 帧长、ADTS/LOAS/
-//! 裸块（裸块需 extradata）、M/S、强度立体声、TNS、pulse。
-//! 不支持（`Err`）：HE-AAC/SBR、PNS 噪声码本、PCE/CCE/>2 声道、
+//! 裸块（裸块需 extradata）、M/S、强度立体声、TNS、pulse、PNS。
+//! 不支持（`Err`）：HE-AAC/SBR、PCE/CCE/>2 声道、
 //! AAC-Main/LTP/SSR 等 object type、960 帧长（收紧待向量）。
 //!
 //! 编码支持：AAC-LC 长窗（1024/sine）、单声道 SCE / 立体声 CPE
@@ -56,6 +56,7 @@ pub mod filterbank;
 
 mod decoder;
 mod encoder;
+mod pns;
 mod spectral;
 mod stereo;
 mod tables_data;

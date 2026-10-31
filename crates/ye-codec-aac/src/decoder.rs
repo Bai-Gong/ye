@@ -21,7 +21,7 @@
 //! PCM 为 oracle，故在调用侧把每帧样本 ×0.5
 //!（[`OUTPUT_CAL`]），滤波器组文件保持 ISO 标定不动。
 //!
-//! 形态收紧（如实报错，绝不静默错帧）：HE-AAC/SBR 扩展、PNS 噪声码本、
+//! 形态收紧（如实报错，绝不静默错帧）：HE-AAC/SBR 扩展、
 //! PCE/CCE/多声道（>2）、非 LC object type、960 帧长（swb 表已转录但
 //! 未对拍验证——收紧，放开须补 960 向量）、流中途变更采样率/声道配置。
 //!
@@ -68,6 +68,7 @@ pub struct AacDecoder {
     /// feed 期累积失败（pull 透出）。
     pending_error: Option<CodecError>,
     flushed: bool,
+    noise_state: u32,
 }
 
 impl AacDecoder {
@@ -86,6 +87,7 @@ impl AacDecoder {
             out: VecDeque::new(),
             pending_error: None,
             flushed: false,
+            noise_state: 0x6d2b79f5,
         };
         if let Some(ed) = params.extradata.as_deref() {
             if ed.is_empty() {
@@ -316,6 +318,7 @@ impl AacDecoder {
                     }
                     let ci = channels_out.len();
                     let mut ch = ch.clone();
+                    crate::pns::generate(&mut ch, &mut self.noise_state);
                     if let Some(tns_data) = ch.tns.take() {
                         tns::apply(&mut ch.coeffs, &ch.ics, &tns_data);
                     }
@@ -334,6 +337,9 @@ impl AacDecoder {
                         ms_used: Vec::new(),
                     };
                     let pc = common.as_ref().unwrap_or(&default_common);
+                    crate::pns::generate(&mut c0, &mut self.noise_state);
+                    crate::pns::generate(&mut c1, &mut self.noise_state);
+                    crate::pns::correlate(pc, &c0, &mut c1);
                     stereo::apply(pc, &mut c0, &mut c1)?;
                     if let Some(t) = c0.tns.take() {
                         tns::apply(&mut c0.coeffs, &c0.ics, &t);

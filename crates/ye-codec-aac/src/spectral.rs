@@ -73,7 +73,11 @@ pub(crate) fn decode_and_requant(
             let mult = band_multiplier(cb, sf_int);
             let lo = ics.swb_offset[sfb] as usize;
             let hi = ics.swb_offset[sfb + 1] as usize;
-            if cb != CB_ZERO && cb != CB_INTENSITY_HI && cb != CB_INTENSITY_LO {
+            if cb != CB_ZERO
+                && cb != CB_INTENSITY_HI
+                && cb != CB_INTENSITY_LO
+                && cb != crate::syntax::CB_NOISE
+            {
                 decode_band(
                     r,
                     ics,

@@ -22,7 +22,7 @@
 //! ## 失败模式
 //!
 //! 位越界、保留值（ms_present=3、sect_cb=12、LC 的 predictor 等）、
-//! 越界频带号 → [`AacError::InvalidData`]；PCE/CCE/PNS 噪声码本/
+//! 越界频带号 → [`AacError::InvalidData`]；PCE/CCE/
 //! SBR 扩展等超出 AAC-LC 范围的形态 → [`AacError::Unsupported`]
 //! （如实报错，绝不静默错帧）。
 
@@ -687,7 +687,7 @@ fn bad_sfi(idx: usize) -> AacError {
 /// 先解析）→ section/scalefactor/pulse/tns/gain_control → spectral。
 ///
 /// # Errors
-/// 见各子语法；PNS 噪声码本 → [`AacError::Unsupported`]。
+/// 见各子语法；PNS 码本由 pns 模块重建，谱语法不消耗该带系数码字。
 pub(crate) fn parse_channel(
     r: &mut BitReader,
     ics: &IcsInfo,
@@ -731,7 +731,7 @@ pub(crate) fn parse_channel(
 /// section_data（ISO 4.6.2.1）：返回组优先的逐频带 codebook。
 ///
 /// # Errors
-/// sect_cb ∈ {12, 13}（保留/PNS）→ [`AacError::Unsupported`]；
+/// sect_cb=12 为保留值；13=PNS，为合法 AAC-LC 噪声频带；
 /// 越界 → [`AacError::InvalidData`]。
 pub(crate) fn parse_section_data(r: &mut BitReader, ics: &IcsInfo) -> Result<Vec<u8>, AacError> {
     let n_bands = ics.num_window_groups as usize * ics.max_sfb as usize;
@@ -748,12 +748,6 @@ pub(crate) fn parse_section_data(r: &mut BitReader, ics: &IcsInfo) -> Result<Vec
             let sect_cb = r.bits(4)? as u8;
             if sect_cb == 12 {
                 return Err(AacError::InvalidData("sect_cb=12（保留）".into()));
-            }
-            if sect_cb == CB_NOISE {
-                return Err(AacError::Unsupported(
-                    "PNS 噪声码本（noiseless 重建噪声波形是实现定义，".to_string()
-                        + "如需支持回施工图裁决）",
-                ));
             }
             let mut sect_end = k;
             loop {
@@ -781,7 +775,7 @@ pub(crate) fn parse_section_data(r: &mut BitReader, ics: &IcsInfo) -> Result<Vec
 /// scale_factor_data（ISO 4.6.2.3）：三条差分链重建。
 ///
 /// 常规链 = global_gain 起步、值域 0..=255；强度链 = 0 起步、裁剪
-/// [−155,100]；噪声链不支持（section 层已拒）。ZERO 频带不耗码字。
+/// [−155,100]；噪声链 global_gain−90 起步，首带 9 位，后续 Huffman 差分。ZERO 不耗码字。
 ///
 /// # Errors
 /// 常规链越界 / 位越界 → [`AacError::InvalidData`]。
@@ -794,10 +788,21 @@ pub(crate) fn parse_scale_factor_data(
     let _ = ics;
     let mut offset_regular = i32::from(global_gain);
     let mut offset_intensity = 0i32;
+    let mut offset_noise = i32::from(global_gain) - 90;
+    let mut first_noise = true;
     let mut out = Vec::with_capacity(codebooks.len());
     for &cb in codebooks {
         match cb {
             CB_ZERO => out.push(0),
+            CB_NOISE => {
+                offset_noise += if first_noise {
+                    first_noise = false;
+                    r.bits(9)? as i32 - 256
+                } else {
+                    r.sf_delta()?
+                };
+                out.push(offset_noise.clamp(-100, 155) as i16);
+            }
             CB_INTENSITY_HI | CB_INTENSITY_LO => {
                 offset_intensity += r.sf_delta()?;
                 let clipped = offset_intensity.clamp(-155, 100);
@@ -1234,15 +1239,12 @@ mod tests {
         w.put(1, 5);
         let mut r = BitReader::new(&w.bytes);
         assert!(parse_section_data(&mut r, &ics).is_err());
-        // sect_cb=13（PNS）→ Unsupported
+        // PNS 是合法 AAC-LC 频带，section 层保留码本。
         let mut w = BitWriter::new();
         w.put(13, 4);
-        w.put(1, 5);
+        w.put(6, 5);
         let mut r = BitReader::new(&w.bytes);
-        assert!(matches!(
-            parse_section_data(&mut r, &ics),
-            Err(AacError::Unsupported(_))
-        ));
+        assert_eq!(parse_section_data(&mut r, &ics).unwrap(), vec![13; 6]);
     }
 
     /// scalefactor 链：常规 + 强度混合，delta 从真码表取码字。
