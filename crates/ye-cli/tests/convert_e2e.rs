@@ -58,6 +58,9 @@ fn gen_source(path: &Path) {
             "yuv420p",
             "-c:a",
             "aac",
+            // AAC 解码当前明确拒绝 PNS，造源须与 conformance 的支持范围一致。
+            "-aac_pns",
+            "0",
             "-b:a",
             "64k",
             "-shortest",
@@ -120,7 +123,8 @@ fn video_frame_count(path: &Path) -> u64 {
                 "-show_entries",
                 "stream=nb_read_frames",
                 "-of",
-                "csv=p=0",
+                // CSV 会把流附带的 side data 输出成额外列；这里只读取帧数。
+                "default=noprint_wrappers=1:nokey=1",
             ])
             .arg(path),
     );
