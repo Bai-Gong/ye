@@ -42,8 +42,7 @@ use crate::error::AacError;
 use crate::filterbank::{self, BlockSequence, FrameLength, WindowInfo, WindowShape};
 use crate::stereo;
 use crate::syntax::{
-    self, AudioSpecificConfig, BitReader, EIGHT_SHORT, LONG_START, LoasState, ONLY_LONG,
-    PairCommon, RawElement,
+    self, AudioSpecificConfig, BitReader, EIGHT_SHORT, LONG_START, LoasState, ONLY_LONG, RawElement,
 };
 use crate::tns;
 
@@ -332,15 +331,15 @@ impl AacDecoder {
                 }
                 RawElement::Pair { common, ch } => {
                     let (mut c0, mut c1) = (ch[0].clone(), ch[1].clone());
-                    let default_common = PairCommon {
-                        ms_present: 0,
-                        ms_used: Vec::new(),
-                    };
-                    let pc = common.as_ref().unwrap_or(&default_common);
                     crate::pns::generate(&mut c0, &mut self.noise_state);
                     crate::pns::generate(&mut c1, &mut self.noise_state);
-                    crate::pns::correlate(pc, &c0, &mut c1);
-                    stereo::apply(pc, &mut c0, &mut c1)?;
+                    // Independent ICS may have different band counts and window
+                    // groups. Cross-channel tools are only defined for a shared
+                    // window; a fabricated empty M/S mask does not make one.
+                    if let Some(pc) = common {
+                        crate::pns::correlate(pc, &c0, &mut c1);
+                        stereo::apply(pc, &mut c0, &mut c1)?;
+                    }
                     if let Some(t) = c0.tns.take() {
                         tns::apply(&mut c0.coeffs, &c0.ics, &t);
                     }
@@ -539,6 +538,46 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use ye_time::Rational;
+
+    #[test]
+    fn independent_cpe_band_counts_decode_without_stereo_indexing() {
+        let mut bits = Vec::new();
+        let mut write = |value: u32, len: u32| {
+            for n in (0..len).rev() {
+                bits.push(((value >> n) & 1) as u8);
+            }
+        };
+        write(1, 3); // CPE
+        write(0, 4); // element tag
+        write(0, 1); // common_window = false
+        for max_sfb in [4, 2] {
+            write(100, 8); // global gain
+            write(0, 1);
+            write(0, 2);
+            write(0, 1); // reserved, ONLY_LONG, shape
+            write(max_sfb, 6);
+            write(0, 1); // max_sfb, predictor absent
+            write(0, 4);
+            write(max_sfb, 5); // one ZERO_HCB section
+            write(0, 1);
+            write(0, 1);
+            write(0, 1); // no pulse, TNS, gain control
+        }
+        write(7, 3); // END
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (n, bit) in bits.into_iter().enumerate() {
+            bytes[n / 8] |= bit << (7 - n % 8);
+        }
+        let mut params = CodecParameters::new(CodecId::Aac, ye_codec::MediaType::Audio);
+        params.extradata = Some(vec![0x12, 0x10]);
+        let mut decoder = AacDecoder::new(&params).unwrap();
+        decoder.feed(&packet(&bytes, Some(0))).unwrap();
+        let Decoded::Frame(ye_codec::Frame::Audio(frame)) = decoder.pull().unwrap() else {
+            panic!("expected PCM");
+        };
+        assert_eq!(frame.data().len(), 1024 * 2 * 4);
+        assert!(frame.data().iter().all(|byte| *byte == 0));
+    }
 
     fn packet(data: &[u8], pts_ticks: Option<i64>) -> Packet {
         let mut p = Packet::empty(0);

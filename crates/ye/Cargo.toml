@@ -57,3 +57,7 @@ ye-codec-aac = { path = "../ye-codec-aac" }
 [[example]]
 name = "recording_acceptance"
 required-features = ["mp4", "h264", "aac", "png"]
+
+[[example]]
+name = "recording_waveforms"
+required-features = ["mp4", "aac"]
