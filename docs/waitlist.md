@@ -9,22 +9,26 @@
 - M1——MP4（progressive 与 fMP4）读 + 写 + probe + remux 直通
   （`ContainerRegistry` auto-probe）。
 - M2——H.264 Baseline 解码、AAC-LC 解码、yuv→rgb 与 scale、PNG 编码、
-  波形峰值、抽帧门面（High/CABAC 真流对拍收口见下表第 1 行）。
+  波形峰值、抽帧门面；High/CABAC progressive 8-bit 4:2:0 真流对拍及
+  消费方真实录屏抽帧已验证，剩余组合见下表。
 - M3——H.264 软件编码（定 QP / 简单 CRF / 真码控）、AAC-LC 编码、
-  处理图最小集、`ye convert` 端到端（音频三态/剥视频）。
-- M4 首轮——`ye::compose` 顺序拼接泵 + 剪导出双引擎接线。
+  处理图最小集、`ye convert` 端到端（音频三态/剥视频）、有理数目标帧率、
+  44.1/48kHz 流式重采样、任务预检与输出文件保护。
+- M4 静态多轨——`ye::compose` 顺序拼接、`ye::timeline` 多层变换/透明叠加、
+  混音/增益/声像、黑场/静音、跨 GOP seek、显式源音轨选择；剪已接入。
 
 各批次交付明细见 [roadmap.md](roadmap.md) 修订记录与施工图归档。
 
 | # | 缺口（消费方需求） | 阻塞层 | 放行里程碑 | 现状 |
 | --- | --- | --- | --- | --- |
-| 1 | 抽帧缩略图（剪 M1：H.264 帧 → PNG） | ye-codec（High/CABAC/B 帧解码收口） | M2 收口轨道 | Baseline 链路已交付且分歧修复收口（2026-10-27，`ip30` 回归集入库，详录见 roadmap 修订记录）。余留（如实）：no-deblock 条帧 81 起 Cr ±1 孤立样本（容差内，归档 ffmpeg 舍入边角，收紧 `ip30` 容差前须先收口——ye-codec-h264 tests/conformance.rs `ip30` 注释）；jian 侧像素用例仍挂 `#[ignore]` 未随修复翻除（归 jian 后续）；**2026-10-31 库内 High/CABAC 收口：progressive 8-bit 4:2:0 的全 I / I/P / B 金字塔及去块、加权变体五组 Y/Cb/Cr 逐帧 bit-exact 通过；剪/锻的导入放行仍需调用侧验证，不等于消费方已放开 High 导入** |
-| 2 | 真转码（锻首个任务：改分辨率/码率出 MP4） | ~~锻 duan 接线；ye 真码控~~ 均已交付 | **M3（收口）** | 已交付收口（M3 首轮 + 补齐，2026-10-26）：编码 + 真码控 + AAC-LC 编码 + convert 三态 + CLI 全量旗标 + 锻侧接线与拒绝面矩阵。余留（如实）：2-pass/完整 CRF 归后续批次；改帧率仍拒（fps 滤镜参数未接） |
-| 3 | 导出合成（剪：filter_complex 全集 + 多输入时间线合成 + 进度） | ye-filter（全集与调度）+ 编码 + 合成 API | **M4** | M4 首轮已交付（2026-10-26）：`ye::compose` 顺序拼接泵 + 剪导出双引擎（契约见 contracts.md「合成导出最小集契约」）。余留（如实）：叠加/变速/旋转/透明度/混音/转场等时间线合成全集、seek 快进、段级静音填充——归 M4 后续批次 |
+| 1 | H.264 舍入边角 | ye-codec-h264 | 解码收口轨道 | `ip30` no-deblock 帧 81 起 Cr ±1 孤立样本仍按既有容差归档；收紧容差前需单独收口。High/CABAC 已有消费方抽帧验收，不再列为整体导入阻塞。 |
+| 2 | 编码质量与码控扩展 | ye-codec-h264 | 后续编码批次 | 基础转码和改帧率已交付；2-pass、完整 CRF 与压缩效率评估待做。 |
+| 3 | 高级时间线导出 | ye-filter + 时间线调度 | M4 后续 | 静态叠加/旋转/透明度/混音、seek 和静音填充已交付；关键帧、变速、转场、字幕/图片等高级编辑仍待实现。 |
 | 4 | MOV 容器（QT 族导入） | ye-container（新实现 crate，MP4 近亲可大量复用） | 持续轨道·下一梯队 | 未开工；按剪的导入统计驱动（同梯队：WAV/MP3 纯探测） |
 | 5 | MKV / WebM 容器 | ye-container（Matroska 实现 crate） | **M5** | 未开工 |
 | 6 | GIF / 图片探测（纯探测，无解封装） | ye-container（纯探测工厂） | 未排期 | 未开工；按导入统计驱动 |
 | 7 | High-profile CAVLC 的 8×8 变换语法 | ye-codec-h264 CAVLC 宏块解析 | 后续解码扩展 | 2026-10-31 色块长 GOP 联调暴露：红→蓝→白、cabac=0/8x8dct=1 时白场首帧报 intra pred mode 8。不能以 CABAC 8×8 对拍通过代替此组合；CAVLC 加权 P_Skip 回归限定 Main 的 4×4 变换。CABAC 同素材三平面逐样本通过。 |
+| 8 | 基础版交付验收 | 剪/锻消费方与运行环境 | P3/P4 收口 | 真实 84 秒录屏未完整渲染；独立双音轨听感、干净 Windows 安装后的完整交互闭环待验。最新历史记录为冶 744 项测试通过，不代表本轮重新执行。 |
 
 维护约定：
 
