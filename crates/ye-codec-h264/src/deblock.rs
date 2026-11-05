@@ -167,7 +167,19 @@ pub(crate) fn boundary_strength(
     // inter：系数非零 → 2（先判）；参考/MV 差异 → 1（B 帧按两列表
     // 逐一比对，任一列表差异即 1——spec 8.8.2.4 / FFmpeg 同构；
     // 未用列表（ref < 0）跳过该列表比对）。
-    if p_mb.nnz[p_blk] != 0 || q_mb.nnz[q_blk] != 0 {
+    // An 8×8 transform's four CAVLC groups describe one spatial block.
+    // nC keeps the separate counts; deblocking tests the whole transform.
+    let has_residual = |mb: &Macroblock, b: usize| {
+        if mb.transform_8x8 && b < 16 {
+            let base = (b / 8) * 8 + ((b % 4) / 2) * 2;
+            [base, base + 1, base + 4, base + 5]
+                .iter()
+                .any(|&i| mb.nnz[i] != 0)
+        } else {
+            mb.nnz[b] != 0
+        }
+    };
+    if has_residual(p_mb, p_blk) || has_residual(q_mb, q_blk) {
         return 2;
     }
     let matches = |pl: usize, ql: usize| {
@@ -706,6 +718,24 @@ mod tests {
         // nnz 与 MV 差同时存在 → 2（nnz 档更高）
         let g = inter_mb(2, [100, 100], 3, 0);
         assert_eq!(boundary_strength(&g, 3, &f, 4, false), 2);
+    }
+
+    #[test]
+    fn cavlc_8x8_residual_applies_to_entire_transform() {
+        let mut p = inter_mb(0, [0, 0], 0, 0);
+        let q = inter_mb(0, [0, 0], 0, 0);
+        p.transform_8x8 = true;
+        // Only the fourth interleaved coefficient group is nonzero.
+        p.nnz[5] = 1;
+        for b in [0, 1, 4, 5] {
+            assert_eq!(boundary_strength(&p, b, &q, b, false), 2);
+            assert_eq!(boundary_strength(&q, b, &p, b, false), 2);
+        }
+        for b in [2, 3, 6, 7, 8, 9, 12, 13] {
+            assert_eq!(boundary_strength(&p, b, &q, b, false), 0);
+        }
+        p.transform_8x8 = false;
+        assert_eq!(boundary_strength(&p, 0, &q, 0, false), 0);
     }
 
     #[test]

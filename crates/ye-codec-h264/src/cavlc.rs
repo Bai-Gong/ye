@@ -392,13 +392,13 @@ pub(crate) enum BlockKind {
     ChromaAc,
 }
 
-/// 解码一个残差块到 `out`（长度 16；chroma DC 用其中 4 槽位）。
+/// 解码一个至多 16 系数的残差组；8×8 CAVLC 的四组交错写入同一个 64 槽块。
 ///
 /// - `nc`：nC（0..=16，由调用方从相邻块 nnz 算出；chroma DC 忽略）；
 /// - `scan`：zigzag 序 → 块内光栅槽位的映射（Intra4x4 luma 传全 16 项
 ///   zigzag，Intra16x16 AC 传 zigzag[1..]，chroma AC 传 chroma zigzag[1..]，
 ///   chroma DC 传 `&[0, 1, 4, 5]` 即 2x2 光栅）；
-/// - `qmul`：16 槽位的反量化乘子（AC 用；DC 忽略）。
+/// - `qmul`：与输出块等长的反量化乘子（16 或 64 槽；AC 用，DC 忽略）。
 ///
 /// 返回 `total_coeff`（供 nnz 缓存）。系数解码顺序为**逆 zigzag**
 /// （level[0] 在最高频），run_before 把零游程铺在其间——与
@@ -407,13 +407,13 @@ pub(crate) enum BlockKind {
 /// # Errors
 /// 位流畸形（token 越界、zeros_left/run 越界、反量化值超出 i16）
 /// → [`H264Error::InvalidData`]。
-pub(crate) fn read_residual(
+pub(crate) fn read_residual<const N: usize>(
     r: &mut BitReader<'_>,
     kind: BlockKind,
     nc: u8,
     scan: &[u8],
-    qmul: &[u32; 16],
-    out: &mut [i16; 16],
+    qmul: &[u32; N],
+    out: &mut [i16; N],
 ) -> Result<u8, H264Error> {
     let max_coeff = scan.len() as u8;
 
@@ -464,7 +464,7 @@ pub(crate) fn read_residual(
     };
 
     // 铺系数（逆 zigzag 游走，FFmpeg STORE_BLOCK 同构）
-    let store = |out: &mut [i16; 16], scan_pos: usize, lv: i32| -> Result<(), H264Error> {
+    let store = |out: &mut [i16; N], scan_pos: usize, lv: i32| -> Result<(), H264Error> {
         let slot = usize::from(scan[scan_pos]);
         let value = match kind {
             BlockKind::LumaDc | BlockKind::ChromaDc => i64::from(lv),

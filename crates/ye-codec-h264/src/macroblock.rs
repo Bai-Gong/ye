@@ -16,6 +16,7 @@ use crate::bitreader::BitReader;
 use crate::cavlc::{self, BlockKind};
 use crate::error::H264Error;
 use crate::inter::InterCtx;
+use crate::intra8x8;
 use crate::mc;
 use crate::sps::Pps;
 
@@ -1427,6 +1428,44 @@ pub(crate) const GOLOMB_TO_INTER_CBP: [u8; 48] = [
     36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
+/// CAVLC encodes an 8×8 transform as four interleaved 16-coefficient groups.
+/// Keep each group's count for subsequent nC prediction (not the CABAC count).
+#[allow(clippy::too_many_arguments)]
+fn read_luma8(
+    r: &mut BitReader<'_>,
+    mb: &mut Macroblock,
+    left: Option<&Macroblock>,
+    top: Option<&Macroblock>,
+    pps: &Pps,
+    qp: u8,
+    inter: bool,
+    blocks: &mut [[i16; 64]; 4],
+) -> Result<(), H264Error> {
+    let qmul = pps.dequant8_coeff(qp, usize::from(inter));
+    for (q, block) in blocks.iter_mut().enumerate() {
+        if mb.cbp & (1 << q) == 0 {
+            continue;
+        }
+        for k in 0..4 {
+            let b = Z_ORDER[q * 4 + k];
+            let ln = if b.is_multiple_of(4) {
+                left.map(|m| m.nnz[b + 3])
+            } else {
+                None
+            };
+            let tn = if b < 4 {
+                top.map(|m| m.nnz[b + 12])
+            } else {
+                None
+            };
+            let nc = nc_luma(&mb.nnz, ln, tn, b);
+            let scan: [u8; 16] = std::array::from_fn(|i| intra8x8::ZIGZAG8[i * 4 + k] as u8);
+            mb.nnz[b] = cavlc::read_residual(r, BlockKind::LumaAc, nc, &scan, &qmul, block)?;
+        }
+    }
+    Ok(())
+}
+
 /// 解码一个 P 片帧间宏块（mb_type 0..4）。解析顺序按 spec 7.3.5 +
 /// FFmpeg `ff_h264_decode_mb_cavlc` 逐字：
 /// 16x16/16x8/8x16：先 ref_idx（te）后 mvd（se，x/y 成对，按分区序；
@@ -1553,34 +1592,54 @@ fn decode_inter_mb(
         cbp: GOLOMB_TO_INTER_CBP[cbp_v as usize],
         ..Macroblock::default()
     };
+    if pps.transform_8x8_mode_flag
+        && mb.cbp & 15 != 0
+        && parts.iter().all(|part| part.2 >= 2 && part.3 >= 2)
+    {
+        mb.transform_8x8 = r.u1()?;
+    }
     if mb.cbp > 0 {
         apply_qp_delta(r, qp)?;
     }
     let mut luma_blocks = [[0i16; 16]; 16];
+    let mut luma8_blocks = [[0i16; 64]; 4];
     let mut chroma_blocks = [[[0i16; 16]; 4]; 2];
-    let qmul = dequant4_coeff(*qp);
-    for &b in Z_ORDER.iter() {
-        let quadrant = 2 * (b >> 3) + ((b & 3) >> 1);
-        if mb.cbp & (1 << quadrant) != 0 {
-            let ln = if b.is_multiple_of(4) {
-                luma_left_nnz(b + 3)
-            } else {
-                None
-            };
-            let tn = if b / 4 == 0 {
-                luma_top_nnz(b + 12)
-            } else {
-                None
-            };
-            let nc = nc_luma(&mb.nnz, ln, tn, b);
-            mb.nnz[b] = cavlc::read_residual(
-                r,
-                BlockKind::LumaAc,
-                nc,
-                &ZIGZAG,
-                &qmul,
-                &mut luma_blocks[b],
-            )?;
+    if mb.transform_8x8 {
+        read_luma8(
+            r,
+            &mut mb,
+            left_mb,
+            top_mb,
+            pps,
+            *qp,
+            true,
+            &mut luma8_blocks,
+        )?;
+    } else {
+        let qmul = dequant4_coeff(*qp);
+        for &b in Z_ORDER.iter() {
+            let quadrant = 2 * (b >> 3) + ((b & 3) >> 1);
+            if mb.cbp & (1 << quadrant) != 0 {
+                let ln = if b.is_multiple_of(4) {
+                    luma_left_nnz(b + 3)
+                } else {
+                    None
+                };
+                let tn = if b / 4 == 0 {
+                    luma_top_nnz(b + 12)
+                } else {
+                    None
+                };
+                let nc = nc_luma(&mb.nnz, ln, tn, b);
+                mb.nnz[b] = cavlc::read_residual(
+                    r,
+                    BlockKind::LumaAc,
+                    nc,
+                    &ZIGZAG,
+                    &qmul,
+                    &mut luma_blocks[b],
+                )?;
+            }
         }
     }
     let qpc = CHROMA_QP[(i32::from(*qp) + pps.chroma_qp_index_offset).clamp(0, 51) as usize];
@@ -1639,14 +1698,21 @@ fn decode_inter_mb(
         mc_partition(pic, &refp, mbx, mby, bx, by, w, h, mv)?;
     }
     let ys = pic.luma_stride();
-    for &b in Z_ORDER.iter() {
-        add_block(
-            &mut pic.luma,
-            ys,
-            mby * 16 + (b / 4) * 4,
-            mbx * 16 + (b % 4) * 4,
-            &mut luma_blocks[b],
-        );
+    if mb.transform_8x8 {
+        for (q, block) in luma8_blocks.iter_mut().enumerate() {
+            let base = (mby * 16 + (q / 2) * 8) * ys + mbx * 16 + (q % 2) * 8;
+            intra8x8::idct8x8_add(&mut pic.luma[base..], ys, block);
+        }
+    } else {
+        for &b in Z_ORDER.iter() {
+            add_block(
+                &mut pic.luma,
+                ys,
+                mby * 16 + (b / 4) * 4,
+                mbx * 16 + (b % 4) * 4,
+                &mut luma_blocks[b],
+            );
+        }
     }
     let cs = pic.chroma_stride();
     for (plane, data) in [&mut pic.cb, &mut pic.cr].iter_mut().enumerate() {
@@ -1734,6 +1800,7 @@ pub(crate) fn decode_macroblock(
         ..Macroblock::default()
     };
     let mut luma_blocks = [[0i16; 16]; 16];
+    let mut luma8_blocks = [[0i16; 64]; 4];
     let mut chroma_blocks = [[[0i16; 16]; 4]; 2];
 
     if mb_type == 25 {
@@ -1777,29 +1844,60 @@ pub(crate) fn decode_macroblock(
     if mb_type == 0 {
         // ---- I_NxN：mb_pred = 16 个 4x4 模式（z 序解析）+ chroma 模式 ----
         let mut modes = [0u8; 16]; // 光栅
-        for &b in Z_ORDER.iter() {
-            let (cx, cy) = (b % 4, b / 4);
-            let left = if cx > 0 {
-                Some(modes[b - 1])
-            } else {
-                left_mb.map(|m| neighbor_i4_mode(m, 3 + cy * 4))
-            };
-            let top = if cy > 0 {
-                Some(modes[b - 4])
-            } else {
-                top_mb.map(|m| neighbor_i4_mode(m, cx + 12))
-            };
-            let prev = prev_i4_mode(left, top);
-            let mut mode = prev;
-            if !r.u1()? {
-                let rem = r.u(3)? as u8;
-                mode = rem + u8::from(rem >= prev);
+        mb.transform_8x8 = pps.transform_8x8_mode_flag && r.u1()?;
+        if mb.transform_8x8 {
+            for q in 0..4 {
+                let left = if q % 2 == 1 {
+                    Some(modes[(q - 1) * 4])
+                } else {
+                    left_mb.map(|m| neighbor_i4_mode(m, 3 + 8 * (q / 2)))
+                };
+                let top = if q >= 2 {
+                    Some(modes[(q - 2) * 4])
+                } else {
+                    top_mb.map(|m| neighbor_i4_mode(m, 12 + 2 * (q % 2)))
+                };
+                let prev = prev_i4_mode(left, top);
+                let mode = if r.u1()? {
+                    prev
+                } else {
+                    let rem = r.u(3)? as u8;
+                    rem + u8::from(rem >= prev)
+                };
+                modes[q * 4..q * 4 + 4].fill(mode);
             }
-            modes[b] = mode;
+            mb.i4_syntax = modes;
+            for q in 0..4 {
+                let avail = intra8x8::quad_avail(&avail, q % 2, q / 2);
+                let mode = intra8x8::rewrite_8x8_mode(modes[q * 4], &avail)?;
+                modes[q * 4..q * 4 + 4].fill(mode);
+            }
+            mb.i4_modes = modes;
+        } else {
+            for &b in Z_ORDER.iter() {
+                let (cx, cy) = (b % 4, b / 4);
+                let left = if cx > 0 {
+                    Some(modes[b - 1])
+                } else {
+                    left_mb.map(|m| neighbor_i4_mode(m, 3 + cy * 4))
+                };
+                let top = if cy > 0 {
+                    Some(modes[b - 4])
+                } else {
+                    top_mb.map(|m| neighbor_i4_mode(m, cx + 12))
+                };
+                let prev = prev_i4_mode(left, top);
+                let mut mode = prev;
+                if !r.u1()? {
+                    let rem = r.u(3)? as u8;
+                    mode = rem + u8::from(rem >= prev);
+                }
+                modes[b] = mode;
+            }
+            mb.i4_syntax = modes;
+            rewrite_4x4_modes(&mut modes, avail.top, avail.left, avail.topleft)?;
+            mb.i4_modes = modes;
         }
-        mb.i4_syntax = modes;
-        rewrite_4x4_modes(&mut modes, avail.top, avail.left, avail.topleft)?;
-        mb.i4_modes = modes;
         let chroma_mode = r.ue()? as u8;
         mb.chroma_syntax = chroma_mode;
         mb.chroma_mode = rewrite_dc_mode(chroma_mode, avail.top, avail.left, avail.topleft, 0)?;
@@ -1817,29 +1915,42 @@ pub(crate) fn decode_macroblock(
             apply_qp_delta(r, qp)?;
         }
         // 残差：luma 逐象限（z 序）；象限 q = 2·(块行/2) + 块列/2
-        let qmul = dequant4_coeff(*qp);
-        for &b in Z_ORDER.iter() {
-            let quadrant = 2 * (b >> 3) + ((b & 3) >> 1);
-            if mb.cbp & (1 << quadrant) != 0 {
-                let ln = if b.is_multiple_of(4) {
-                    luma_left_nnz(b + 3)
-                } else {
-                    None
-                };
-                let tn = if b / 4 == 0 {
-                    luma_top_nnz(b + 12)
-                } else {
-                    None
-                };
-                let nc = nc_luma(&mb.nnz, ln, tn, b);
-                mb.nnz[b] = cavlc::read_residual(
-                    r,
-                    BlockKind::LumaAc,
-                    nc,
-                    &ZIGZAG,
-                    &qmul,
-                    &mut luma_blocks[b],
-                )?;
+        if mb.transform_8x8 {
+            read_luma8(
+                r,
+                &mut mb,
+                left_mb,
+                top_mb,
+                pps,
+                *qp,
+                false,
+                &mut luma8_blocks,
+            )?;
+        } else {
+            let qmul = dequant4_coeff(*qp);
+            for &b in Z_ORDER.iter() {
+                let quadrant = 2 * (b >> 3) + ((b & 3) >> 1);
+                if mb.cbp & (1 << quadrant) != 0 {
+                    let ln = if b.is_multiple_of(4) {
+                        luma_left_nnz(b + 3)
+                    } else {
+                        None
+                    };
+                    let tn = if b / 4 == 0 {
+                        luma_top_nnz(b + 12)
+                    } else {
+                        None
+                    };
+                    let nc = nc_luma(&mb.nnz, ln, tn, b);
+                    mb.nnz[b] = cavlc::read_residual(
+                        r,
+                        BlockKind::LumaAc,
+                        nc,
+                        &ZIGZAG,
+                        &qmul,
+                        &mut luma_blocks[b],
+                    )?;
+                }
             }
         }
     } else {
@@ -1941,6 +2052,11 @@ pub(crate) fn decode_macroblock(
 
     // ---- 重建：luma ----
     match mb.kind {
+        MbKind::Intra4x4 if mb.transform_8x8 => {
+            for (q, block) in luma8_blocks.iter_mut().enumerate() {
+                intra8x8::reconstruct_8x8(pic, mbx, mby, q, mb.i4_modes[q * 4], block);
+            }
+        }
         MbKind::Intra4x4 => {
             for &b in Z_ORDER.iter() {
                 reconstruct_4x4(

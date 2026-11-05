@@ -309,11 +309,13 @@ fn p_skip_weighted_color_changes_match_all_three_planes() {
     };
     for (tag, params) in [
         ("cabac", "cabac=1:bframes=3:weightp=2:keyint=90:scenecut=0"),
-        // CAVLC regression targets Main-profile 4x4 transforms; High-profile
-        // CAVLC 8x8 transform syntax is tracked separately in the waitlist.
         (
             "cavlc",
             "cabac=0:bframes=0:weightp=2:keyint=90:scenecut=0:8x8dct=0",
+        ),
+        (
+            "cavlc-high",
+            "cabac=0:bframes=0:weightp=2:keyint=90:scenecut=0:8x8dct=1",
         ),
     ] {
         let dir =
@@ -366,5 +368,22 @@ fn p_skip_weighted_color_changes_match_all_three_planes() {
         }
         std::fs::remove_file(src).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+}
+
+#[test]
+fn cavlc_high_8x8_motion_matches_all_three_planes() {
+    for (tag, params) in [
+        ("cavlc-high-intra", "cabac=0:8x8dct=1:keyint=1:bframes=0"),
+        (
+            "cavlc-high-ip",
+            "cabac=0:8x8dct=1:keyint=30:scenecut=0:bframes=0:weightp=0",
+        ),
+        (
+            "cavlc-high-no-deblock",
+            "cabac=0:8x8dct=1:keyint=30:scenecut=0:bframes=0:weightp=0:no-deblock=1",
+        ),
+    ] {
+        run_case(tag, params);
     }
 }
