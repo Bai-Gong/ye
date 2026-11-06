@@ -916,22 +916,26 @@ fn build_audio_encode_lane(
             codec: params,
             time_base,
             frame_rate: None,
-            metadata: presentation_metadata(if output.is_some() {
-                stream
-                    .duration
-                    .map(|d| {
-                        d.checked_add(
-                            stream
-                                .start_time
-                                .unwrap_or(Timestamp::new(0, stream.time_base)),
-                        )?
-                        .rescale(time_base)
-                    })
-                    .transpose()?
-                    .map(|t| t.ticks())
-            } else {
-                None
-            }),
+            // PCM has no codec padding on input. Preserve its exact presentation
+            // length when AAC adds a final 1024-sample block, even at native rate.
+            metadata: presentation_metadata(
+                if output.is_some() || stream.codec.codec == CodecId::Pcm {
+                    stream
+                        .duration
+                        .map(|d| {
+                            d.checked_add(
+                                stream
+                                    .start_time
+                                    .unwrap_or(Timestamp::new(0, stream.time_base)),
+                            )?
+                            .rescale(time_base)
+                        })
+                        .transpose()?
+                        .map(|t| t.ticks())
+                } else {
+                    None
+                },
+            ),
         },
         samples: Vec::new(),
         sample_rate,

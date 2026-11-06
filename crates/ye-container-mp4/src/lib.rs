@@ -1,4 +1,7 @@
-//! MP4 解封装（只读）与封装（progressive 与 fMP4）。
+//! MP4/MOV 解封装与 MP4 封装（progressive 与 fMP4）。
+//! QuickTime qt 品牌或经典无 ftyp MOV 支持 H.264/AAC，AAC sound description
+//! v0/v1（含 wave/esds）；其他 QuickTime codec、音频 v2 明确拒绝。
+//! MOV 读取沿用 sample-table/显示时间 seek；输出仍为 MP4，不冒充 MOV writer。
 //!
 //! 读取端对标 libavformat mov demuxer 的只读子集：解析 box 树，读出每路
 //! trak 的元数据（codec、宽高/声道采样率、时基、时长）与样例表

@@ -1158,3 +1158,25 @@ H.264 4×4 逆变换按光栅系数先水平后垂直；B 直接预测按共置�
 与导出的编辑列表处理不变。颜色矩阵一次舍入替代旧逐项 floor；这是
 产品数值修正，不保证与旧颜色实现逐字节相同。详情及消费方升级要点
 见 [integration-readiness.md](integration-readiness.md)。
+
+
+### MOV、PCM WAV 与动画时间线（2026-11-06 后续）
+
+`mp4` feature 现包含受限 QuickTime MOV 导入，`header.format_name` 为 mov，
+注册工厂名仍为 mp4。AAC v0/v1 音频描述支持嵌套 wave/esds；不支持编码、
+v2、空/重复配置明确拒绝。WAV 由新增可选 `wav` feature 提供，含
+`ye-container-wav` / `ye-codec-pcm`。`container::register_enabled` 与
+`register_decoders` 帮助消费方注册所有已启用的真实实现。
+
+`audio_export::{write_wav,export_wav}` 按源呈现时间导出选定音轨，保持采样率
+与声道、剔除 codec padding、补齐时间空隙；文件入口采用输出事务。PCM WAV
+转 AAC 时保留准确呈现时长，不将末尾补齐的 1024 样本扩大为可播放时长。
+
+`animation::TimelineOptions` 增补视频/音频局部时间关键帧和线性包络；
+`timeline::{check_timeline_with_options,render_frames_with_options,render_with_options}`
+消费这些选项，旧静态入口及DTO形状不变。每帧/样本按精确时点求值，原始
+片段索引绑定动画后再排序。音频累加使用f64，最终截幅转F32。此前静态
+时间线章节“关键帧尚不支持”的限制由本节更新；变速、图片、字幕仍未实现。
+
+范围、精度限制、示例及本轮验证见
+[formats-animation-2026-11-06.md](formats-animation-2026-11-06.md)。

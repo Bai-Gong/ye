@@ -17,8 +17,13 @@ ye-codec-h264 = { path = "../ye-codec-h264", optional = true }
 ye-codec-aac = { path = "../ye-codec-aac", optional = true }
 ye-png = { path = "../ye-png", optional = true }
 
+ye-container-wav = { path = "../ye-container-wav", optional = true }
+ye-codec-pcm = { path = "../ye-codec-pcm", optional = true }
+
 [features]
 default = ["mp4"]
+# PCM WAV import/export; optional and independent of MP4/AAC.
+wav = ["dep:ye-container-wav", "dep:ye-codec-pcm"]
 # 容器：MP4 解封装与封装（ye-container-mp4，含 Demuxer/Muxer trait 接线）。
 # 2026-10-24 合流（B 案）后 ye-container-mp4 依赖 ye-container（契约类型），
 # 抽象层反向转发会成环——feature 汇总上提到本门面，re-export 在

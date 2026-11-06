@@ -9,6 +9,35 @@ use std::sync::atomic::AtomicBool;
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match ye_cli::parse_args(&args) {
+        Ok(ye_cli::Command::ExportWav {
+            input,
+            output,
+            options,
+        }) => {
+            match ye::audio_export::export_wav(
+                &input,
+                &output,
+                &options,
+                &AtomicBool::new(false),
+                &|_, _| {},
+            ) {
+                Ok(stats) => {
+                    println!(
+                        "{} → {}: WAV, {}Hz, {} channels, {} samples/channel",
+                        input.display(),
+                        output.display(),
+                        stats.sample_rate,
+                        stats.channels,
+                        stats.sample_frames
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("ye: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(ye_cli::Command::Help) => {
             println!("{}", ye_cli::USAGE);
             ExitCode::SUCCESS

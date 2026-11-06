@@ -264,31 +264,31 @@ pub fn peaks_by_bucket_size(
 }
 
 // ---------------------------------------------------------------------------
-// 消费助手（mp4 + aac feature；纯核上方为无条件编译区）
+// 消费助手（mp4+aac 或 wav feature；纯核上方为无条件编译区）
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use std::io::{Read, Seek, SeekFrom};
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use std::sync::atomic::AtomicBool;
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
-use ye_codec::{AudioFrame, CodecId, CodecRegistry, Frame, MediaType};
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
+use ye_codec::{AudioFrame, CodecRegistry, Frame, MediaType};
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use ye_container::{ContainerError, ContainerRegistry, MediaHeader, ReadSeek};
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use ye_pixfmt::SampleFormat;
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 use crate::convert::{VideoChain, convert_frames, filter_ops};
 
 /// 波形结果（消费助手成功载荷）。
 ///
 /// derive 清单：`Debug, Clone, PartialEq`（全纯值字段；不作 `Eq`——
 /// [`PeakBucket`] 含 f32；不作 `Copy`——peaks 矩阵按值传递）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioPeaks {
     /// 采样率（Hz；首个解码帧口径，无解码帧为 0）。
@@ -309,13 +309,13 @@ pub struct AudioPeaks {
 /// 一份克隆——probe 按值消费 `Box<dyn ReadSeek>`，不经共享则喂泵前
 /// 无法回卷（模块文档「回卷」）。顺序使用（probe 先、泵后），锁无
 /// 竞争。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 struct SharedInput {
     /// 底层输入。
     inner: Arc<Mutex<Box<dyn ReadSeek>>>,
 }
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 impl SharedInput {
     /// 包一份底层输入的克隆视图（喂给 probe / 泵的 `Box<dyn ReadSeek>`）。
     fn share(inner: &Arc<Mutex<Box<dyn ReadSeek>>>) -> Box<dyn ReadSeek> {
@@ -325,14 +325,14 @@ impl SharedInput {
     }
 }
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 impl Read for SharedInput {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         lock_input(&self.inner).read(buf)
     }
 }
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 impl Seek for SharedInput {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         lock_input(&self.inner).seek(pos)
@@ -341,29 +341,25 @@ impl Seek for SharedInput {
 
 /// 锁底层输入（中毒容忍：read/seek 无 panic 路径，锁中毒仅因其它线程
 /// panic 中断 IO——输入是纯数据游标，无不变式可破坏，取内部句柄续用）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 fn lock_input(shared: &Arc<Mutex<Box<dyn ReadSeek>>>) -> MutexGuard<'_, Box<dyn ReadSeek>> {
     shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 消费助手注册表：容器 MP4 + 解码 AAC（`h264` 开启时顺带注册——
-/// 含视频素材的视频帧解码后丢弃；未开时视频流以 `NotRegistered`
-/// 透传，见模块文档）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+/// 消费助手使用门面已启用的容器和解码器（MP4/MOV/AAC、WAV/PCM 等）。
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 fn decode_registries() -> (ContainerRegistry, CodecRegistry) {
     let mut containers = ContainerRegistry::new();
-    crate::container::mp4::register_mp4(&mut containers);
+    crate::container::register_enabled(&mut containers);
     let mut codecs = CodecRegistry::new();
-    codecs.register_decoder(CodecId::Aac, crate::codec_aac::decoder_factory);
-    #[cfg(feature = "h264")]
-    codecs.register_decoder(CodecId::H264, crate::codec_h264::decoder_factory);
+    crate::register_decoders(&mut codecs);
     (containers, codecs)
 }
 
 /// 前置流布局校验：**恰一条音频流**（模块文档「前置流布局校验」）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 fn validate_single_audio_stream(header: &MediaHeader) -> Result<(), ConvertError> {
     let audio = header
         .streams
@@ -385,7 +381,7 @@ fn validate_single_audio_stream(header: &MediaHeader) -> Result<(), ConvertError
 /// 消费助手公共前奏：probe 校验流布局 → 共享游标回卷 0（喂泵前）。
 ///
 /// 返回共享句柄（供 [`convert_frames`] 经 [`SharedInput::share`] 持有）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 fn probe_and_rewind(
     containers: &ContainerRegistry,
     input: Box<dyn ReadSeek>,
@@ -406,7 +402,7 @@ fn probe_and_rewind(
 /// 首帧把 `scale.channels` 从 0 定为该帧声道数并记录采样率；中途声道
 /// 数变化 → [`ConvertError::InvalidData`]（波形无法续算）。返回本帧的
 /// packed f32 样本（小端解包；帧数据长度与 `帧数×声道数` 交叉校验）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 fn scaled_samples(scale: &mut (usize, u32), audio: &AudioFrame) -> Result<Vec<f32>, ConvertError> {
     if audio.format() != SampleFormat::F32 {
         return Err(ConvertError::InvalidData(format!(
@@ -446,7 +442,7 @@ fn scaled_samples(scale: &mut (usize, u32), audio: &AudioFrame) -> Result<Vec<f3
 
 /// 流式分桶游标（桶长入口）：帧到达即喂、满桶即闭，EOF 冲刷尾桶
 /// （不满也闭——与纯核桶长入口边界一致）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 struct StreamBuckets {
     /// 桶长（请求值）。
     bucket_samples: usize,
@@ -460,7 +456,7 @@ struct StreamBuckets {
     filled: usize,
 }
 
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 impl StreamBuckets {
     /// 空游标（bucket_samples 已由入口校验非 0）。
     fn new(bucket_samples: usize) -> Self {
@@ -530,7 +526,7 @@ impl StreamBuckets {
 /// # Errors
 /// `bucket_samples == 0` → [`ConvertError::InvalidArguments`]；流布局
 /// 校验/解封装/解码失败原样透传（不兜底）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 pub fn audio_peaks(
     input: Box<dyn ReadSeek>,
     bucket_samples: usize,
@@ -576,7 +572,7 @@ pub fn audio_peaks(
 /// # Errors
 /// `bucket_count == 0` → [`ConvertError::InvalidArguments`]；流布局
 /// 校验/解封装/解码失败原样透传（不兜底）。
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 pub fn audio_peaks_with_count(
     input: Box<dyn ReadSeek>,
     bucket_count: usize,
@@ -631,7 +627,7 @@ pub fn audio_peaks_with_count(
 
 /// Presentation-aligned, bounded waveform for product timelines. Decode only audio;
 /// retain priming for overlap reconstruction, but exclude it from visible buckets.
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 pub fn audio_peaks_aligned_with_count(
     input: Box<dyn ReadSeek>,
     bucket_count: usize,
@@ -641,7 +637,7 @@ pub fn audio_peaks_aligned_with_count(
 }
 
 /// Presentation-aligned waveform for one explicit container audio stream.
-#[cfg(all(feature = "mp4", feature = "aac"))]
+#[cfg(any(all(feature = "mp4", feature = "aac"), feature = "wav"))]
 pub fn audio_peaks_aligned_stream_with_count(
     input: Box<dyn ReadSeek>,
     stream_index: Option<u32>,

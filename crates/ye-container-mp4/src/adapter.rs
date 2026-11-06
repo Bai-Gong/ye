@@ -15,7 +15,7 @@
 //!   fMP4 等布局选项走具体类型 [`Mp4Writer`]，不经 trait（裁决第 7 条）；
 //! - [`Mp4DemuxerFactory::probe`]：ftyp/styp box 头嗅探——size 合法 +
 //!   类型四字符命中 + major brand 在常见集内 → [`ProbeScore::MAXIMUM`]，
-//!   brand 在拒绝表（qt 族 MOV）→ NONE（明确拒绝，见 [`DENIED_BRANDS`]），
+//!   QuickTime qt brand 同样录取；经典无 ftyp MOV 以结构半命中并在 open 校验，
 //!   brand 可读但不在集内 → [`ProbeScore::EXTENSION`]，其余 → NONE；
 //! - [`register_mp4`]：向注册表注册 demuxer/muxer 工厂（auto-probe 由
 //!   [`ContainerRegistry::open_demuxer`] 驱动）。
@@ -25,6 +25,7 @@
 //! 本层零换算透传。
 
 use std::cmp::Ordering;
+use std::io::{Read, SeekFrom};
 
 use ye_codec::Packet;
 use ye_container::{
@@ -75,68 +76,70 @@ fn map_write_err(e: WriterError) -> ContainerError {
 
 // —— 探测 ——
 
-/// ftyp/styp major brand 常见集（对齐 FFmpeg mov probe 的 brand 表的
-/// 常用子集；命中即视作魔数完全命中。注意 `m4a `/`m4v ` 含空格）。
-/// 不含 `heic` 等 HEIF 静态图片 brand（2026-10-24 评审：HEIC 是 ISOBMFF
-/// 家族但无 moov/trak，命中 MAXIMUM 会让照片被当 MP4 假阳性录取——
-/// 现在 heic 走未知 brand 路径（EXTENSION 半命中），再被读取端
-/// 「至少一条 trak」校验在 open 阶段拒绝）。
-/// 也不含 `qt  `（QuickTime MOV，施工图①同日修订）：qt 族降为
-/// [`DENIED_BRANDS`] 明确拒绝，probe 即拒、不假成功。
-const KNOWN_BRANDS: [[u8; 4]; 12] = [
+/// ISO BMFF and QuickTime share the sample-table demuxer. Probe identifies the
+/// container only; open validates tracks, sample descriptions and codec support.
+const KNOWN_BRANDS: [[u8; 4]; 13] = [
     *b"isom", *b"iso2", *b"mp41", *b"mp42", *b"mp71", *b"avc1", *b"avc3", *b"mp4a", *b"m4v ",
-    *b"dash", *b"msdh", *b"mse6",
+    *b"dash", *b"msdh", *b"mse6", *b"qt  ",
 ];
 
-/// 明确不录取的 major brand（施工图①：qt 族 MOV 在 probe 即拒）。
-/// QuickTime 专有 atom 语义与 codec（SVQ3 等）超出本 MP4 实现的
-/// 声明范围——与其半懂地假成功，不如明确失败，让调用方（剪）按
-/// 探测结果回退 ffprobe（过渡期行为；M4 落地 MOV 支持后移除）。
-/// 注意本表只拦 major brand；compatible brands 里的 `qt  ` 不拦
-/// （major 非 qt 的文件按其 major brand 归类）。
-const DENIED_BRANDS: [[u8; 4]; 1] = [*b"qt  "];
-
-/// ftyp/box 嗅探（[`DemuxerFactory::probe`] 的实现）。
-///
-/// 规则：≥8 字节、首 box size ≥ 8 且类型为 `ftyp`/`styp` 才继续；
-/// major brand（box 载荷前 4 字节）在 [`KNOWN_BRANDS`] → MAXIMUM，
-/// 在 [`DENIED_BRANDS`]（qt 族 MOV）→ NONE（**明确拒绝**：本实现不
-/// 声明支持 QuickTime 专有语义，`open_demuxer`/`probe` 即刻
-/// `UnknownFormat`，不进 open 阶段假成功），
-/// 可打印但不在集内 → EXTENSION（**部分魔数命中**：box 头可信但
-/// brand 未知，如 heic 照片或罕见 brand 的真 MP4——探查管线无文件名
-/// 输入，该档语义见 [`ProbeScore::EXTENSION`]；录取后的硬保证由读取端
-/// 「至少一条 trak」校验兜底，非 MP4 结构的文件 open 即 InvalidData），
-/// 不可打印 → NONE（乱数据）。窗口不足 12 字节（brand 读不到）按
-/// EXTENSION 给分（box 头已可信；后续 open 同样受最少轨道校验约束）。
 fn probe_mp4(head: &[u8]) -> ProbeScore {
-    if head.len() < 8 {
-        return ProbeScore::NONE;
+    let mut at = 0usize;
+    while let Some(header) = head.get(at..at.saturating_add(8)) {
+        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let kind = &header[4..8];
+        if size != 0 && size != 1 && size < 8 {
+            return ProbeScore::NONE;
+        }
+        match kind {
+            b"ftyp" | b"styp" => {
+                let offset = if size == 1 { 16 } else { 8 };
+                let Some(brand) = head.get(at + offset..at + offset + 4) else {
+                    return ProbeScore::EXTENSION;
+                };
+                if KNOWN_BRANDS.iter().any(|known| known == brand) {
+                    return ProbeScore::MAXIMUM;
+                }
+                return if brand.iter().all(|b| (0x20..=0x7e).contains(b)) {
+                    ProbeScore::EXTENSION
+                } else {
+                    ProbeScore::NONE
+                };
+            }
+            // Classic MOV predates ftyp. Actual moov/trak validation occurs on open.
+            b"moov" | b"mdat" => return ProbeScore::EXTENSION,
+            b"wide" | b"free" | b"skip" if size >= 8 => {
+                let Some(next) = at.checked_add(size) else {
+                    return ProbeScore::NONE;
+                };
+                at = next;
+            }
+            _ => return ProbeScore::NONE,
+        }
     }
-    let size = u32::from_be_bytes(head[0..4].try_into().unwrap()) as u64;
-    if size < 8 {
-        return ProbeScore::NONE;
+    ProbeScore::NONE
+}
+
+fn is_quicktime(head: &[u8]) -> bool {
+    let mut at = 0usize;
+    while let Some(header) = head.get(at..at.saturating_add(8)) {
+        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        match &header[4..8] {
+            b"ftyp" | b"styp" => {
+                let offset = if size == 1 { 16 } else { 8 };
+                return head.get(at + offset..at + offset + 4) == Some(b"qt  ");
+            }
+            b"moov" | b"mdat" => return true,
+            b"wide" | b"free" | b"skip" if size >= 8 => {
+                let Some(next) = at.checked_add(size) else {
+                    return false;
+                };
+                at = next;
+            }
+            _ => return false,
+        }
     }
-    match &head[4..8] {
-        b"ftyp" | b"styp" => {}
-        _ => return ProbeScore::NONE,
-    }
-    if head.len() < 12 {
-        return ProbeScore::EXTENSION;
-    }
-    let brand: [u8; 4] = head[8..12].try_into().unwrap();
-    if KNOWN_BRANDS.contains(&brand) {
-        return ProbeScore::MAXIMUM;
-    }
-    if DENIED_BRANDS.contains(&brand) {
-        return ProbeScore::NONE;
-    }
-    let printable = brand.iter().all(|&b| (0x20..=0x7e).contains(&b));
-    if printable {
-        ProbeScore::EXTENSION
-    } else {
-        ProbeScore::NONE
-    }
+    false
 }
 
 // —— 解封装 ——
@@ -157,14 +160,43 @@ pub struct Mp4Demuxer {
     reader: Mp4Reader<Box<dyn ReadSeek>>,
     /// 每轨下一待读样例序号（0-based，统一编址）。
     cursors: Vec<u64>,
+    format: &'static str,
 }
 
 impl Mp4Demuxer {
     /// 绑定输入并完成初始化解析（[`DemuxerFactory::open`] 的实现体）。
-    pub fn new(input: Box<dyn ReadSeek>) -> Result<Self, ContainerError> {
+    pub fn new(mut input: Box<dyn ReadSeek>) -> Result<Self, ContainerError> {
+        let mut head = Vec::new();
+        input.seek(SeekFrom::Start(0))?;
+        (&mut input)
+            .take(ContainerRegistry::PROBE_WINDOW as u64)
+            .read_to_end(&mut head)?;
+        input.seek(SeekFrom::Start(0))?;
+        let format = if is_quicktime(&head) {
+            "mov"
+        } else {
+            FORMAT_NAME
+        };
         let reader = Mp4Reader::from_reader(input).map_err(map_read_err)?;
         let cursors = vec![0u64; reader.streams().len()];
-        Ok(Mp4Demuxer { reader, cursors })
+        if format == "mov" {
+            for stream in reader.streams() {
+                if !matches!(
+                    stream.codec.codec,
+                    ye_codec::CodecId::H264 | ye_codec::CodecId::Aac
+                ) {
+                    return Err(ContainerError::InvalidData(format!(
+                        "unsupported QuickTime codec {:?} on stream {} (supported: H.264/AAC)",
+                        stream.codec.codec, stream.index
+                    )));
+                }
+            }
+        }
+        Ok(Mp4Demuxer {
+            reader,
+            cursors,
+            format,
+        })
     }
 
     fn shifted(&self, si: usize, value: Timestamp) -> Result<Timestamp, ContainerError> {
@@ -244,7 +276,7 @@ impl Mp4Demuxer {
 
 impl Demuxer for Mp4Demuxer {
     fn format_name(&self) -> &str {
-        FORMAT_NAME
+        self.format
     }
 
     /// 流表克隆 + 容器级时长（各轨时长重标度到 canonical 后取最大）。
@@ -304,7 +336,7 @@ impl Demuxer for Mp4Demuxer {
             });
         }
         Ok(MediaHeader {
-            format_name: FORMAT_NAME.to_string(),
+            format_name: self.format.to_string(),
             streams,
             duration,
             start_time: None,
@@ -691,7 +723,7 @@ mod tests {
         );
         assert_eq!(
             f.probe(&[0, 0, 0, 16, b'm', b'o', b'o', b'v']),
-            ProbeScore::NONE
+            ProbeScore::EXTENSION
         );
         assert_eq!(f.probe(&[0u8; 7]), ProbeScore::NONE);
         assert_eq!(f.probe(&[]), ProbeScore::NONE);
@@ -713,50 +745,19 @@ mod tests {
         assert_eq!(f.probe(&ftyp_bytes(b"heic")), ProbeScore::EXTENSION);
     }
 
-    /// qt 族 MOV 在 probe 即拒（施工图①：`qt  ` 移出常见集并进拒绝表，
-    /// 打 NONE 而非 EXTENSION——EXTENSION ≥ MINIMUM 仍会被注册表录取，
-    /// 结构兼容的 MOV 会假成功）。回归：此前 `qt  ` 命中 MAXIMUM。
     #[test]
-    fn qt_brand_is_denied_at_probe() {
+    fn qt_brand_is_detected_but_empty_movie_is_rejected() {
         let f = Mp4DemuxerFactory;
-        assert_eq!(f.probe(&ftyp_bytes(b"qt  ")), ProbeScore::NONE);
-    }
-
-    /// 注册表面：qt brand 样片经 `open_demuxer`/`probe`/`detect` 必须
-    /// 明确失败（`UnknownFormat`），不进 open 阶段——剪对 MOV 按此
-    /// 回退 ffprobe（过渡期行为）。样片带 moov 形态头：即便结构再像
-    /// MP4，brand 拒绝也先于一切结构解析。
-    #[test]
-    fn qt_brand_mov_fails_at_registry_not_fake_success() {
-        let reg = registry();
+        assert_eq!(f.probe(&ftyp_bytes(b"qt  ")), ProbeScore::MAXIMUM);
         let mut data = ftyp_bytes(b"qt  ");
-        // ftyp_bytes 声明 24 字节只给 20：补齐 + moov 占位
         data.extend_from_slice(&[0u8; 4]);
-        data.extend_from_slice(&[0, 0, 0, 16, b'm', b'o', b'o', b'v']);
-        data.extend_from_slice(&[0u8; 8]);
-        // auto-probe 打开：唯一工厂打 NONE < MINIMUM → UnknownFormat
-        match reg.open_demuxer(open_vec(data.clone())) {
-            Err(ContainerError::UnknownFormat) => {}
-            Err(other) => panic!("应为 UnknownFormat，实为 {other:?}"),
-            Ok(_) => panic!("qt 族 MOV 不得被 MP4 工厂录取（假成功）"),
-        }
-        // 一步式 probe 同样明确失败
+        data.extend_from_slice(&[0, 0, 0, 8, b'm', b'o', b'o', b'v']);
         assert!(matches!(
-            reg.probe(open_vec(data.clone())),
-            Err(ContainerError::UnknownFormat)
-        ));
-        // 只打分不打开的 detect 同口径
-        let mut cursor = std::io::Cursor::new(data);
-        assert!(matches!(
-            reg.detect(&mut cursor),
-            Err(ContainerError::UnknownFormat)
+            registry().open_demuxer(open_vec(data)),
+            Err(ContainerError::InvalidData(_))
         ));
     }
 
-    /// 无 moov/trak 的文件（HEIC 照片形态：ftyp heic + free/mdat）经
-    /// 注册表打开 ⇒ Err(InvalidData)，不得返回 0 路流的假成功
-    /// （回归：此前 open_demuxer 返回 Ok(("mp4", 0 流))，ye-cli probe
-    /// 输出「photo.heic: mp4, 0 路流」）。
     #[test]
     fn moovless_file_fails_at_open_not_fake_success() {
         let reg = registry();

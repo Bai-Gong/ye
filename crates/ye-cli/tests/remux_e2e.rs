@@ -126,7 +126,14 @@ fn remux_end_to_end() {
         eprintln!("跳过：PATH 无 ffmpeg/ffprobe（remux_end_to_end）");
         return;
     }
-    let dir = tmp("remux_e2e");
+    let dir = tmp(&format!(
+        "remux_e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("src.mp4");
     let dst = dir.join("out.mp4");
@@ -259,7 +266,14 @@ fn parse_args_rejects_bad_remux_usage() {
 /// 打开失败的错误信息应带路径前缀（不依赖 ffmpeg）。
 #[test]
 fn remux_reports_open_failure_with_path() {
-    let dir = tmp("remux_e2e");
+    let dir = tmp(&format!(
+        "remux_e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let missing = dir.join("no-such-input.mp4");
     let out = dir.join("no-such-output.mp4");
     let err = ye_cli::remux(&missing, &out).expect_err("打开不存在的文件应失败");

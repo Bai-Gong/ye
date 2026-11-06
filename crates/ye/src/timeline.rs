@@ -1,5 +1,6 @@
-//! Static, streaming timeline renderer. Windows are half-open and share time zero.
+//! Streaming timeline renderer with optional clip-local animation. Windows are half-open and share time zero.
 //! Each occurrence owns an input cursor; repeated material can play concurrently.
+use crate::animation::{ClipAnimation, LocalTime, TimelineOptions};
 use crate::compose::ComposeSettings;
 use crate::convert::{ConvertError, ConvertProgress, ConvertStats, FrameSink};
 use std::collections::VecDeque;
@@ -126,6 +127,85 @@ pub fn check_timeline(
                     || !(-1.0..=1.0).contains(&m.pan)
                 {
                     issues.push(format!("第 {} 层音频增益/声像非法", i + 1));
+                }
+            }
+        }
+    }
+    issues
+}
+
+/// Validate static clip shape and all animation tracks before opening any input.
+pub fn check_timeline_with_options(
+    clips: &[TimelineClip],
+    settings: &ComposeSettings,
+    duration_us: i64,
+    options: &TimelineOptions,
+) -> Vec<String> {
+    let mut issues = check_timeline(clips, settings, duration_us);
+    if options.clips.is_empty() {
+        return issues;
+    }
+    if options.clips.len() != clips.len() {
+        issues.push("动画配置数量必须与输入片段数量一致".into());
+        return issues;
+    }
+    for (index, (clip, animation)) in clips.iter().zip(&options.clips).enumerate() {
+        let duration = clip
+            .timeline_end_us
+            .checked_sub(clip.timeline_start_us)
+            .unwrap_or(-1);
+        if animation.fade_in_us < 0
+            || animation.fade_out_us < 0
+            || animation
+                .fade_in_us
+                .checked_add(animation.fade_out_us)
+                .is_none_or(|sum| sum > duration)
+        {
+            issues.push(format!("第 {} 层淡入/淡出长度非法或超出片段", index + 1));
+        }
+        let video = matches!(clip.layer, Layer::Video(_));
+        for (name, track, kind, valid) in [
+            ("x", &animation.x, true, (|_: f64| true) as fn(f64) -> bool),
+            ("y", &animation.y, true, (|_: f64| true) as fn(f64) -> bool),
+            (
+                "scale",
+                &animation.scale,
+                true,
+                (|v: f64| v > 0.0) as fn(f64) -> bool,
+            ),
+            (
+                "rotation",
+                &animation.rotation,
+                true,
+                (|_: f64| true) as fn(f64) -> bool,
+            ),
+            (
+                "opacity",
+                &animation.opacity,
+                true,
+                (|v: f64| (0.0..=1.0).contains(&v)) as fn(f64) -> bool,
+            ),
+            (
+                "gain",
+                &animation.gain,
+                false,
+                (|v: f64| (0.0..=2.0).contains(&v)) as fn(f64) -> bool,
+            ),
+            (
+                "pan",
+                &animation.pan,
+                false,
+                (|v: f64| (-1.0..=1.0).contains(&v)) as fn(f64) -> bool,
+            ),
+        ] {
+            if let Some(track) = track {
+                if kind != video {
+                    issues.push(format!("第 {} 层 {name} 动画与层类型不符", index + 1));
+                } else if !track.validate(duration, valid) {
+                    issues.push(format!(
+                        "第 {} 层 {name} 关键帧须非空、时点严格升序且数值/时点在合法范围",
+                        index + 1
+                    ));
                 }
             }
         }
@@ -391,7 +471,7 @@ impl AudioCursor {
         lo: i64,
         hi: i64,
         cancel: &AtomicBool,
-    ) -> Result<[f32; 2], ConvertError> {
+    ) -> Result<[f64; 2], ConvertError> {
         let center = i64::try_from(phase.div_euclid(denominator))
             .map_err(|_| invalid("audio clock overflow"))?;
         self.ensure(center, cancel)?;
@@ -437,7 +517,9 @@ impl AudioCursor {
         {
             self.blocks.pop_front();
         }
-        Ok(value.map(|v| (v / norm) as f32))
+        // Preserve interpolation overshoot in f64 until all tracks have mixed.
+        // Finite F32 source samples may exceed F32 range after sinc/gain.
+        Ok(value.map(|v| v / norm))
     }
 }
 
@@ -447,6 +529,7 @@ struct ActiveClip {
     start: i64,
     end: i64,
     cursor: Cursor,
+    animation: ClipAnimation,
 }
 enum Cursor {
     Video(Box<VideoCursor>, Transform),
@@ -526,22 +609,23 @@ pub fn blend(
 
 /// Render unencoded RGBA and packed 48kHz stereo PCM for acceptance and encoding.
 #[allow(clippy::too_many_arguments)]
-pub fn render_frames(
+pub fn render_frames_with_options(
     containers: &ContainerRegistry,
     codecs: &CodecRegistry,
     clips: Vec<TimelineClip>,
     settings: &ComposeSettings,
     duration_us: i64,
+    options: &TimelineOptions,
     sink: FrameSink<'_>,
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
 ) -> Result<ConvertStats, ConvertError> {
-    let issues = check_timeline(&clips, settings, duration_us);
+    let issues = check_timeline_with_options(&clips, settings, duration_us, options);
     if !issues.is_empty() {
         return Err(invalid(issues.join("；")));
     }
     let mut active = Vec::new();
-    for c in clips {
+    for (index, c) in clips.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(ConvertError::Cancelled);
         }
@@ -618,6 +702,7 @@ pub fn render_frames(
             start: c.timeline_start_us,
             end: c.timeline_end_us,
             cursor,
+            animation: options.clips.get(index).cloned().unwrap_or_default(),
         });
     }
     active.sort_by_key(|c| match c.cursor {
@@ -680,15 +765,31 @@ pub fn render_frames(
                     ) {
                         return Err(invalid("暂不支持 HDR 色彩转换"));
                     }
-                    let rgba = crate::convert::filter_convert(source, PixelFormat::Rgba8)?;
-                    blend(&mut frame, &rgba, *t)?;
+                    let rgba = if source.format() == PixelFormat::Rgba8 {
+                        source.clone()
+                    } else {
+                        crate::convert::filter_convert(source, PixelFormat::Rgba8)?
+                    };
+                    let time = LocalTime::from_timestamp(time, c.start);
+                    let animation = &c.animation;
+                    let value = ClipAnimation::value;
+                    let animated = Transform {
+                        x: value(&animation.x, t.x, time),
+                        y: value(&animation.y, t.y, time),
+                        scale: value(&animation.scale, t.scale, time),
+                        rotation: value(&animation.rotation, t.rotation, time),
+                        opacity: value(&animation.opacity, t.opacity, time)
+                            * animation.envelope(time, c.end - c.start),
+                        z: t.z,
+                    };
+                    blend(&mut frame, &rgba, animated)?;
                 }
             }
             sink(Frame::Video(frame))?;
             v += 1;
         } else {
             let count = (naudio - a).min(1024) as usize;
-            let mut mixed = vec![[0.0f32; 2]; count];
+            let mut mixed = vec![[0.0f64; 2]; count];
             for c in &mut active {
                 if let Cursor::Audio(cursor, mix) = &mut c.cursor {
                     for (i, out) in mixed.iter_mut().enumerate() {
@@ -708,9 +809,14 @@ pub fn render_frames(
                             c.source_out,
                             cancel,
                         )?;
+                        let time = LocalTime::from_sample(index, RATE, c.start);
+                        let gain =
+                            ClipAnimation::value(&c.animation.gain, f64::from(mix.gain), time)
+                                * c.animation.envelope(time, c.end - c.start);
+                        let pan = ClipAnimation::value(&c.animation.pan, f64::from(mix.pan), time);
                         // Balance pan: center preserves both channels, extremes silence the opposite side.
-                        out[0] += pcm[0] * mix.gain * (1.0 - mix.pan.max(0.0));
-                        out[1] += pcm[1] * mix.gain * (1.0 + mix.pan.min(0.0));
+                        out[0] += pcm[0] * gain * (1.0 - pan.max(0.0));
+                        out[1] += pcm[1] * gain * (1.0 + pan.min(0.0));
                     }
                 }
             }
@@ -726,7 +832,7 @@ pub fn render_frames(
                 .chunks_exact_mut(4)
                 .zip(mixed.into_iter().flatten())
             {
-                dst.copy_from_slice(&s.clamp(-1.0, 1.0).to_le_bytes());
+                dst.copy_from_slice(&(s.clamp(-1.0, 1.0) as f32).to_le_bytes());
             }
             sink(Frame::Audio(frame))?;
             a += count as u64;
@@ -746,7 +852,7 @@ pub fn render_frames(
 
 /// Encoded timeline output, sharing the established encoder/mux/progress contract.
 #[allow(clippy::too_many_arguments)]
-pub fn render(
+pub fn render_with_options(
     containers: &ContainerRegistry,
     codecs: &CodecRegistry,
     clips: Vec<TimelineClip>,
@@ -754,10 +860,11 @@ pub fn render(
     output: Box<dyn WriteSeek>,
     settings: &ComposeSettings,
     duration_us: i64,
+    options: &TimelineOptions,
     progress: ConvertProgress<'_>,
     cancel: &AtomicBool,
 ) -> Result<ConvertStats, ConvertError> {
-    let issues = check_timeline(&clips, settings, duration_us);
+    let issues = check_timeline_with_options(&clips, settings, duration_us, options);
     if !issues.is_empty() {
         return Err(invalid(issues.join("；")));
     }
@@ -769,15 +876,68 @@ pub fn render(
         settings,
         duration_us,
     )?;
-    render_frames(
+    render_frames_with_options(
         containers,
         codecs,
         clips,
         settings,
         duration_us,
+        options,
         &mut |frame| encoder.write(frame),
         progress,
         cancel,
     )?;
     encoder.finish()
+}
+
+/// Static compatibility entry point. Use `render_frames_with_options` for animation.
+#[allow(clippy::too_many_arguments)]
+pub fn render_frames(
+    containers: &ContainerRegistry,
+    codecs: &CodecRegistry,
+    clips: Vec<TimelineClip>,
+    settings: &ComposeSettings,
+    duration_us: i64,
+    sink: FrameSink<'_>,
+    progress: ConvertProgress<'_>,
+    cancel: &AtomicBool,
+) -> Result<ConvertStats, ConvertError> {
+    render_frames_with_options(
+        containers,
+        codecs,
+        clips,
+        settings,
+        duration_us,
+        &TimelineOptions::default(),
+        sink,
+        progress,
+        cancel,
+    )
+}
+
+/// Static compatibility entry point. Use `render_with_options` for animation.
+#[allow(clippy::too_many_arguments)]
+pub fn render(
+    containers: &ContainerRegistry,
+    codecs: &CodecRegistry,
+    clips: Vec<TimelineClip>,
+    output_format: &str,
+    output: Box<dyn WriteSeek>,
+    settings: &ComposeSettings,
+    duration_us: i64,
+    progress: ConvertProgress<'_>,
+    cancel: &AtomicBool,
+) -> Result<ConvertStats, ConvertError> {
+    render_with_options(
+        containers,
+        codecs,
+        clips,
+        output_format,
+        output,
+        settings,
+        duration_us,
+        &TimelineOptions::default(),
+        progress,
+        cancel,
+    )
 }

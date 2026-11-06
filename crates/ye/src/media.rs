@@ -12,7 +12,7 @@ pub struct CapabilityIssue {
 /// 探测只读取容器，不把成功探测等同于支持该素材解码。
 pub fn inspect(input: Box<dyn ReadSeek>) -> Result<MediaHeader, ConvertError> {
     let mut containers = ContainerRegistry::new();
-    crate::container::mp4::register_mp4(&mut containers);
+    crate::container::register_enabled(&mut containers);
     let (_, header) = containers.probe(input)?;
     Ok(header)
 }

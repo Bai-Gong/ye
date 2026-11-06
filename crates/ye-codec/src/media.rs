@@ -32,6 +32,8 @@ pub enum CodecId {
     Vp9,
     /// MPEG-2/4 AAC 家族（音频）。
     Aac,
+    /// Uncompressed integer or floating-point PCM audio.
+    Pcm,
     /// FLAC 无损音频。
     Flac,
     /// Opus（音频）。
@@ -44,12 +46,14 @@ pub enum CodecId {
 
 impl CodecId {
     /// 所属媒体类型：`H264`/`Hevc`/`Av1`/`Vp9` → [`MediaType::Video`]；
-    /// `Aac`/`Flac`/`Opus`/`Mp3` → [`MediaType::Audio`]；
+    /// `Aac`/`Pcm`/`Flac`/`Opus`/`Mp3` → [`MediaType::Audio`]；
     /// [`Unknown`](Self::Unknown) → `None`（无法判定归属）。
     pub fn media_type(self) -> Option<MediaType> {
         match self {
             CodecId::H264 | CodecId::Hevc | CodecId::Av1 | CodecId::Vp9 => Some(MediaType::Video),
-            CodecId::Aac | CodecId::Flac | CodecId::Opus | CodecId::Mp3 => Some(MediaType::Audio),
+            CodecId::Aac | CodecId::Pcm | CodecId::Flac | CodecId::Opus | CodecId::Mp3 => {
+                Some(MediaType::Audio)
+            }
             CodecId::Unknown => None,
         }
     }
@@ -66,6 +70,7 @@ mod tests {
         assert_eq!(CodecId::Av1.media_type(), Some(MediaType::Video));
         assert_eq!(CodecId::Vp9.media_type(), Some(MediaType::Video));
         assert_eq!(CodecId::Aac.media_type(), Some(MediaType::Audio));
+        assert_eq!(CodecId::Pcm.media_type(), Some(MediaType::Audio));
         assert_eq!(CodecId::Flac.media_type(), Some(MediaType::Audio));
         assert_eq!(CodecId::Opus.media_type(), Some(MediaType::Audio));
         assert_eq!(CodecId::Mp3.media_type(), Some(MediaType::Audio));

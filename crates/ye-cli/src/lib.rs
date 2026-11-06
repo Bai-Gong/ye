@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use ye::codec::CodecRegistry;
-use ye::container::mp4::register_mp4;
 use ye::container::{ContainerRegistry, MediaHeader};
 
 /// 用法说明（`--help` 与用法错误共用，输出方负责加换行）。
@@ -38,10 +37,13 @@ ye — 百工·冶命令行（媒体探查 / 转码）
                          转码输出 MP4：视频 H.264 Baseline 重编码（--size 320x240 缩放、
                          --vb 800 视频码率封顶 kbps、--no-video 剥视频），
                          音频 --audio copy 直通 / --audio aac:128 AAC-LC 重编码（kbps）
+  ye export-wav <IN> <OUT> [--format u8|s16|s24|s32|f32] [--stream INDEX]
+                         解码选定音轨为 WAV，保持源采样率/声道，默认 s16
   ye --help              显示本帮助
   ye --version           显示版本
 
-当前支持: MP4 解封装与封装（progressive 与 fMP4 读写），probe/remux/convert 可用。
+当前支持: MP4/fMP4、H.264/AAC MOV 导入、PCM WAV 读写。WAV 转 AAC 请使用
+convert IN OUT --no-video --audio aac:128；导出 WAV 使用 export-wav。
 convert 的参数形态即锻（duan）的进程内接入契约（进度回调 + AtomicBool 取消）。";
 
 /// `convert` 的转码选项（解析层定形，`--vb`/`--audio`/`--no-video`）。
@@ -89,6 +91,12 @@ pub enum Command {
         /// 转码选项（尺寸/码率/音频/剥视频）。
         options: ConvertOptions,
     },
+    /// Decode one selected audio stream to PCM WAV.
+    ExportWav {
+        input: PathBuf,
+        output: PathBuf,
+        options: ye::audio_export::WavExportOptions,
+    },
     /// `ye --help` / `ye -h`。
     Help,
     /// `ye --version` / `ye -V`。
@@ -108,6 +116,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
         Some("remux") => parse_two_paths("remux", &args[1..])
             .map(|(input, output)| Command::Remux { input, output }),
         Some("convert") => parse_convert(&args[1..]),
+        Some("export-wav") => parse_export_wav(&args[1..]),
         Some("--help") | Some("-h") => Ok(Command::Help),
         Some("--version") | Some("-V") => Ok(Command::Version),
         other => Err(format!(
@@ -269,22 +278,21 @@ fn parse_audio(value: &OsString) -> Result<ConvertAudio, String> {
     ))
 }
 
-/// 命令行自用的容器注册表：MP4 demuxer/muxer 已注册（显式构造、
+/// 命令行自用的容器注册表：MP4/MOV 与 WAV 已注册（显式构造、
 /// 显式传递——注册表无全局单例，见 ye-container 契约）。
 pub fn registry() -> ContainerRegistry {
     let mut reg = ContainerRegistry::new();
-    register_mp4(&mut reg);
+    ye::container::register_enabled(&mut reg);
     reg
 }
 
-/// 命令行自用的编解码注册表：H.264 解码/编码 + AAC 解码/编码真工厂
+/// 命令行自用的编解码注册表：H.264/AAC 解码编码 + PCM 解码真工厂
 /// 已注册（直通路径用不到 AAC，`--audio aac` 重编码需要；显式构造、
 /// 显式传递）。
 pub fn codec_registry() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
-    ye::codec_h264::register_h264(&mut reg);
+    ye::register_decoders(&mut reg);
     ye::codec_h264::register_h264_encoder(&mut reg);
-    ye::codec_aac::register_aac(&mut reg);
     ye::codec_aac::register_aac_encoder(&mut reg);
     reg
 }
@@ -304,7 +312,7 @@ pub fn codec_registry() -> CodecRegistry {
 /// Err 载荷为已含路径前缀的用户向错误信息。
 pub fn probe(path: &Path) -> Result<String, String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (format, mut demuxer) = registry()
+    let (_, mut demuxer) = registry()
         .open_demuxer(Box::new(BufReader::new(file)))
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let header = demuxer
@@ -321,7 +329,7 @@ pub fn probe(path: &Path) -> Result<String, String> {
             stream_bytes[si] += pkt.data.len() as u64;
         }
     }
-    Ok(report(&header, &format, &stream_bytes, path))
+    Ok(report(&header, &header.format_name, &stream_bytes, path))
 }
 
 /// 由头信息与每路样例字节数生成报告。
@@ -427,7 +435,9 @@ fn codec_label(codec: ye::container::mp4::CodecId) -> String {
 /// Err 载荷为已含路径前缀的用户向错误信息。
 pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
     let in_file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
-    let out_file = File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let transaction = ye::output::OutputTransaction::new(output)
+        .map_err(|e| format!("{}: {e}", output.display()))?;
+    let out_file = transaction.writer().map_err(|e| e.to_string())?;
     let stats = ye::container::remux(
         &registry(),
         Box::new(BufReader::new(in_file)),
@@ -435,6 +445,7 @@ pub fn remux(input: &Path, output: &Path) -> Result<String, String> {
         Box::new(BufWriter::new(out_file)),
     )
     .map_err(|e| format!("{} → {}: {e}", input.display(), output.display()))?;
+    transaction.commit().map_err(|e| e.to_string())?;
     Ok(format!(
         "{} → {}: MP4, {} 路流, {} 样例直通（不转码）\n",
         input.display(),
@@ -468,8 +479,7 @@ pub type ConvertProgress<'a> = &'a dyn Fn(i64, i64);
 /// - `cancel`：取消旗标 `&AtomicBool`——置位即请求取消，泵每包检查、
 ///   及时退出。
 ///
-/// 失败即清理半成品（删除已创建的输出文件）——泵持有 `WriteSeek`
-/// 抽象、无路径概念，删除归本层。
+/// 通过输出事务写临时文件；成功后提交，失败只清理自有半成品，已有目标不覆盖。
 pub fn convert(
     input: &Path,
     output: &Path,
@@ -479,11 +489,6 @@ pub fn convert(
 ) -> Result<String, String> {
     let ctx = || format!("{} → {}", input.display(), output.display());
     let result = run_convert(input, output, options, progress, cancel);
-    if result.is_err() {
-        // 半成品清理：泵已随错误丢弃输出 writer（文件句柄关闭），
-        // 这里删除残留文件（不存在时忽略）。
-        let _ = std::fs::remove_file(output);
-    }
     result
         .map(|stats| {
             let video_desc = match (options.no_video, options.size) {
@@ -531,7 +536,9 @@ fn run_convert(
     cancel: &AtomicBool,
 ) -> Result<ye::convert::ConvertStats, String> {
     let in_file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
-    let out_file = File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let transaction = ye::output::OutputTransaction::new(output)
+        .map_err(|e| format!("{}: {e}", output.display()))?;
+    let out_file = transaction.writer().map_err(|e| e.to_string())?;
     let settings = ye::convert::VideoEncodeSettings {
         chain: ye::convert::VideoChain {
             format: None,
@@ -553,7 +560,7 @@ fn run_convert(
             bitrate_bps: kbps.saturating_mul(1_000),
         },
     };
-    ye::convert::convert(
+    let stats = ye::convert::convert(
         &registry(),
         &codec_registry(),
         Box::new(BufReader::new(in_file)),
@@ -565,5 +572,66 @@ fn run_convert(
         progress,
         cancel,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+fn parse_export_wav(rest: &[OsString]) -> Result<Command, String> {
+    use ye::{audio_export::WavExportOptions, codec_pcm::PcmFormat};
+    let mut options = WavExportOptions::default();
+    let mut paths = Vec::new();
+    let mut seen_format = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].to_str() {
+            Some("--format") => {
+                if seen_format {
+                    return Err("--format may appear only once".into());
+                }
+                seen_format = true;
+                options.format = match rest.get(i + 1).and_then(|s| s.to_str()) {
+                    Some("u8") => PcmFormat::U8,
+                    Some("s16") => PcmFormat::S16,
+                    Some("s24") => PcmFormat::S24,
+                    Some("s32") => PcmFormat::S32,
+                    Some("f32") => PcmFormat::F32,
+                    _ => return Err("--format requires u8|s16|s24|s32|f32".into()),
+                };
+                i += 2;
+            }
+            Some("--stream") => {
+                if options.stream_index.is_some() {
+                    return Err("--stream may appear only once".into());
+                }
+                options.stream_index = Some(
+                    rest.get(i + 1)
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse().ok())
+                        .ok_or("--stream requires an unsigned container index")?,
+                );
+                i += 2;
+            }
+            Some(text) if text.starts_with('-') => {
+                return Err(format!("unknown WAV option: {text}"));
+            }
+            _ => {
+                paths.push(PathBuf::from(&rest[i]));
+                i += 1;
+            }
+        }
+    }
+    if paths.len() != 2 {
+        return Err(format!(
+            "export-wav requires input and output paths\n{USAGE}"
+        ));
+    }
+    Ok(Command::ExportWav {
+        input: paths.remove(0),
+        output: paths.remove(0),
+        options,
+    })
 }

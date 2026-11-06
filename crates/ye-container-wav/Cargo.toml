@@ -1,0 +1,12 @@
+[package]
+name = "ye-container-wav"
+description = "Streaming RIFF WAVE PCM container"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+ye-container = { path = "../ye-container" }
+ye-codec = { path = "../ye-codec" }
+ye-codec-pcm = { path = "../ye-codec-pcm" }
+ye-pixfmt = { path = "../ye-pixfmt" }
+ye-time = { path = "../ye-time" }

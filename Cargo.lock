@@ -9,8 +9,10 @@ dependencies = [
  "ye-codec",
  "ye-codec-aac",
  "ye-codec-h264",
+ "ye-codec-pcm",
  "ye-container",
  "ye-container-mp4",
+ "ye-container-wav",
  "ye-device",
  "ye-filter",
  "ye-pixfmt",
@@ -58,6 +60,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ye-codec-pcm"
+version = "0.1.0"
+dependencies = [
+ "ye-codec",
+ "ye-pixfmt",
+ "ye-time",
+]
+
+[[package]]
 name = "ye-conformance"
 version = "0.1.0"
 dependencies = [
@@ -81,6 +92,17 @@ name = "ye-container-mp4"
 version = "0.1.0"
 dependencies = [
  "ye-codec",
+ "ye-container",
+ "ye-pixfmt",
+ "ye-time",
+]
+
+[[package]]
+name = "ye-container-wav"
+version = "0.1.0"
+dependencies = [
+ "ye-codec",
+ "ye-codec-pcm",
  "ye-container",
  "ye-pixfmt",
  "ye-time",

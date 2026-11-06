@@ -24,3 +24,18 @@ pub mod mp4 {
 mod remux;
 
 pub use remux::{RemuxStats, remux};
+
+/// WAV PCM container support.
+#[cfg(feature = "wav")]
+pub mod wav {
+    pub use ye_container_wav::*;
+}
+
+/// Register the containers enabled by this facade's features.
+pub fn register_enabled(registry: &mut ContainerRegistry) {
+    let _ = &registry;
+    #[cfg(feature = "mp4")]
+    mp4::register_mp4(registry);
+    #[cfg(feature = "wav")]
+    wav::register_wav(registry);
+}

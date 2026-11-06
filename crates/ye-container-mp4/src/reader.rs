@@ -10,8 +10,8 @@
 //!    同样处理）按大小跳过；容器嵌套深度上限 64 层，超限 ⇒ Malformed
 //!    （防栈溢出）。
 //! 4. stsd entry_count 必须为 1；宽高/声道采样率取 entry 固定字段，
-//!    第一个子 box 按其声明 size 截取的载荷进 extra_data
-//!    （size==0 ⇒ 到 entry 末；越出 entry ⇒ Malformed）。
+//!    H.264/HEVC/AAC 按 avcC/hvcC/esds 类型寻找配置（AAC 支持 wave 嵌套）；
+//!    其余 codec 保留首子 box 载荷。size==0 到 entry 末；越界/重复配置拒绝。
 //! 5. mdhd/tkhd 先读版本字节再按 v0/v1 字段宽度解析。
 //! 6. read_packet 分配前校验样例 offset+size ≤ 文件长度，越界 ⇒ Malformed。
 //!
@@ -1768,7 +1768,7 @@ fn finish_track(
             return Err(malformed(&stss_path, "stss 缺样号 1（首样例须为关键帧）"));
         }
     }
-    let (video, audio, extra_data) = extract_entry_fields(kind, &b.stsd_content, &path)?;
+    let (video, audio, extra_data) = extract_entry_fields(kind, codec, &b.stsd_content, &path)?;
 
     let mdhd_path = format!("{path}.mdia.mdhd");
     // timescale 为 u32；Rational 分母为 i32——超出 i32::MAX 的 timescale
@@ -1888,7 +1888,12 @@ fn finish_track(
 /// SampleEntry 基座找子 box。返回 (视频 (w,h)?, 音频 (声道,采样率)?, extra)。
 type EntryFields = (Option<(u32, u32)>, Option<(u32, u32)>, Vec<u8>);
 
-fn extract_entry_fields(kind: TrackKind, content: &[u8], trak_path: &str) -> Res<EntryFields> {
+fn extract_entry_fields(
+    kind: TrackKind,
+    codec: FourCc,
+    content: &[u8],
+    trak_path: &str,
+) -> Res<EntryFields> {
     let path = format!("{trak_path}.mdia.minf.stbl.stsd");
     let mut c = Cur::new(content);
     match kind {
@@ -1897,7 +1902,11 @@ fn extract_entry_fields(kind: TrackKind, content: &[u8], trak_path: &str) -> Res
             c.skip(24, &path, "entry 固定字段")?;
             let width = c.u16(&path, "width")? as u32;
             let height = c.u16(&path, "height")? as u32;
-            let extra = child_payload(content, 78, &path)?;
+            let extra = match &codec.bytes {
+                b"avc1" | b"avc3" => codec_payload(content, 78, b"avcC", &path, 0)?,
+                b"hvc1" | b"hev1" => codec_payload(content, 78, b"hvcC", &path, 0)?,
+                _ => child_payload(content, 78, &path)?,
+            };
             Ok((Some((width, height)), None, extra))
         }
         TrackKind::Audio => {
@@ -1929,11 +1938,32 @@ fn extract_entry_fields(kind: TrackKind, content: &[u8], trak_path: &str) -> Res
             let (channel_count, sample_rate, fixed_len) = if form_a {
                 (ch_at(8).unwrap() as u32, rate_at(16).unwrap(), 20)
             } else if form_b {
-                (ch_at(16).unwrap() as u32, rate_at(24).unwrap(), 28)
+                {
+                    let version = u16::from_be_bytes(content[8..10].try_into().unwrap());
+                    let fixed_len = match version {
+                        0 => 28,
+                        // QuickTime sound description v1 adds four u32 fields.
+                        // https://developer.apple.com/documentation/quicktime-file-format/sound_sample_description_version_1
+                        1 => 44,
+                        _ => {
+                            return Err(Mp4Error::Unsupported(
+                                "QuickTime sound sample description version (supported: 0/1)",
+                            ));
+                        }
+                    };
+                    if content.len() < fixed_len {
+                        return Err(malformed(&path, "truncated QuickTime sound description"));
+                    }
+                    (ch_at(16).unwrap() as u32, rate_at(24).unwrap(), fixed_len)
+                }
             } else {
                 return Err(malformed(&path, "audio entry 声道/采样率字段不可识别"));
             };
-            let extra = child_payload(content, fixed_len, &path)?;
+            let extra = if codec.bytes == *b"mp4a" {
+                codec_payload(content, fixed_len, b"esds", &path, 0)?
+            } else {
+                child_payload(content, fixed_len, &path)?
+            };
             Ok((None, Some((channel_count, sample_rate)), extra))
         }
         TrackKind::Other => {
@@ -1941,6 +1971,69 @@ fn extract_entry_fields(kind: TrackKind, content: &[u8], trak_path: &str) -> Res
             Ok((None, None, extra))
         }
     }
+}
+
+/// Find codec configuration by atom type; QuickTime AAC nests esds in wave.
+/// Validate every sibling's bounds, and never treat frma/pasp/colr as decoder data.
+fn codec_payload(
+    content: &[u8],
+    mut at: usize,
+    wanted: &[u8; 4],
+    path: &str,
+    depth: u8,
+) -> Res<Vec<u8>> {
+    if depth > 4 {
+        return Err(malformed(path, "sample description atom nesting too deep"));
+    }
+    let mut found = None;
+    while at < content.len() {
+        if content.len() - at < 8 {
+            return Err(malformed(path, "truncated sample description atom"));
+        }
+        let size = u32::from_be_bytes(content[at..at + 4].try_into().unwrap()) as u64;
+        let (size, header) = if size == 1 {
+            if content.len() - at < 16 {
+                return Err(malformed(path, "truncated sample description largesize"));
+            }
+            (
+                u64::from_be_bytes(content[at + 8..at + 16].try_into().unwrap()),
+                16usize,
+            )
+        } else if size == 0 {
+            ((content.len() - at) as u64, 8)
+        } else {
+            (size, 8)
+        };
+        if size < header as u64 || size > (content.len() - at) as u64 {
+            return Err(malformed(path, "子 box 越出 entry 范围"));
+        }
+        let end = at + size as usize;
+        let kind = &content[at + 4..at + 8];
+        let value = if kind == wanted {
+            // A present-but-empty configuration is malformed, not a missing
+            // atom. Reject it before recursion can confuse the two states.
+            if at + header == end {
+                return Err(malformed(path, "empty codec configuration"));
+            }
+            Some(content[at + header..end].to_vec())
+        } else if kind == b"wave" {
+            let nested = codec_payload(&content[at + header..end], 0, wanted, path, depth + 1)?;
+            if nested.is_empty() {
+                None
+            } else {
+                Some(nested)
+            }
+        } else {
+            None
+        };
+        if let Some(value) = value
+            && found.replace(value).is_some()
+        {
+            return Err(malformed(path, "duplicate codec configuration"));
+        }
+        at = end;
+    }
+    Ok(found.unwrap_or_default())
 }
 
 /// entry 内第一个子 box 的载荷：按子 box 声明的 size 截取
@@ -2066,5 +2159,95 @@ mod edit_tests {
         }
         bytes[31] = 1;
         assert!(parse_edit_list(&bytes, "test", &mut TrackBuilder::new("test".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod quicktime_description_tests {
+    use super::*;
+    fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut a = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        a.extend(kind);
+        a.extend(payload);
+        a
+    }
+    fn sound(version: u16) -> Vec<u8> {
+        let mut data = vec![0; if version == 1 { 44 } else { 28 }];
+        data[6..8].copy_from_slice(&1u16.to_be_bytes());
+        data[8..10].copy_from_slice(&version.to_be_bytes());
+        data[16..18].copy_from_slice(&2u16.to_be_bytes());
+        data[18..20].copy_from_slice(&16u16.to_be_bytes());
+        data[24..28].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+        data
+    }
+    #[test]
+    fn sound_v1_wave_finds_esds_after_frma_and_rejects_duplicates() {
+        let payload = [0, 0, 0, 0, 3, 2, 0x11, 0x90];
+        let mut nested = atom(b"frma", b"mp4a");
+        nested.extend(atom(b"esds", &payload));
+        nested.extend(atom(&[0; 4], &[]));
+        let mut data = sound(1);
+        data.extend(atom(b"wave", &nested));
+        let (_, audio, extra) =
+            extract_entry_fields(TrackKind::Audio, FourCc::new(*b"mp4a"), &data, "test").unwrap();
+        assert_eq!(audio, Some((2, 48000)));
+        assert_eq!(extra, payload);
+        data.extend(atom(b"esds", &payload));
+        assert!(
+            extract_entry_fields(TrackKind::Audio, FourCc::new(*b"mp4a"), &data, "test").is_err()
+        );
+    }
+    #[test]
+    fn empty_nested_configuration_cannot_hide_a_duplicate() {
+        let payload = [0, 0, 0, 0, 3, 2, 0x11, 0x90];
+        let empty = atom(b"wave", &atom(b"esds", &[]));
+        let valid = atom(b"esds", &payload);
+        for suffix in [
+            empty.clone(),
+            [empty.clone(), valid.clone()].concat(),
+            [valid, empty].concat(),
+        ] {
+            let mut data = sound(1);
+            data.extend(suffix);
+            let error =
+                extract_entry_fields(TrackKind::Audio, FourCc::new(*b"mp4a"), &data, "test")
+                    .unwrap_err();
+            assert!(matches!(error, Mp4Error::Malformed { ref reason, .. }
+                if reason == "empty codec configuration"));
+        }
+    }
+
+    #[test]
+    fn sound_v2_truncated_v1_and_bad_child_lengths_fail() {
+        let codec = FourCc::new(*b"mp4a");
+        assert!(matches!(
+            extract_entry_fields(TrackKind::Audio, codec, &sound(2), "test"),
+            Err(Mp4Error::Unsupported(_))
+        ));
+        let data = sound(1);
+        for len in 28..44 {
+            assert!(extract_entry_fields(TrackKind::Audio, codec, &data[..len], "test").is_err());
+        }
+        for suffix in [
+            vec![0, 0, 0, 7, b'e', b's', b'd', b's'],
+            vec![0, 0, 0, 20, b'e', b's', b'd', b's'],
+            vec![0, 0, 0],
+        ] {
+            let mut data = sound(0);
+            data.extend(suffix);
+            assert!(extract_entry_fields(TrackKind::Audio, codec, &data, "test").is_err());
+        }
+    }
+    #[test]
+    fn video_config_is_found_by_type_not_first_child() {
+        let mut data = vec![0; 78];
+        data[24..26].copy_from_slice(&96u16.to_be_bytes());
+        data[26..28].copy_from_slice(&64u16.to_be_bytes());
+        data.extend(atom(b"pasp", &[0, 0, 0, 1, 0, 0, 0, 1]));
+        data.extend(atom(b"avcC", &[1, 100, 0, 30]));
+        let (video, _, extra) =
+            extract_entry_fields(TrackKind::Video, FourCc::new(*b"avc1"), &data, "test").unwrap();
+        assert_eq!(video, Some((96, 64)));
+        assert_eq!(extra, [1, 100, 0, 30]);
     }
 }

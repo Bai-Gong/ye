@@ -38,6 +38,8 @@ ye/
 │   ├── ye-container/     # 封装/解封装 trait 与注册表（Stream ⇄ Packet）
 │   ├── ye-container-mp4/ # MP4 解封装与封装实现（feature `mp4`，progressive 与 fMP4）
 │   ├── ye-codec-h264/    # H.264 解码器与编码器（含 AAC 见 ye-codec-aac）
+│   ├── ye-container-wav/ # RIFF WAV 读写（含受限 WAVE_FORMAT_EXTENSIBLE）
+│   ├── ye-codec-pcm/     # U8/S16/S24/S32/F32 PCM 编解码
 │   ├── ye-filter/        # 媒体处理图（对标 lavfi）
 │   ├── ye-device/        # 硬件加速后端（VideoToolbox / D3D11VA / VA-API / NVENC）
 │   └── ye-cli/           # `ye` 命令行（对标 ffmpeg / ffprobe）
@@ -79,8 +81,9 @@ for s in reader.streams() {
 
 ## 构建与测试
 
-在 `ye/` 下执行：`cargo test`、`cargo clippy --all-targets -- -D warnings`、
-`cargo fmt --check`。
+在 `ye/` 下执行：`cargo test --workspace --release --all-features`、
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`、
+`cargo fmt --all --check`。外部参考工具仅用于测试。
 
 ## 文档
 
@@ -90,6 +93,7 @@ for s in reader.streams() {
 | [docs/contracts.md](docs/contracts.md) | 各层已落地的接口契约 |
 | [docs/roadmap.md](docs/roadmap.md) | 里程碑、排期与修订记录 |
 | [docs/waitlist.md](docs/waitlist.md) | 能力缺口等待清单 |
+| [docs/formats-animation-2026-11-06.md](docs/formats-animation-2026-11-06.md) | MOV/WAV 支持范围、关键帧与淡入淡出接口 |
 | [docs/integration-readiness.md](docs/integration-readiness.md) | 剪、锻接入入口与升级要点 |
 | [docs/validation-2026-11-06.md](docs/validation-2026-11-06.md) | 最新回归与连续抽帧性能 |
 | [docs/m2-jian-plan.md](docs/m2-jian-plan.md)、[docs/m3-plan.md](docs/m3-plan.md) | 历史施工图归档 |

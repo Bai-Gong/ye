@@ -1,0 +1,10 @@
+[package]
+name = "ye-codec-pcm"
+description = "PCM little-endian decoder and encoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+ye-codec = { path = "../ye-codec" }
+ye-pixfmt = { path = "../ye-pixfmt" }
+ye-time = { path = "../ye-time" }
