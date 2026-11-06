@@ -89,12 +89,6 @@ impl GrabState {
             // 已取得的帧不被后续调用覆盖。
             return Ok(());
         }
-        if video.format() != PixelFormat::Rgba8 {
-            return Err(ConvertError::InvalidData(format!(
-                "抽帧链要求 rgba8 帧，收到 {}（链配置与解码器输出不符）",
-                video.format().name()
-            )));
-        }
         let Some(pts) = video.pts() else {
             // 无 pts：跳过时点判定（计数已记 frames_seen）——不猜帧序。
             return Ok(());
@@ -103,7 +97,12 @@ impl GrabState {
         self.saw_pts = true;
         self.latest_pts_us = Some(self.latest_pts_us.map_or(pts_us, |old| old.max(pts_us)));
         if ye_time::Timestamp::compare(pts, ye_time::Timestamp::new(self.time_us, MICRO)).is_ge() {
-            self.grabbed = Some(tight_rgba(&video));
+            let rgba = if video.format() == PixelFormat::Rgba8 {
+                video
+            } else {
+                filter_convert(&video, PixelFormat::Rgba8)?
+            };
+            self.grabbed = Some(tight_rgba(&rgba));
             // 通知调用方停止读取后续包。
             cancel.store(true, Ordering::Relaxed);
         }
@@ -189,10 +188,7 @@ pub fn decode_frame_rgba(
                 "video decoder returned audio".into(),
             ));
         };
-        state.feed(
-            Frame::Video(filter_convert(&video, PixelFormat::Rgba8)?),
-            &cancel,
-        )?;
+        state.feed(Frame::Video(video), &cancel)?;
         if let Some(frame) = state.grabbed.take() {
             return Ok(frame);
         }
@@ -371,9 +367,9 @@ mod tests {
         assert_eq!(state.latest_pts_us, Some(100));
     }
 
-    /// 音频帧丢弃不计视频帧数；非 rgba8 视频帧明确 Err。
+    /// 音频不计视频帧；仅选中的 YUV 视频帧执行转换。
     #[test]
-    fn 音频帧丢弃且非rgba帧明确报错() {
+    fn 音频帧丢弃且选中yuv帧才转换() {
         let cancel = AtomicBool::new(false);
         let mut state = state_at(0);
         let audio = AudioFrame::new(SampleFormat::F32, ChannelLayout::MONO, 48_000, 1, None)
@@ -382,13 +378,10 @@ mod tests {
             .feed(Frame::Audio(audio), &cancel)
             .expect("音频帧丢弃");
         assert_eq!(state.frames_seen, 0, "音频不进视频计数");
-        assert!(
-            matches!(
-                state.feed(Frame::Video(yuv_frame()), &cancel),
-                Err(ConvertError::InvalidData(_))
-            ),
-            "链输出非 rgba8 是数据驱动失败"
-        );
+        let mut video = yuv_frame();
+        video.set_pts(Some(Timestamp::new(0, MICRO)));
+        state.feed(Frame::Video(video), &cancel).unwrap();
+        assert!(state.grabbed.is_some());
     }
 
     /// EOF 三形 Err 各述其因：无视频帧 / 全帧无 pts / 时点超出最晚 pts。

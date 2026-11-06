@@ -240,7 +240,10 @@ pub(crate) fn pred_spatial_direct(
         }
     };
 
-    if !is8x8 && col_is16 {
+    // Direct/skip macroblocks can retain a 16x16 syntax tag while their
+    // derived motion differs by quadrant. Only collapse genuinely uniform
+    // motion; otherwise each quadrant needs its own colocated-zero test.
+    if !is8x8 && col_is16 && uniform_motion(col_mb) {
         // 16x16 直接：共置 16x16/intra → col_zero 判定按 l1mv0[0]
         let zero = col_zero_flag(col_mb, 0, ctx.col_is_long);
         parts.push(quad_part(0, 0, zero));
@@ -261,6 +264,15 @@ pub(crate) fn pred_spatial_direct(
         parts.push(quad_part(x8, y8, zero));
     }
     Ok(())
+}
+
+fn uniform_motion(mb: &crate::macroblock::Macroblock) -> bool {
+    (1..16).all(|b| {
+        mb.mv[b] == mb.mv[0]
+            && mb.mv_l1[b] == mb.mv_l1[0]
+            && mb.ref_idx[b] == mb.ref_idx[0]
+            && mb.ref_idx_l1[b] == mb.ref_idx_l1[0]
+    })
 }
 
 /// col_zero_flag（FFmpeg：共置非 intra 且非长期参考，且
@@ -729,5 +741,30 @@ pub(crate) fn write_parts(mb: &mut crate::macroblock::Macroblock, parts: &[MvPar
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macroblock::Macroblock;
+
+    #[test]
+    fn direct_syntax_shape_does_not_imply_uniform_motion() {
+        let mut mb = Macroblock {
+            kind: MbKind::InterB,
+            shape: InterShape::P16x16,
+            ref_idx: [0; 16],
+            ref_idx_l1: [0; 16],
+            ..Macroblock::default()
+        };
+        assert!(uniform_motion(&mb));
+        assert!(col_zero_flag(&mb, 0, false));
+        for b in [2, 3, 6, 7] {
+            mb.mv[b] = [0, 16];
+        }
+        assert!(!uniform_motion(&mb));
+        assert!(!col_zero_flag(&mb, quad_center_block(1, 0), false));
+        assert!(col_zero_flag(&mb, quad_center_block(0, 0), false));
     }
 }

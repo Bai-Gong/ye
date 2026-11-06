@@ -55,12 +55,10 @@
 //!
 //! - **sine 族**：`w[n] = sin((n+0.5)·π/(2M))`，对称且严格满足
 //!   功率互补（TDAC）`w²[n] + w²[n+M] = 1`；
-//! - **KBD 族**（Kaiser-Bessel Derived）：Kaiser 核
-//!   `p[j] = I₀(πα·√(1−((2j−(M−1))/M)²))`（j=0..M−1，对称），
-//!   半格累加 `w²[n] = (S(n)+S(n−1))/(2·S(M−1))` 后开方、镜像对称
-//!   延拓——半格错位使对称性与 TDAC **代数精确**成立。α 按规范
-//!   取值：长窗（2048/1920）α=4，短窗（256/240）α=6。I₀ 为第一类
-//!   修正贝塞尔函数（幂级数实现）。
+//! - **KBD 族**（Kaiser-Bessel Derived）：Kaiser 核在整数端点
+//!   `p[j] = I₀(πα·√(1−(2j/M−1)²))`（j=0..=M）上取样；
+//!   `w²[n] = Σ(j=0..n)p[j] / Σ(j=0..M)p[j]`，再镜像延拓。
+//!   α：长窗 4、短窗 6；包含两端的归一化保证 TDAC 功率互补。
 //!
 //! 表为 f32（贴近主链实际消费精度），计算在 f64 中进行。
 //!
@@ -239,35 +237,26 @@ fn build_sine(len: usize) -> Vec<f32> {
         .collect()
 }
 
-/// KBD 窗生成（对称半格累加构造，见模块文档）。
+/// KBD 窗生成（AAC 整数端点累加构造，见模块文档）。
 fn build_kbd(len: usize) -> Vec<f32> {
     let m = len / 2;
     let alpha = kbd_alpha(len);
-    // 对称 Kaiser 核 p[j] = I0(πα√(1−((2j−(M−1))/M)²))，j = 0..M−1
-    let mut p = vec![0.0f64; m];
-    let mf = m as f64;
-    let center = (m - 1) as f64;
-    for (j, pj) in p.iter_mut().enumerate() {
-        let u = (2.0 * j as f64 - center) / mf;
-        let inner = 1.0 - u * u;
-        let arg = if inner > 0.0 {
-            std::f64::consts::PI * alpha * inner.sqrt()
-        } else {
-            0.0
-        };
-        *pj = bessel_i0(arg);
-    }
-    // 前缀和 S[n] = Σ_{j<n} p[j]；半格均值 u[n] = (S(n)+S(n−1))/(2·S(M))
-    let mut s = vec![0.0f64; m + 1];
-    for j in 0..m {
-        s[j + 1] = s[j] + p[j];
-    }
-    let total = s[m];
+    // AAC 的 Kaiser 核在整数端点 j=0..=M 上取样；包含两端的
+    // 归一化和保证 w[n]^2 + w[M-1-n]^2 = 1。
+    let kernel: Vec<f64> = (0..=m)
+        .map(|j| {
+            let u = 2.0 * j as f64 / m as f64 - 1.0;
+            bessel_i0(std::f64::consts::PI * alpha * (1.0 - u * u).max(0.0).sqrt())
+        })
+        .collect();
+    let total: f64 = kernel.iter().sum();
+    let mut cumulative = 0.0;
     let mut w = vec![0.0f32; len];
     for n in 0..m {
-        let v = ((s[n + 1] + s[n]) / (2.0 * total)).sqrt() as f32;
+        cumulative += kernel[n];
+        let v = (cumulative / total).sqrt() as f32;
         w[n] = v;
-        w[len - 1 - n] = v; // 镜像对称延拓
+        w[len - 1 - n] = v;
     }
     w
 }
@@ -548,23 +537,27 @@ mod tests {
 
     #[test]
     fn kbd_table_golden() {
+        // AAC KBD 标准整数端点公式；参考 FFmpeg libavcodec/kbdwin.c。
+        // 中点也锁定，避免只检查近零/近一端点而漏过错误窗形。
         // KBD 长窗 α=4（首尾相等：对称构造）
         let w = kbd_table(2048).unwrap();
-        assert!((w[0] as f64 - 2.148452073462322e-4).abs() < TOL_WIN);
-        assert!((w[1024] as f64 - 0.9999999769207681).abs() < TOL_WIN);
-        assert!((w[2047] as f64 - 2.148452073462322e-4).abs() < TOL_WIN);
+        assert!((w[512] as f64 - 0.7080928462716053).abs() < TOL_WIN);
+        assert!((w[0] as f64 - 2.925615348376497e-4).abs() < TOL_WIN);
+        assert!((w[1024] as f64 - 0.9999999572038732).abs() < TOL_WIN);
+        assert!((w[2047] as f64 - 2.925615348376497e-4).abs() < TOL_WIN);
         let w = kbd_table(1920).unwrap();
-        assert!((w[0] as f64 - 2.2244004163424167e-4).abs() < TOL_WIN);
-        assert!((w[960] as f64 - 0.9999999752602136).abs() < TOL_WIN);
+        assert!((w[0] as f64 - 3.0215625309493735e-4).abs() < TOL_WIN);
+        assert!((w[960] as f64 - 0.9999999543507984).abs() < TOL_WIN);
         // KBD 短窗 α=6
         let w = kbd_table(256).unwrap();
-        assert!((w[0] as f64 - 5.310323524847102e-5).abs() < TOL_WIN);
-        assert!((w[128] as f64 - 0.9999999985900232).abs() < TOL_WIN);
-        assert!((w[255] as f64 - 5.310323524847102e-5).abs() < TOL_WIN);
+        assert!((w[64] as f64 - 0.7166758128747093).abs() < TOL_WIN);
+        assert!((w[0] as f64 - 4.379570409412748e-5).abs() < TOL_WIN);
+        assert!((w[128] as f64 - 0.9999999990409681).abs() < TOL_WIN);
+        assert!((w[255] as f64 - 4.379570409412748e-5).abs() < TOL_WIN);
         let w = kbd_table(240).unwrap();
-        assert!((w[0] as f64 - 5.645269558308988e-5).abs() < TOL_WIN);
-        assert!((w[120] as f64 - 0.9999999984065465).abs() < TOL_WIN);
-        assert!((w[239] as f64 - 5.645269558308988e-5).abs() < TOL_WIN);
+        assert!((w[0] as f64 - 4.523200869094999e-5).abs() < TOL_WIN);
+        assert!((w[120] as f64 - 0.9999999989770326).abs() < TOL_WIN);
+        assert!((w[239] as f64 - 4.523200869094999e-5).abs() < TOL_WIN);
         assert!(matches!(
             kbd_table(512),
             Err(FilterbankError::UnsupportedWindowLen(512))

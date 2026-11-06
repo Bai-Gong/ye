@@ -113,7 +113,7 @@ CONFORMANCE pending=Q（待网络清册，不参与断言）
 - **参考侧**：`ffmpeg -i <vec> -f s16le -c:a pcm_s16le`（runner 内
   `-map 0:a:0 -v error`；**mp4 条带 `-ignore_editlist 1`**——我方
   解码器按裸码流语义输出全部存储帧，ffmpeg 默认按 edit list 裁去
-  1 个 priming 帧，两侧口径须一致）。
+  1 个 priming 帧，两侧口径须一致；skip_manual 还明确禁止新版 FFmpeg 按尾包时长裁 padding）。
 - **我方侧**：`ye-codec-aac` 解码（f32 归一化）→ s16 →
   `<cache>/<name>.our.pcm`（交错、逐帧顺序，无 padding）。
 - **容差**（施工图③原文定死）：100% 样本 |Δ|≤4 且**每帧** |Δ|≤1

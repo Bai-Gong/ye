@@ -522,9 +522,9 @@ fn h264_run(name: &str, vec_path: &Path, data: &[u8], cache_dir: &Path) -> Resul
 /// `-f s16le` 参考按施工图③双层容差（100% |Δ|≤4 且每帧 |Δ|≤1 占比
 /// ≥999‰，逐帧判定）裁决；失败落 `<cache>/failures/<name>.fail.txt`。
 ///
-/// MP4 向量参考侧带 `-ignore_editlist 1`：我方解码器按裸码流语义输出
-/// 全部存储帧（无容器级 priming 裁剪），ffmpeg 默认按 edit list 裁去
-/// 首帧——两侧口径须一致（见 manifest/README 登记）。
+/// MP4 参考使用 `-ignore_editlist 1 -flags2 +skip_manual`，保留全部
+/// priming/padding；新版 FFmpeg 即使忽略 edit list 仍可能按尾包时长
+/// 裁尾，skip_manual 显式关闭此行为，与裸解码器的完整帧契约对齐。
 fn aac_run(
     name: &str,
     container: &str,
@@ -639,7 +639,8 @@ fn aac_run(
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
     if container == "mp4" {
-        cmd.arg("-ignore_editlist").arg("1");
+        // 裸解码保留完整 AAC 帧；新版 FFmpeg 还会按尾包 duration 裁尾。
+        cmd.args(["-ignore_editlist", "1", "-flags2", "+skip_manual"]);
     }
     cmd.arg("-i")
         .arg(vec_path)

@@ -318,3 +318,84 @@ fn png出口与encode_rgba逐字节一致() {
     assert_eq!(png, manual, "PNG 出口与 encode_rgba 逐字节一致");
     assert_eq!(&png[0..8], &ye::png::SIGNATURE, "合法 PNG 签名开头");
 }
+
+#[test]
+fn sequential_grabs_match_independent_frames_and_stop_on_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use ye::frame_sequence::decode_frames_rgba;
+    let (mp4, _) = produced();
+    let cancel = AtomicBool::new(false);
+    let times = [-50, 0, 1, 1, 39_999, 40_000, 80_001, 440_000];
+    let mut count = 0;
+    decode_frames_rgba(open(&mp4), &times, None, &cancel, |index, frame| {
+        assert_eq!(index, count);
+        assert_eq!(*frame, decode_frame_rgba(open(&mp4), times[index]).unwrap());
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, times.len());
+
+    let mut delivered = Vec::new();
+    let result = decode_frames_rgba(open(&mp4), &[0, 480_000], None, &cancel, |index, _| {
+        delivered.push(index);
+        Ok(())
+    });
+    assert!(matches!(result, Err(ConvertError::InvalidData(_))));
+    assert_eq!(delivered, [0]);
+
+    delivered.clear();
+    let result = decode_frames_rgba(open(&mp4), &[0, 0, 40_000], None, &cancel, |index, _| {
+        delivered.push(index);
+        cancel.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+    assert!(matches!(result, Err(ConvertError::Cancelled)));
+    assert_eq!(delivered, [0]);
+    cancel.store(false, Ordering::Relaxed);
+    delivered.clear();
+    let result = decode_frames_rgba(open(&mp4), &[0, 40_000], None, &cancel, |index, _| {
+        delivered.push(index);
+        Err(ConvertError::InvalidArguments("sink failed".into()))
+    });
+    assert!(
+        matches!(result, Err(ConvertError::InvalidArguments(message)) if message == "sink failed")
+    );
+    assert_eq!(delivered, [0]);
+    assert!(decode_frames_rgba(open(&mp4), &[0], Some(999), &cancel, |_, _| Ok(())).is_err());
+}
+
+#[test]
+fn sequence_validates_requests_before_opening_media() {
+    use std::sync::atomic::AtomicBool;
+    use ye::frame_sequence::decode_frames_rgba;
+    let cancel = AtomicBool::new(false);
+    assert!(
+        decode_frames_rgba(open(&[]), &[], None, &cancel, |_, _| panic!(
+            "empty request"
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        decode_frames_rgba(open(&[]), &[1, 0], None, &cancel, |_, _| panic!(
+            "invalid order"
+        )),
+        Err(ConvertError::InvalidArguments(_))
+    ));
+    assert!(matches!(
+        decode_frames_rgba(
+            open(&[]),
+            &[0],
+            None,
+            &AtomicBool::new(true),
+            |_, _| panic!("cancelled")
+        ),
+        Err(ConvertError::Cancelled)
+    ));
+    assert!(
+        decode_frames_rgba(open(&[]), &[0], None, &cancel, |_, _| panic!(
+            "invalid media"
+        ))
+        .is_err()
+    );
+}

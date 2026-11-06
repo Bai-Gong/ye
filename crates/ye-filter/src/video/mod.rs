@@ -48,7 +48,7 @@
 //!
 //! | 对拍 | ffmpeg 参考 | 容差（写死） | 实测基线 |
 //! | --- | --- | --- | --- |
-//! | 转换核（同尺寸 yuv420p→rgba/rgb24） | `-sws_flags bilinear` + `-pix_fmt` 直转 | 1 | 有限范围 1（约 0.2% 像素 ±1）、全程范围 0 |
+//! | 转换核（同尺寸 yuv420p→rgba/rgb24） | `-cpuflags 0 -sws_flags neighbor+full_chroma_int+accurate_rnd`，RGB48 后量化至 8 位 | 1 | 有限/全程范围均 ≤1（全字节立方体随机输入） |
 //! | 平面缩放（yuv420p→yuv420p） | `-sws_flags bilinear -vf scale=WxH:flags=bilinear` | 2 | ≤2（多为 1） |
 //! | 缩放+转换链 | `scale=WxH:flags=bilinear,format=yuv420p,format=rgba`（两段式） | 4 | ≤4 |
 //! | 平面域裁剪（M3） | `-vf crop=CW:CH:X:Y` | 0 | 0（纯字节搬运） |

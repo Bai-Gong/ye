@@ -61,7 +61,7 @@ $ cargo run -p ye-cli -- convert 素材.mp4 出片.mp4 --size 320x240   # 转码
 作为库使用：只依赖门面 `ye`，容器能力按 feature 开启（`mp4` 默认开启）：
 
 ```toml
-ye = { path = "../ye", features = ["mp4"] }
+ye = { path = "../ye/crates/ye", features = ["mp4"] }
 ```
 
 ```rust
@@ -90,6 +90,8 @@ for s in reader.streams() {
 | [docs/contracts.md](docs/contracts.md) | 各层已落地的接口契约 |
 | [docs/roadmap.md](docs/roadmap.md) | 里程碑、排期与修订记录 |
 | [docs/waitlist.md](docs/waitlist.md) | 能力缺口等待清单 |
+| [docs/integration-readiness.md](docs/integration-readiness.md) | 剪、锻接入入口与升级要点 |
+| [docs/validation-2026-11-06.md](docs/validation-2026-11-06.md) | 最新回归与连续抽帧性能 |
 | [docs/m2-jian-plan.md](docs/m2-jian-plan.md)、[docs/m3-plan.md](docs/m3-plan.md) | 历史施工图归档 |
 
 ## 分支与协作

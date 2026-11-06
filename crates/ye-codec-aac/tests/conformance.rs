@@ -6,7 +6,7 @@
 //!    （runner 主口径的接线文件，写完即被 `cargo run -p ye-conformance`
 //!    自动纳入对拍）；
 //! 3. 本测试内以 ffmpeg `-f s16le` 为 oracle（MP4 条带
-//!    `-ignore_editlist 1`，对齐我方裸码流语义）、用 ye-conformance 的
+//!    `-ignore_editlist 1 -flags2 +skip_manual`，对齐我方裸码流语义）、用 ye-conformance 的
 //!    比较器与施工图③容差（100% |Δ|≤4 且每帧 |Δ|≤1 占比 ≥99.9%，
 //!    逐帧判定）独立裁决。
 //!
@@ -181,7 +181,7 @@ fn aac_vectors_pass_conformance() {
         std::fs::write(cache.join(format!("{}.our.pcm", entry.name)), &our_pcm)
             .expect("写 our.pcm");
 
-        // oracle：ffmpeg -f s16le（mp4 加 -ignore_editlist 1）
+        // 裸码流对拍保留 priming/padding；ignore_editlist 不关闭新版尾包裁剪。
         let ref_path = std::env::temp_dir().join(format!(
             "ye-aac-{}-{}.ref.pcm",
             entry.name,
@@ -190,7 +190,7 @@ fn aac_vectors_pass_conformance() {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-y", "-v", "error"]);
         if entry.container == "mp4" {
-            cmd.arg("-ignore_editlist").arg("1");
+            cmd.args(["-ignore_editlist", "1", "-flags2", "+skip_manual"]);
         }
         cmd.arg("-i")
             .arg(&vec_path)

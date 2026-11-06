@@ -169,6 +169,7 @@ pub(crate) struct Source {
     saw_frame: bool,
 }
 impl Source {
+    #[cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
     pub(crate) fn open(
         containers: &ContainerRegistry,
         codecs: &CodecRegistry,

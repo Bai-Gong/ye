@@ -59,6 +59,9 @@ pub mod timeline;
 #[cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
 pub mod frame_grab;
 
+#[cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
+pub mod frame_sequence;
+
 #[cfg(feature = "png")]
 pub mod png;
 

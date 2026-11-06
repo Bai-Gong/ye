@@ -113,39 +113,28 @@ pub(crate) fn dc_qmul(qp: u8) -> u32 {
     DEQUANT_V[usize::from(qp % 6)][0] << (u32::from(qp / 6) + 6)
 }
 
-/// 4x4 整数反变换 + 叠加（FFmpeg h264idct_template.c `ff_h264_idct_add`
-/// 逐字：DC 预加 1<<5 折入舍入，先列（垂直）后行（水平），输出裸 `>>6`）。
+/// 4x4 整数反变换 + 叠加：光栅系数先行（水平）后列（垂直），
+/// 最后加 32 再右移 6 位。蝶形中的半值截断使两遍不可交换。
+/// FFmpeg 的系数存储已转置，因此其代码中的列遍对应这里的水平遍。
 /// `block` 为光栅 [row*4+col]；`dst` 指向平面内 4x4 区域左上角起的长切片。
 pub(crate) fn idct4x4_add(dst: &mut [u8], stride: usize, block: &mut [i16; 16]) {
-    block[0] += 1 << 5;
-    // 垂直 pass：处理列 i（block[i + 4*j]，行主序即列 i）
-    for i in 0..4usize {
-        let b0 = i32::from(block[i]);
-        let b4 = i32::from(block[i + 4]);
-        let b8 = i32::from(block[i + 8]);
-        let b12 = i32::from(block[i + 12]);
-        let z0 = b0 + b8;
-        let z1 = b0 - b8;
-        let z2 = (b4 >> 1) - b12;
-        let z3 = b4 + (b12 >> 1);
-        block[i] = (z0 + z3) as i16;
-        block[i + 4] = (z1 + z2) as i16;
-        block[i + 8] = (z1 - z2) as i16;
-        block[i + 12] = (z0 - z3) as i16;
+    let mut tmp = [0i32; 16];
+    for y in 0..4 {
+        let b = &block[y * 4..y * 4 + 4];
+        let z0 = i32::from(b[0]) + i32::from(b[2]);
+        let z1 = i32::from(b[0]) - i32::from(b[2]);
+        let z2 = (i32::from(b[1]) >> 1) - i32::from(b[3]);
+        let z3 = i32::from(b[1]) + (i32::from(b[3]) >> 1);
+        tmp[y * 4..y * 4 + 4].copy_from_slice(&[z0 + z3, z1 + z2, z1 - z2, z0 - z3]);
     }
-    // 水平 pass：处理行 i，直接叠加并裁剪
-    for i in 0..4usize {
-        let b0 = i32::from(block[i * 4]);
-        let b1 = i32::from(block[i * 4 + 1]);
-        let b2 = i32::from(block[i * 4 + 2]);
-        let b3 = i32::from(block[i * 4 + 3]);
-        let z0 = b0 + b2;
-        let z1 = b0 - b2;
-        let z2 = (b1 >> 1) - b3;
-        let z3 = b1 + (b3 >> 1);
-        for (x, v) in [(0usize, z0 + z3), (1, z1 + z2), (2, z1 - z2), (3, z0 - z3)] {
-            let d = i32::from(dst[i * stride + x]) + (v >> 6);
-            dst[i * stride + x] = d.clamp(0, 255) as u8;
+    for x in 0..4 {
+        let z0 = tmp[x] + tmp[8 + x];
+        let z1 = tmp[x] - tmp[8 + x];
+        let z2 = (tmp[4 + x] >> 1) - tmp[12 + x];
+        let z3 = tmp[4 + x] + (tmp[12 + x] >> 1);
+        for (y, v) in [z0 + z3, z1 + z2, z1 - z2, z0 - z3].into_iter().enumerate() {
+            dst[y * stride + x] =
+                (i32::from(dst[y * stride + x]) + ((v + 32) >> 6)).clamp(0, 255) as u8;
         }
     }
 }
@@ -2362,8 +2351,8 @@ mod tests {
 
     #[test]
     fn idct_single_ac_hand_computed() {
-        // block[1]=256（AC）：pass1 后列 1 全 256、列 0 = 32；
-        // pass2 各行加 [4,2,-2,-4]
+        // block[1]=256（AC）：水平遍首行 [256,128,-128,-256]；
+        // 垂直遍复制到各行，最终各行加 [4,2,-2,-4]
         let mut block = [0i16; 16];
         block[1] = 256;
         let mut dst = [100u8; 16];
@@ -2374,6 +2363,19 @@ mod tests {
             assert_eq!(dst[y * 4 + 2], 98, "row {y} col 2");
             assert_eq!(dst[y * 4 + 3], 96, "row {y} col 3");
         }
+    }
+
+    #[test]
+    fn idct_rounding_order_for_mixed_odd_ac() {
+        // Horizontal row 1 becomes [31, 12, -12, -31]. The vertical
+        // pass yields magnitudes at most 31, so every final residual is 0.
+        // Reversing the passes makes the bottom-right residual +1.
+        let mut block = [0i16; 16];
+        block[5] = 30;
+        block[7] = 3;
+        let mut dst = [100; 16];
+        idct4x4_add(&mut dst, 4, &mut block);
+        assert_eq!(dst, [100; 16]);
     }
 
     #[test]

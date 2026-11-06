@@ -1,11 +1,9 @@
 //! 波形 oracle 对拍（m2-jian-plan §3.2，T3 ye 侧；jian 侧 T8 同口径）。
 //!
-//! 参考侧 ffmpeg `-ignore_editlist 1`（**mov 解封装器私有选项，必须在
-//! -i 之前**，坑 §1.4-5）解到 packed f32le，喂**同一份分桶纯核**
-//! [`peaks_by_bucket_count`]——口径自洽：两侧桶边界公式同源，差异只来自
-//! 解码器。ye 轨按裸码流语义输出全部含 priming 帧（conformance
-//! README:113-116），ffmpeg 侧不忽略 edit list 即含同样的 priming/padding
-//! 样本，两侧样本序列对齐。
+//! 参考侧使用 `-ignore_editlist 1 -flags2 +skip_manual` 解到 packed
+//! f32le，喂同一份分桶纯核。两侧均按裸 AAC 码流输出完整帧，保留
+//! priming/padding；仅忽略 edit list 不足以关闭 FFmpeg 新版依据尾包
+//! duration 执行的样本裁尾。呈现时间线裁剪另由 waveform_aligned 验证。
 //!
 //! **两条向量都要过**（正弦对 min/max 敏感、白噪声对错位敏感——能暴露
 //! edit list 口径错误，评审问题 4）。向量配方与定位器复用
@@ -66,7 +64,15 @@ fn ref_path(tag: &str, ext: &str) -> PathBuf {
 fn reference_samples(exe: &Path, vec: &Path, tag: &str) -> Vec<f32> {
     let out = ref_path(tag, "f32");
     let status = Command::new(exe)
-        .args(["-v", "error", "-ignore_editlist", "1", "-i"])
+        .args([
+            "-v",
+            "error",
+            "-ignore_editlist",
+            "1",
+            "-flags2",
+            "+skip_manual",
+            "-i",
+        ])
         .arg(vec)
         .args(["-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le"])
         .arg(&out)

@@ -22,7 +22,8 @@
 //! 各用例注释。vec-video-multi 行为锁定照常生效。
 //!
 //! 像素转换口径的前提（已实测锁定，2026-10-27）：两侧转换口径同源
-//! （swscale 逐像素表路径，ye-filter convert.rs 头注），像素对拍的全部
+//! （固定 CPU 标量、最近邻色度、full_chroma_int+accurate_rnd；
+//! 13 位定点矩阵一次舍入，见 ye-filter convert.rs），像素对拍的全部
 //! 余量预算留给解码侧。
 
 #![cfg(all(feature = "mp4", feature = "h264", feature = "png"))]
@@ -142,11 +143,20 @@ fn reference_frame(exe: &Path, vec: &Path, t_us: i64, tag: &str) -> Vec<u8> {
         f64::from(i32::try_from(t_us).expect("时点在 i32 域")) / 1e6
     );
     let status = Command::new(exe)
-        .args(["-v", "error", "-ss"])
+        .args(["-v", "error", "-cpuflags", "0", "-ss"])
         .arg(&seconds)
         .arg("-i")
         .arg(vec)
-        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba"])
+        .args([
+            "-sws_flags",
+            "neighbor+full_chroma_int+accurate_rnd",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+        ])
         .arg(&out)
         .status()
         .unwrap_or_else(|err| panic!("启动 ffmpeg 失败（{}）：{err}", exe.display()));
@@ -170,7 +180,7 @@ fn reference_frame(exe: &Path, vec: &Path, t_us: i64, tag: &str) -> Vec<u8> {
 fn reference_yuv(exe: &Path, vec: &Path, tag: &str) -> Vec<u8> {
     let out = ref_path(tag, "yuv");
     let status = Command::new(exe)
-        .args(["-v", "error", "-i"])
+        .args(["-v", "error", "-cpuflags", "0", "-i"])
         .arg(vec)
         .args(["-map", "0:v:0", "-pix_fmt", "yuv420p", "-f", "rawvideo"])
         .arg(&out)
@@ -438,9 +448,19 @@ fn bt709_vui_limited_and_full_range_reach_rgba_output() {
             ye::frame_grab::decode_frame_rgba(Box::new(std::fs::File::open(&path).unwrap()), 0)
                 .unwrap();
         let reference = Command::new(&exe)
-            .args(["-v", "error", "-i"])
+            .args(["-v", "error", "-cpuflags", "0", "-i"])
             .arg(&path)
-            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .args([
+                "-sws_flags",
+                "neighbor+full_chroma_int+accurate_rnd",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
             .output()
             .unwrap();
         assert!(reference.status.success());

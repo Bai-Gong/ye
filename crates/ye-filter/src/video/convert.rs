@@ -1,25 +1,12 @@
 //! yuv420p ↔ rgba/rgb24 像素格式转换内核（M2 像素核，纯函数、无状态）。
 //!
-//! ## 对齐口径（swscale oracle，2026-10-25 探测锁定）
+//! ## 确定性颜色转换
 //!
-//! yuv→rgb 方向对齐 **FFmpeg swscale 的逐像素表路径**（`yuv420p`→`rgba`/`rgb24`
-//! 同尺寸转换，`-sws_flags bilinear`）：
-//!
-//! - **色度上采样 = 最近邻 2×2 复制**：yuv420p 半分辨率色度样本直接铺满对应的
-//!   2×2 luma 块（luma 行 `r` 取色度行 `r/2`，luma 列 `c` 取色度列 `c/2`）。
-//!   这与 swscale 无 `SWS_FULL_CHR_H_INT` 时的 420→packed RGB 快速路径一致
-//!   （8×8 棋盘/斜坡/竖条三组探测逐像素验证）。
-//! - **BT.601 表模型（逐项 floor、和后截幅）**：
-//!   `R = clip( YT[Y] + RV[V] )`、`G = clip( YT[Y] + GU[U] + GV[V] )`、
-//!   `B = clip( YT[Y] + BU[U] )`，其中 `YT[y] = floor(cy·(y−16))`（有限范围；
-//!   全程范围 `YT[y] = y`）、`RV[v] = floor(cr·(v−128))`、
-//!   `GU[u] = floor(−cgu·(u−128))`、`GV[v] = floor(−cgv·(v−128))`、
-//!   `BU[u] = floor(cb·(u−128))`，clip 到 [0,255]，alpha 恒 255。
-//!   系数为 BT.601（Kr=0.299/Kb=0.114）：有限范围 luma 用 `cy = 255/219`，
-//!   色度系数 = JPEG 系数 × 255/224；全程范围 cy=1、色度系数 = JPEG 系数。
-//! - **实测偏差（对拍基线，容差写死只准收紧）**：有限范围逐像素 |Δ|≤1
-//!   （约 0.2% 像素差 1，来自 swscale 表内部定点常数的微差）；全程范围
-//!   逐字节 bit-exact（本机 N-123627 实测 0/18432 样本差）。
+//! 色度按最近邻 2×2 复制；BT.601/709 矩阵使用 13 位定点系数，
+//! 亮度与色度相加后统一四舍五入、截幅，避免逐项 floor 的系统性偏暗。
+//! 黑白端点保持 0/255；输出不随 CPU 架构变化。
+//! oracle 显式使用 swscale 的 `neighbor+full_chroma_int+accurate_rnd`
+//! 与 `-cpuflags 0`，避免默认 x86/NEON/旧表路径采用不同量化规则。
 //!
 //! rgb→yuv 方向按 BT.601 规格实现（先逐像素换算再对 2×2 块取均值得到色度），
 //! 无 oracle 对拍（M2 施工图对拍口径只覆盖 yuv→rgb 方向），以已知色 +
@@ -102,67 +89,27 @@ impl Yuv420pView<'_> {
     }
 }
 
-/// BT.601 转换表（长度 256 的查表项；由 [`tables`] 构建）。
-///
-/// `y`/`rv`/`gu`/`gv`/`bu` 均为「逐项 floor」后的整数增量，直接相加后截幅。
-#[derive(Debug, Clone)]
-struct Bt601Tables {
-    y: [i32; 256],
-    rv: [i32; 256],
-    gu: [i32; 256],
-    gv: [i32; 256],
-    bu: [i32; 256],
-}
-
-/// BT.601 系数（JPEG 全程范围形态；有限范围 = 以下系数 × 255/224、luma 乘 255/219）。
-///
-/// 数值以 swscale oracle 对拍校准（本模块头注「对齐口径」）；不建议改动——
-/// 改动会移动 floor 边界，需重新对全立方体采样对拍。
-const J_R: f64 = 1.402;
-const J_GU: f64 = 0.344_136;
-const J_GV: f64 = 0.714_136;
-const J_B: f64 = 1.772;
-/// 有限范围色度缩放（255/224）。
-const CHROMA_SCALE: f64 = 255.0 / 224.0;
-/// 有限范围 luma 缩放（255/219）。
-const LUMA_SCALE: f64 = 255.0 / 219.0;
-
-fn floor_f(x: f64) -> i32 {
-    // f64::floor 对负数同样向 −∞ 取整；值域有限（|x| < 400）转 i32 安全。
-    x.floor() as i32
-}
-
-/// 构建 BT.601 查表（逐项 floor；`range` 决定系数档）。
-fn tables(range: YuvRange) -> Bt601Tables {
-    let (cy, cr, cgu, cgv, cb) = match range {
-        YuvRange::Limited => (
-            LUMA_SCALE,
-            J_R * CHROMA_SCALE,
-            J_GU * CHROMA_SCALE,
-            J_GV * CHROMA_SCALE,
-            J_B * CHROMA_SCALE,
-        ),
-        YuvRange::Full => (1.0, J_R, J_GU, J_GV, J_B),
-    };
-    let mut t = Bt601Tables {
-        y: [0; 256],
-        rv: [0; 256],
-        gu: [0; 256],
-        gv: [0; 256],
-        bu: [0; 256],
-    };
-    for i in 0..256 {
-        t.y[i] = match range {
-            // 有限范围：YT[y] = floor(cy·(y−16))；全程范围恒等映射。
-            YuvRange::Limited => floor_f(cy * (i as f64 - 16.0)),
-            YuvRange::Full => i as i32,
-        };
-        t.rv[i] = floor_f(cr * (i as f64 - 128.0));
-        t.gu[i] = floor_f(-cgu * (i as f64 - 128.0));
-        t.gv[i] = floor_f(-cgv * (i as f64 - 128.0));
-        t.bu[i] = floor_f(cb * (i as f64 - 128.0));
+/// 13-bit fixed-point matrix. Coefficients are rounded once, and channel
+/// contributions are summed before rounding the resulting sample.
+/// The limited-range matrix is scaled by 255/224 (chroma), 255/219 (luma).
+fn coefficients(range: YuvRange, matrix: YuvMatrix) -> [i32; 6] {
+    match (matrix, range) {
+        (YuvMatrix::Bt601, YuvRange::Limited) => [9539, 16, 13075, -3209, -6660, 16525],
+        (YuvMatrix::Bt601, YuvRange::Full) => [8192, 0, 11485, -2819, -5850, 14516],
+        (YuvMatrix::Bt709, YuvRange::Limited) => [9539, 16, 14686, -1747, -4366, 17305],
+        (YuvMatrix::Bt709, YuvRange::Full) => [8192, 0, 12901, -1534, -3835, 15201],
     }
-    t
+}
+
+fn rgb_sample(y: u8, u: u8, v: u8, c: &[i32; 6]) -> [u8; 3] {
+    let y = (i32::from(y) - c[1]) * c[0] + 4096;
+    let u = i32::from(u) - 128;
+    let v = i32::from(v) - 128;
+    [
+        clip8((y + c[2] * v) >> 13),
+        clip8((y + c[3] * u + c[4] * v) >> 13),
+        clip8((y + c[5] * u) >> 13),
+    ]
 }
 
 fn clip8(x: i32) -> u8 {
@@ -180,16 +127,13 @@ pub fn yuv420p_to_rgba(
     range: YuvRange,
 ) -> Result<Vec<u8>, FilterError> {
     src.validate(width, height)?;
-    let t = tables(range);
+    let coefficients = coefficients(range, YuvMatrix::Bt601);
     let mut out = vec![0u8; width * height * 4];
     for r in 0..height {
         for c in 0..width {
             let (y, u, v) = src.sample(r, c);
             let o = (r * width + c) * 4;
-            let yt = t.y[y as usize];
-            out[o] = clip8(yt + t.rv[v as usize]);
-            out[o + 1] = clip8(yt + t.gu[u as usize] + t.gv[v as usize]);
-            out[o + 2] = clip8(yt + t.bu[u as usize]);
+            out[o..o + 3].copy_from_slice(&rgb_sample(y, u, v, &coefficients));
             out[o + 3] = 255;
         }
     }
@@ -207,16 +151,13 @@ pub fn yuv420p_to_rgb24(
     range: YuvRange,
 ) -> Result<Vec<u8>, FilterError> {
     src.validate(width, height)?;
-    let t = tables(range);
+    let coefficients = coefficients(range, YuvMatrix::Bt601);
     let mut out = vec![0u8; width * height * 3];
     for r in 0..height {
         for c in 0..width {
             let (y, u, v) = src.sample(r, c);
             let o = (r * width + c) * 3;
-            let yt = t.y[y as usize];
-            out[o] = clip8(yt + t.rv[v as usize]);
-            out[o + 1] = clip8(yt + t.gu[u as usize] + t.gv[v as usize]);
-            out[o + 2] = clip8(yt + t.bu[u as usize]);
+            out[o..o + 3].copy_from_slice(&rgb_sample(y, u, v, &coefficients));
         }
     }
     Ok(out)
@@ -446,14 +387,14 @@ mod tests {
         let p = uniform(235, 128, 128);
         let out = yuv420p_to_rgba(&view_of(&p), 4, 4, YuvRange::Limited).unwrap();
         assert_eq!(&out[..4], &[255, 255, 255, 255]);
-        // 纯红（BT.601 有限范围经典值 Y=81,U=90,V=240 → 探测实测 (253,0,0)）
+        // 纯红（BT.601 有限范围经典值 Y=81,U=90,V=240 → (254,0,0)）
         let p = uniform(81, 90, 240);
         let out = yuv420p_to_rgba(&view_of(&p), 4, 4, YuvRange::Limited).unwrap();
-        assert_eq!(&out[..4], &[253, 0, 0, 255]);
-        // Y=81,U=128,V=240 → (253,0,75)
+        assert_eq!(&out[..4], &[254, 0, 0, 255]);
+        // Y=81,U=128,V=240 → (254,0,76)
         let p = uniform(81, 128, 240);
         let out = yuv420p_to_rgba(&view_of(&p), 4, 4, YuvRange::Limited).unwrap();
-        assert_eq!(&out[..4], &[253, 0, 75, 255]);
+        assert_eq!(&out[..4], &[254, 0, 76, 255]);
     }
 
     #[test]
@@ -602,7 +543,78 @@ mod tests {
         }
     }
 
-    /// 32×32 全随机噪声 ×4 帧 vs `-sws_flags bilinear -pix_fmt rgba` 直转。
+    // Use the high-precision reference for the full YUV byte cube: FFmpeg 9's
+    // packed 8-bit full-chroma path wraps e.g. (247,251,185) blue to zero.
+    // RGB48 clips correctly; quantize only after that clipping. Keep maxAbs=1.
+    // This path expands 8-bit code values by 256, not 257: neutral full-range
+    // 128/200 become 32768/51200; limited white 235 becomes 65283. Thus round
+    // by +128 then >>8, clipping the 65535 saturation endpoint back to 255.
+    fn reference_rgb(frame: &[u8], w: usize, h: usize, format: &str, alpha: bool) -> Vec<u8> {
+        let rgb48 = run_ffmpeg_raw(
+            frame,
+            w,
+            h,
+            format,
+            &[
+                "-cpuflags",
+                "0",
+                "-sws_flags",
+                "neighbor+full_chroma_int+accurate_rnd",
+            ],
+            "rgb48le",
+        );
+        let mut out = Vec::with_capacity(w * h * if alpha { 4 } else { 3 });
+        for pixel in rgb48.chunks_exact(6) {
+            for sample in pixel.chunks_exact(2) {
+                let value = u32::from(u16::from_le_bytes([sample[0], sample[1]]));
+                out.push(((value + 128) >> 8).min(255) as u8);
+            }
+            if alpha {
+                out.push(255);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fixed_point_matrix_golden_endpoints_and_extreme_chroma() {
+        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709] {
+            for (range, black, white) in [(YuvRange::Limited, 16, 235), (YuvRange::Full, 0, 255)] {
+                let c = coefficients(range, matrix);
+                assert_eq!(rgb_sample(black, 128, 128, &c), [0; 3]);
+                assert_eq!(rgb_sample(white, 128, 128, &c), [255; 3]);
+            }
+        }
+        assert_eq!(
+            rgb_sample(
+                247,
+                251,
+                185,
+                &coefficients(YuvRange::Limited, YuvMatrix::Bt601)
+            ),
+            [255, 174, 255]
+        );
+        assert_eq!(
+            rgb_sample(
+                81,
+                90,
+                240,
+                &coefficients(YuvRange::Limited, YuvMatrix::Bt601)
+            ),
+            [254, 0, 0]
+        );
+        assert_eq!(
+            rgb_sample(
+                81,
+                90,
+                240,
+                &coefficients(YuvRange::Limited, YuvMatrix::Bt709)
+            ),
+            [255, 24, 0]
+        );
+    }
+
+    /// 32×32 全随机噪声 ×4 帧与最近邻、高精度参考比较。
     /// 容差写死 ORACLE_CONVERT_MAX_ABS=1（实测有限范围 max=1）。
     #[test]
     fn oracle_convert_rgba_matches_swscale() {
@@ -615,7 +627,7 @@ mod tests {
         let mut worst = 0u32;
         for _ in 0..4 {
             let frame = noise_frame(&mut lcg, w, h);
-            let ref_out = run_ffmpeg_raw(&frame, w, h, "yuv420p", &[], "rgba");
+            let ref_out = reference_rgb(&frame, w, h, "yuv420p", true);
             let mine =
                 yuv420p_to_rgba(&tight_view(&frame, w, h), w, h, YuvRange::Limited).expect("转换");
             let d = max_abs_diff(&mine, &ref_out);
@@ -640,7 +652,7 @@ mod tests {
         let mut worst = 0u32;
         for _ in 0..3 {
             let frame = noise_frame(&mut lcg, w, h);
-            let ref_out = run_ffmpeg_raw(&frame, w, h, "yuv420p", &[], "rgb24");
+            let ref_out = reference_rgb(&frame, w, h, "yuv420p", false);
             let mine =
                 yuv420p_to_rgb24(&tight_view(&frame, w, h), w, h, YuvRange::Limited).expect("转换");
             let d = max_abs_diff(&mine, &ref_out);
@@ -653,8 +665,7 @@ mod tests {
         eprintln!("oracle convert rgb24: max_abs={worst} (容差 {ORACLE_CONVERT_MAX_ABS})");
     }
 
-    /// 全程范围（yuvj420p 输入）实测逐字节 bit-exact，仍按容差 1 断言
-    /// （跨 ffmpeg 构建的 SIMD 路径差异留 1 位余量）。
+    /// 全程范围（yuvj420p 输入）沿用同一高精度参考，容差保持 1。
     #[test]
     fn oracle_convert_full_range_matches_swscale() {
         if !ffmpeg_available() {
@@ -666,7 +677,7 @@ mod tests {
         let mut worst = 0u32;
         for _ in 0..3 {
             let frame = noise_frame(&mut lcg, w, h);
-            let ref_out = run_ffmpeg_raw(&frame, w, h, "yuvj420p", &[], "rgba");
+            let ref_out = reference_rgb(&frame, w, h, "yuvj420p", true);
             let mine =
                 yuv420p_to_rgba(&tight_view(&frame, w, h), w, h, YuvRange::Full).expect("转换");
             let d = max_abs_diff(&mine, &ref_out);
@@ -687,7 +698,7 @@ pub enum YuvMatrix {
     Bt709,
 }
 
-/// 显式矩阵转换，旧入口继续保持 BT.601 原有逐项舍入口径。
+/// 显式矩阵转换，与 BT.601 入口共用一次舍入的定点内核。
 pub fn yuv420p_to_rgba_matrix(
     src: &Yuv420pView<'_>,
     width: usize,
@@ -695,25 +706,14 @@ pub fn yuv420p_to_rgba_matrix(
     range: YuvRange,
     matrix: YuvMatrix,
 ) -> Result<Vec<u8>, FilterError> {
-    if matrix == YuvMatrix::Bt601 {
-        return yuv420p_to_rgba(src, width, height, range);
-    }
     src.validate(width, height)?;
+    let coefficients = coefficients(range, matrix);
     let mut out = vec![0; width * height * 4];
     for y in 0..height {
         for x in 0..width {
             let (yy, uu, vv) = src.sample(y, x);
-            let (luma, scale) = match range {
-                YuvRange::Limited => ((f64::from(yy) - 16.0) * 255.0 / 219.0, 255.0 / 224.0),
-                YuvRange::Full => (f64::from(yy), 1.0),
-            };
-            let u = (f64::from(uu) - 128.0) * scale;
-            let v = (f64::from(vv) - 128.0) * scale;
             let i = (y * width + x) * 4;
-            out[i] = clip8(floor_f(luma) + floor_f(1.5748 * v));
-            out[i + 1] =
-                clip8(floor_f(luma) + floor_f(-0.1873242729 * u) + floor_f(-0.4681242729 * v));
-            out[i + 2] = clip8(floor_f(luma) + floor_f(1.8556 * u));
+            out[i..i + 3].copy_from_slice(&rgb_sample(yy, uu, vv, &coefficients));
             out[i + 3] = 255;
         }
     }

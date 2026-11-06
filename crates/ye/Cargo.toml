@@ -61,3 +61,7 @@ required-features = ["mp4", "h264", "aac", "png"]
 [[example]]
 name = "recording_waveforms"
 required-features = ["mp4", "aac"]
+
+[[example]]
+name = "filmstrip_benchmark"
+required-features = ["mp4", "h264", "png"]
